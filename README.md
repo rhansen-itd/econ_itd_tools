@@ -5,6 +5,17 @@ signal controllers and EVO radar units. There is no shared package or library
 code here — each tool is independent and can be run on its own. They're grouped
 by which device they talk to.
 
+## Setup
+
+```
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+Run scripts from inside `EOS/` or `EVO/` (their `INT_DIR` config blocks are
+relative to that directory, pointing at `../sites/<intersection>/`).
+
 ## EOS/ — Econolite EOS controller tools
 
 - `eos_set_time.py` — sets the clock on an EOS controller over its front-panel
