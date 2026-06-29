@@ -20,7 +20,7 @@ from scipy.optimize import minimize
 # Import functions from main fusion script
 import sys
 sys.path.insert(0, '.')
-from claude_latest import parse_xml_config, parse_and_align_data
+from fusion_visualizer import parse_xml_config, parse_and_align_data
 
 # ============================================================================
 # CONFIGURATION

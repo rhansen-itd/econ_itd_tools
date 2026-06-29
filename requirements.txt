@@ -1,0 +1,13 @@
+matplotlib
+numpy
+openpyxl
+pandas
+Pillow
+plotly
+requests
+scipy
+shapely
+urllib3
+websockets
+ezdxf
+opencv-python
