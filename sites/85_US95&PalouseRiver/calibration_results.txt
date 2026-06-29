@@ -1,0 +1,6 @@
+Optimization complete:
+ Azimuth adjustment: 0.002°
+ X translation: -2.849 m
+ Y translation: -1.915 m
+ Mean residual error: 6.241 m
+ Max residual error: 12.739 m
