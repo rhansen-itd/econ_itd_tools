@@ -1,3 +1,17 @@
 .venv/
 __pycache__/
 *.pyc
+.ipynb_checkpoints/
+
+# Large raw capture data, video, and generated HTML reports.
+# Kept locally on disk, not tracked in git (too large / regenerable).
+*.mp4
+*.html
+*EVO*.txt
+*iprj.txt
+sites/Banks/sensors1_2.txt
+sites/Banks/sensors3_4.txt
+
+# Exceptions: keep two small EVO captures as tracked samples.
+!sites/86_US95&SH8/10_37_2_86_EVO_1770311735.txt
+!sites/201_SH55&BanksLowmanRd/10_37_23_201_EVO_1770686257.txt
