@@ -15,6 +15,7 @@ supplier, so an uncalibrated background simply disables dimensioned draw.
 from __future__ import annotations
 
 import copy
+import itertools
 import re
 from typing import Callable
 
@@ -497,6 +498,93 @@ class DrawingController:
         return " | ".join(parts)
 
 
+# Tolerance (world px) for recognizing an engine-placed zone on open: the
+# vendor format rounds coordinates to 2 decimals (≤0.005 px per coordinate,
+# ≤ ~0.02 px through a projection), while hand-drawn slop is a screen pixel
+# or more. 0.05 sits an order of magnitude above one and below the other.
+ATTACH_TOL = 0.05
+
+
+def _corner_candidates(p: Point, datum, tol: float) -> list[tuple[float, float]]:
+    """All (station, offset) readings of *p*, one per datum segment whose
+    reading ``locate`` confirms. ``project`` alone returns only the globally
+    nearest reading, which is the wrong one for a corner on the concave
+    side of a bend (e.g. a dilemma zone straddling the vertex)."""
+    cands = []
+    pts, stations = datum.points, datum.stations
+    for i in range(len(pts) - 1):
+        tx, ty = geometry.unit_vector(pts[i], pts[i + 1])
+        dx, dy = p[0] - pts[i][0], p[1] - pts[i][1]
+        s = stations[i] + dx * tx + dy * ty
+        nx, ny = geometry.offset_normal((tx, ty))
+        off = dx * nx + dy * ny
+        if geometry.dist(datum.point_at(s, off), p) <= tol:
+            cands.append((s, off))
+    return cands
+
+
+def _is_so_rectangle(so, tol: float) -> bool:
+    """Exactly two distinct stations x two distinct offsets, one corner in
+    each quadrant — the signature of an engine-placed detector."""
+    ss = sorted(s for s, _ in so)
+    oo = sorted(o for _, o in so)
+    if ss[1] - ss[0] > tol or ss[3] - ss[2] > tol \
+            or oo[1] - oo[0] > tol or oo[3] - oo[2] > tol:
+        return False  # not two clean pairs
+    if ss[2] - ss[1] <= tol or oo[2] - oo[1] <= tol:
+        return False  # degenerate (zero length or width)
+    s_mid, o_mid = (ss[1] + ss[2]) / 2, (oo[1] + oo[2]) / 2
+    return len({(s > s_mid, o > o_mid) for s, o in so}) == 4
+
+
+def station_offset_rectangle(points, datum, tol: float = ATTACH_TOL):
+    """Per-corner (station, offset) if *points* is a station/offset-aligned
+    rectangle on *datum* (see `_is_so_rectangle`) — trying every combination
+    of per-segment corner readings (a few at most), so zones straddling a
+    bend are recognized too. Returns None for anything hand-drawn."""
+    if len(points) != 4:
+        return None
+    cands = [_corner_candidates(p, datum, tol) for p in points]
+    if any(not c for c in cands):
+        return None
+    for so in itertools.product(*cands):
+        if _is_so_rectangle(so, tol):
+            return list(so)
+    return None
+
+
+def derive_attachments(centerlines, zone_lists) -> int:
+    """Re-attach zones that look engine-placed along one of *centerlines*.
+
+    Session 7.5 attachments are session-local (the .iprj format has nowhere
+    to carry them), so on project open this reconstructs them: a zone that
+    is an exact station/offset rectangle on a centerline was almost
+    certainly placed along it — and a user who drew one that precisely by
+    hand gets the re-stationing they would expect anyway. A zone matching
+    several centerlines (e.g. parallel datums) attaches to the laterally
+    nearest. Returns the number of zones attached."""
+    datums = [(cl, cl.current()) for cl in centerlines]
+    n = 0
+    for zones in zone_lists:
+        for z in zones:
+            if is_placeholder(z) or not z.enable:
+                continue
+            best = None
+            for cl, datum in datums:
+                if datum is None:
+                    continue
+                so = station_offset_rectangle(z.points, datum)
+                if so is None:
+                    continue
+                off = min(abs(o) for _, o in so)
+                if best is None or off < best[0]:
+                    best = (off, cl, so)
+            if best is not None:
+                best[1].attach(z, best[2])
+                n += 1
+    return n
+
+
 class CenterlineController:
     """Draw/edit a single approach centerline — station 0 at the first
     point (the stop bar), stations increasing upstream (see
@@ -510,6 +598,18 @@ class CenterlineController:
     before release. Undo is whole-list snapshots rather than
     `DrawingController`'s op stack — this is a single small polyline, not a
     collection of zones.
+
+    Session 7.5: zones placed along this centerline register here via
+    `attach` (their per-corner station/offset from
+    `model.templates.place_detectors_on_centerline`); every geometry edit
+    re-stations them (`restation`), so attached detectors follow the
+    curve as it is reshaped — including through undo, since zone points are
+    purely derived from (points, attachment coords). The GUI calls
+    `reproject` after manual zone edits so a hand-adjusted zone keeps its
+    adjusted station/offset instead of snapping back. Attachments are
+    session-local — the `.iprj` format has nowhere to carry them — but on
+    project open `derive_attachments` reconstructs them for zones that
+    still look engine-placed (see `station_offset_rectangle`).
     """
 
     def __init__(self, ft_per_px: Callable[[], float | None]):
@@ -520,6 +620,8 @@ class CenterlineController:
         self.handle_radius = 10.0  # vertex grab radius, world px; GUI rescales on zoom
         self._dragging = False
         self._undo: list[list[Point]] = []
+        # id(zone) -> (zone, per-corner (station, offset) in world px)
+        self.attached: dict[int, tuple[EventZone, list[tuple[float, float]]]] = {}
         self.message = ""
 
     def current(self) -> "geometry.Centerline | None":
@@ -537,6 +639,41 @@ class CenterlineController:
                 return i
         return -1
 
+    # -- attached zones (Session 7.5) ------------------------------------------
+
+    def attach(self, zone: EventZone, corners_so: list[tuple[float, float]]) -> None:
+        """Register *zone* as placed at *corners_so* (per-corner
+        station/offset, world px) so centerline edits re-station it."""
+        self.attached[id(zone)] = (zone, [tuple(c) for c in corners_so])
+
+    def restation(self) -> None:
+        """Recompute every attached zone's points from its stored
+        station/offset corners — called after any centerline geometry
+        change. With fewer than two distinct points there is no datum, so
+        zones stay put until the centerline is valid again."""
+        c = self.current()
+        if c is None:
+            return
+        for zone, corners in self.attached.values():
+            zone.points = [c.point_at(s, off) for s, off in corners]
+
+    def reproject(self) -> None:
+        """Re-derive stored station/offset corners from each attached
+        zone's current points — the GUI calls this after manual zone edits
+        (drag/nudge/undo) so the adjustment sticks through later centerline
+        edits. Zones whose points still match their stored corners keep
+        the exact placement coordinates (`project` can differ minutely from
+        the placed values near corners and past the ends)."""
+        c = self.current()
+        if c is None:
+            return
+        for key, (zone, corners) in self.attached.items():
+            if len(zone.points) == len(corners) and all(
+                    geometry.dist(p, c.point_at(s, off)) < 1e-6
+                    for p, (s, off) in zip(zone.points, corners)):
+                continue
+            self.attached[key] = (zone, [c.project(p) for p in zone.points])
+
     # -- mouse -----------------------------------------------------------------
 
     def mouse_down(self, p: Point) -> None:
@@ -548,12 +685,14 @@ class CenterlineController:
         else:
             self.points.append(p)
             self.selected = len(self.points) - 1
+            self.restation()
         self._dragging = True
 
     def mouse_move(self, p: Point, dragging: bool = False) -> None:
         self.cursor = p
         if dragging and self._dragging and self.selected != -1:
             self.points[self.selected] = p
+            self.restation()
 
     def mouse_up(self, p: Point) -> None:
         self._dragging = False
@@ -584,6 +723,7 @@ class CenterlineController:
         self._snapshot()
         self.points.pop(self.selected)
         self.selected = min(self.selected, len(self.points) - 1)
+        self.restation()
         self.message = "deleted vertex"
         return True
 
@@ -593,6 +733,7 @@ class CenterlineController:
             return
         self.points = self._undo.pop()
         self.selected = min(self.selected, len(self.points) - 1)
+        self.restation()
         self.message = "undid centerline edit"
 
     # -- render state / readout ---------------------------------------------------

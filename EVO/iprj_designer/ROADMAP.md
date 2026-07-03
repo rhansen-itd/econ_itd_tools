@@ -308,10 +308,10 @@ Suggested prompt:
 ### Session 7.5 — Curvilinear placement refactor (Target: Fable; escalate to Opus only if it needs an architecture call)
 
 Scope:
-- [ ] Place loops (and template expansions from Session 6) by station/offset
+- [x] Place loops (and template expansions from Session 6) by station/offset
       so advance detectors follow approach curvature; loop orientation from
       local segment direction
-- [ ] Re-station attached zones when the centerline is edited afterward
+- [x] Re-station attached zones when the centerline is edited afterward
 
 Suggested prompt:
 > [Fable, or Opus first if the undo/re-stationing interaction needs a
@@ -655,6 +655,101 @@ Suggested prompt:
   disk before it was caught and restored with `git checkout` — always
   launch `gui/app.py` against a scratch copy when Playwright-testing save
   paths, never the fixture directly.
+
+- 2026-07-02 — **Session 7.5 done (no Opus escalation needed).**
+  `model/templates.py`: `place_detectors_on_centerline` /
+  `expand_and_place_on_centerline` map each detector corner to a
+  (station, offset) on a Session 7.1 `Centerline` and locate it there, so
+  detectors follow approach curvature and take orientation from the local
+  segment. Sign mapping (documented in the module): the centerline is
+  drawn stop-bar-first, so `setback_ft` adds directly to station; positive
+  `Centerline` offset is the driver's *left* (tangent points upstream), so
+  `lateral_offset_ft` subtracts. The clicked stop-bar reference is
+  *projected* onto the datum, keeping its straight-placement meaning; on a
+  straight datum the curvilinear form reproduces `place_detectors` exactly
+  (pytest-pinned). `PlacedDetector.corners_so` carries the per-corner
+  station/offset as the attachment record.
+- 2026-07-02 — Re-stationing resolved without an architecture change to
+  the undo model: `CenterlineController` keeps an `attached` registry
+  (zone → corner station/offsets) and re-derives attached zones' points
+  from it after *every* centerline mutation — drag (live), vertex
+  add/delete, and snapshot undo — so undoing a centerline edit restores
+  the zones for free (they're derived state, no zone-side undo ops
+  needed). The reverse direction: the GUI calls `reproject` after manual
+  zone edits (drag/nudge/undo), re-deriving the stored station/offsets
+  from the zone's moved points, so a hand-adjusted detector keeps its
+  adjustment through later centerline edits; untouched zones keep their
+  exact placement coords (guard against `project`'s tiny corner-case
+  drift). Attachments are session-local — `Lineal` can't carry them, so a
+  reloaded project's zones sit where saved but no longer follow edits
+  (noted in the app docstring; acceptable, same status the centerline
+  itself had before 7.3).
+- 2026-07-02 — GUI flow: with any usable centerline drawn, the Template
+  tool is one click — live 11-detector preview follows the hover point
+  along the *nearest* centerline (smallest |offset| of the projection, no
+  distance cap — draw the approach's centerline first or expect
+  attachment to the nearest one), and the click places + attaches. With
+  no centerline the Session 6.3 ref-then-aim two-click flow is unchanged.
+  Manual free/dimensioned draw stays straight-line and unattached — the
+  refactor covers engine-placed detectors, where curvature matters
+  (283.8 ft advance loops), not a hand-drawn 5 ft loop. Ctrl-drag copies
+  of attached zones are deliberately *not* attached.
+- 2026-07-02 — Verified: 200/200 pytest (9 new: straight-datum
+  equivalence incl. off-datum ref + unit scaling, 90°-bend advance-loop
+  rotation with hand-computed corners, corners_so round-trip, attachment
+  restation/undo/reproject). Playwright end-to-end: bent 3-point
+  centerline, one-click template placement ("along C1", outputs 33–43,
+  zone table 11 rows), vertex drag moved the advance detector ~40 img px,
+  `u` restored it to 0.00 px residual, zero console errors. Process note:
+  the e2e ran against a small *generated* scratch project — banks.iprj in
+  the NiceGUI app plus headless Chromium OOM-kills on this 6.5 GB machine
+  (the server alone reached ~1.4 GB RSS); the banks-scale math is already
+  pinned by pytest.
+
+- 2026-07-02 — **Memory: NiceGUI 3 script mode was re-executing the whole
+  app per page request.** Measured: server ready at 162 MB, then ~11 MB
+  *permanently retained per GET of /* on Banks (OOM-killed this 6.5 GB
+  machine during the 7.5 e2e). tracemalloc traced it to
+  `ui_run.py: runpy.run_path(sys.argv[0])` — with UI built in the global
+  scope, NiceGUI 3 re-runs the entire script (argparse → `load_iprj` 8 MB
+  XML parse → new `Viewer` → `build_ui`) for *every* page request and
+  retains a full project copy per client. Fix: `main()` now loads the
+  project once and passes `ui.run(lambda: build_ui(viewer), ...)` — a root
+  page function — so only the (small) element tree builds per client and
+  the one Viewer stays shared (single-user semantics unchanged; Session
+  8.1 owns multi-session). After: 130 MB flat across 51 GETs, Banks +
+  headless Chromium runs comfortably. Two consequences: the Session-4
+  "poll startup with a socket, not GETs" caveat is root-caused (each GET
+  was a full project re-parse) and no longer load-bearing, and shrinking
+  the background image is unnecessary — the server never decodes pixels
+  anyway (see next entry).
+- 2026-07-02 — Background image is now served as a temp *file*
+  (`Viewer.image_file`), never a PIL object: NiceGUI retained per-client
+  state around PIL-sourced `interactive_image` (~60 MB/request on Banks,
+  measured before the root-function fix made it moot); a file source is
+  streamed. Only the dimensions (`image_w`/`image_h`) are kept — pixels
+  are never decoded server-side. `Viewer.image` (PIL) is gone.
+- 2026-07-02 — **Attachments re-derived on project open** (owner request —
+  7.5 attachments were session-local since `.iprj` can't carry them).
+  Heuristic in `gui/drawing.py`: a 4-corner zone whose corners form an
+  exact station/offset rectangle on a loaded centerline (two distinct
+  stations x two distinct offsets, each corner reproduced by `locate`,
+  tol 0.05 world px — 10x the vendor's 2-decimal rounding, well under
+  hand-drawn slop) is attached to the laterally nearest centerline;
+  `derive_attachments` runs in `Viewer.__init__` and a notification
+  reports the count. Corner readings are collected *per segment* and the
+  rectangle searched over the (tiny) combination space, because plain
+  `project()` picks the wrong segment for corners on the concave side of
+  a bend — caught live when the bend-straddling dilemma zone came back
+  10/11 in the e2e; regression-tested. Known accepted edges: a zone
+  hand-moved *off* the exact grid on a curved leg reloads unattached
+  (its reprojected corners are no longer a station/offset rectangle);
+  a hand-drawn rectangle drawn perfectly on-grid re-attaches — which is
+  the behavior the owner asked for ("appears snapped → assume attached").
+  205 pytest green; e2e extended: place → Save As → relaunch → "11 zones
+  re-attached" notification → vertex drag re-stations identically
+  (39.5 px, matching the in-session drag) → zero console errors; Banks
+  browser smoke at 130 MB RSS, 18 rows, zero console errors.
 
 ## Appendix — example template (acceptance case for Session 6)
 

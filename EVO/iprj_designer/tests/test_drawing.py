@@ -1,8 +1,9 @@
 import pytest
 
 from gui.drawing import (DIM_LENGTH1, DIM_LENGTH2, DIM_OFF, CenterlineController,
-                         DrawingController, bumped_name, is_placeholder,
-                         next_output_number)
+                         DrawingController, bumped_name, derive_attachments,
+                         is_placeholder, next_output_number)
+from model import geometry
 from model.iprj_io import EventZone
 
 FT_PER_PX = 0.25  # 10 ft == 40 world px
@@ -489,3 +490,152 @@ def test_centerline_status_messages():
     assert "1 point" in ctrl.status()
     ctrl.mouse_down((100, 0))
     assert "2 points" in ctrl.status()
+
+
+# -- centerline zone attachments (Session 7.5) --------------------------------
+
+def cl_with_zone():
+    """A straight centerline (0,0)->(100,0) with a 10x10 zone attached at
+    stations 20..30, offsets 0..-10 (its placed points coincide)."""
+    ctrl = make_cl()
+    ctrl.mouse_down((0, 0))
+    ctrl.mouse_down((100, 0))
+    corners = [(20.0, 0.0), (20.0, -10.0), (30.0, -10.0), (30.0, 0.0)]
+    zone = EventZone(enable=1, zone_name="A",
+                     points=[(20, 0), (20, -10), (30, -10), (30, 0)])
+    ctrl.attach(zone, corners)
+    return ctrl, zone
+
+
+def test_attached_zone_restations_on_vertex_drag_and_undo():
+    ctrl, zone = cl_with_zone()
+    orig = list(zone.points)
+    # drag the stop-bar vertex 50 px back: every station shifts with it
+    ctrl.mouse_down((0, 0))                    # grabs vertex 0
+    ctrl.mouse_move((-50, 0), dragging=True)   # re-stations live
+    ctrl.mouse_up((-50, 0))
+    assert zone.points == [(-30, 0), (-30, -10), (-20, -10), (-20, 0)]
+    ctrl.undo()  # snapshot restore re-stations too
+    assert zone.points == orig
+
+
+def test_attached_zone_follows_a_bend():
+    ctrl, zone = cl_with_zone()
+    # bend the far end down: the zone re-locates via the datum engine
+    ctrl.mouse_down((100, 0))
+    ctrl.mouse_move((100, 100), dragging=True)
+    ctrl.mouse_up((100, 100))
+    datum = geometry.Centerline(ctrl.points)
+    expected = [datum.point_at(s, off)
+                for s, off in [(20, 0), (20, -10), (30, -10), (30, 0)]]
+    for (x, y), (ex, ey) in zip(zone.points, expected):
+        assert x == pytest.approx(ex)
+        assert y == pytest.approx(ey)
+
+
+def test_reproject_keeps_manual_adjustment_through_later_edits():
+    ctrl, zone = cl_with_zone()
+    # the user slides the zone 5 px upstream; the GUI then reprojects
+    zone.points = [(x + 5, y) for x, y in zone.points]
+    ctrl.reproject()
+    # a later centerline edit re-stations from the adjusted coords
+    ctrl.mouse_down((0, 0))
+    ctrl.mouse_move((-50, 0), dragging=True)
+    ctrl.mouse_up((-50, 0))
+    assert zone.points == [(-25, 0), (-25, -10), (-15, -10), (-15, 0)]
+
+
+def test_reproject_untouched_zone_keeps_exact_placement_coords():
+    ctrl, zone = cl_with_zone()
+    corners = list(ctrl.attached[id(zone)][1])
+    ctrl.reproject()  # points still match -> stored coords untouched
+    assert ctrl.attached[id(zone)][1] == corners
+
+
+def test_restation_noop_without_a_datum():
+    ctrl = make_cl()
+    ctrl.mouse_down((0, 0))
+    zone = EventZone(enable=1, points=[(1, 1)])
+    ctrl.attach(zone, [(0.0, 0.0)])
+    ctrl.mouse_move((5, 5), dragging=True)  # single point: no datum yet
+    assert zone.points == [(1, 1)]
+
+
+# -- deriving attachments on open (Session 7.5 addendum) -----------------------
+
+def placed_zones_on_bent_centerline():
+    """The acceptance template placed along a bent centerline at 4 px/ft
+    (so the 283.8 ft advance loops land past the bend), corners rounded to
+    the vendor's 2 decimals as save/load would."""
+    from model.templates import ApproachTemplate, Lane, expand_and_place_on_centerline
+    cl_pts = [(0.0, 0.0), (0.0, -800.0), (-600.0, -1400.0)]
+    t = ApproachTemplate(lanes=[Lane("L"), Lane("T"), Lane("T"), Lane("R")],
+                         speed_mph=45.0)
+    placed = expand_and_place_on_centerline(t, cl_pts, (2.0, 1.0), 4.0)
+    zones = [EventZone(enable=1, zone_name=d.spec.name,
+                       points=[(round(x, 2), round(y, 2)) for x, y in d.points])
+             for d in placed]
+    return cl_pts, zones
+
+
+def test_derive_attachments_recognizes_engine_placed_zones():
+    cl_pts, zones = placed_zones_on_bent_centerline()
+    ctrl = make_cl()
+    ctrl.points = list(cl_pts)
+    assert derive_attachments([ctrl], [zones]) == len(zones) == 11
+    # and the derived attachment actually re-stations: stretch the far leg
+    before = [list(z.points) for z in zones]
+    ctrl.selected = 2
+    ctrl.points[2] = (-900.0, -1400.0)
+    ctrl.restation()
+    moved = sum(any(geometry.dist(p, q) > 1.0 for p, q in zip(a, z.points))
+                for a, z in zip(before, zones))
+    assert moved >= 2  # the past-the-bend advance loops followed
+
+
+def test_derive_attachments_recognizes_zone_straddling_a_bend():
+    """A dilemma zone whose corners sit on both legs of a bend: the
+    concave-side corners project onto the wrong segment, so recognition
+    must go through the per-segment candidate search."""
+    from model.templates import ApproachTemplate, Lane, expand_and_place_on_centerline
+    cl_pts = [(400.0, 500.0), (400.0, 420.0), (250.0, 150.0)]  # bend at 160 ft
+    t = ApproachTemplate(lanes=[Lane("L"), Lane("T"), Lane("T"), Lane("R")],
+                         speed_mph=45.0)  # dilemma 160..180 ft straddles it
+    placed = expand_and_place_on_centerline(t, cl_pts, (395.0, 505.0), 0.5)
+    zones = [EventZone(enable=1, zone_name=d.spec.name,
+                       points=[(round(x, 2), round(y, 2)) for x, y in d.points])
+             for d in placed]
+    ctrl = make_cl()
+    ctrl.points = list(cl_pts)
+    assert derive_attachments([ctrl], [zones]) == len(zones) == 11
+
+
+def test_derive_attachments_rejects_hand_drawn_shapes():
+    ctrl = make_cl()
+    ctrl.points = [(0.0, 0.0), (0.0, -800.0)]
+    tilted = EventZone(enable=1, points=[  # rectangle, but 3 px off-axis
+        (20, -100), (60, -103), (63, -143), (23, -140)])
+    quad = EventZone(enable=1, points=[(0, -50), (40, -50), (50, -90), (0, -80)])
+    triangle = EventZone(enable=1, points=[(0, -200), (40, -200), (20, -240)])
+    assert derive_attachments([ctrl], [[tilted, quad, triangle]]) == 0
+
+
+def test_derive_attachments_picks_laterally_nearest_centerline():
+    # two parallel straight datums: an aligned rectangle matches both, so
+    # the laterally nearest must win
+    near, far = make_cl(), make_cl()
+    near.points = [(0.0, 0.0), (0.0, -800.0)]
+    far.points = [(500.0, 0.0), (500.0, -800.0)]
+    zone = EventZone(enable=1, points=[(20, -100), (32, -100),
+                                       (32, -140), (20, -140)])
+    assert derive_attachments([near, far], [[zone]]) == 1
+    assert id(zone) in near.attached
+    assert id(zone) not in far.attached
+
+
+def test_derive_attachments_skips_placeholders_and_disabled():
+    ctrl = make_cl()
+    ctrl.points = [(0.0, 0.0), (0.0, -800.0)]
+    disabled = EventZone(enable=0, zone_name="off", points=[
+        (20, -100), (32, -100), (32, -140), (20, -140)])
+    assert derive_attachments([ctrl], [[EventZone(), disabled]]) == 0

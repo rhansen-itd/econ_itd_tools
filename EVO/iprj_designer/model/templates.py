@@ -7,7 +7,9 @@ detectors to place, where numbering/phases start.
 Session 6.2 (below the schema section) expands a template into a placed
 detector list with ITE kinematic distances — see the "Template expansion"
 section for the formulas and coordinate conventions. Session 6.3 wires the
-expansion into the canvas; nothing here imports GUI code.
+expansion into the canvas; Session 7.5 adds the curvilinear variant that
+places along a `model.geometry.Centerline` datum instead of one straight
+upstream vector. Nothing here imports GUI code.
 """
 
 from __future__ import annotations
@@ -17,7 +19,9 @@ import math
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Sequence
 
+from .geometry import Centerline
 from .iprj_io import Point
 
 # Lane movement is one or more of these letters, e.g. "T", "L", "TR".
@@ -205,6 +209,10 @@ class DetectorSpec:
 class PlacedDetector:
     spec: DetectorSpec
     points: list[Point]  # 4 corners in world coordinates (y-down), drawing order
+    # Per-corner (station, offset) in the placement centerline's coordinates
+    # (world units, same order as ``points``) when placed curvilinearly —
+    # the attachment record that lets a centerline edit re-station the zone.
+    corners_so: list[tuple[float, float]] | None = None
 
 
 def _numbered(base_names: list[str]) -> list[str]:
@@ -315,3 +323,74 @@ def expand_and_place(
     """One-call form for the GUI: expand, then place (see both functions)."""
     return place_detectors(expand_template(template), stop_bar_ref, upstream_dir,
                            units_per_ft)
+
+
+# ---------------------------------------------------------------------------
+# Curvilinear placement (Session 7.5) — place along a centerline datum
+# ---------------------------------------------------------------------------
+#
+# Instead of extruding the approach-local frame along one straight upstream
+# vector, each detector corner is mapped to a (station, offset) on a
+# `model.geometry.Centerline` and located there, so far-upstream detectors
+# follow the approach's curvature and every corner takes its orientation
+# from the local segment direction.
+#
+# Sign mapping between the two frames (both y-down):
+#
+# * The centerline is drawn stop bar first (station 0) and upstream from
+#   there, so ``setback_ft`` (positive upstream) adds directly to station.
+# * `Centerline` offsets are positive to the right of *increasing station*
+#   — the upstream direction — which is the driver's LEFT (the driver
+#   travels downstream). ``lateral_offset_ft`` grows toward the driver's
+#   right, so it *subtracts* from offset.
+#
+# The stop-bar reference point is projected onto the centerline; detectors
+# are laid out relative to that projection, so the click keeps its
+# straight-placement meaning (where the stop bar meets the leftmost lane's
+# left edge) and the centerline itself may be drawn anywhere across the
+# approach. Stations past the drawn end extrapolate along the terminal
+# segment (`Centerline` behavior), so a datum drawn a little short still
+# places the advance detectors.
+
+
+def place_detectors_on_centerline(
+    specs: list[DetectorSpec],
+    centerline_points: Sequence[Point],
+    stop_bar_ref: Point,
+    units_per_ft: float = 1.0,
+) -> list[PlacedDetector]:
+    """Place specs along a centerline datum (conventions above).
+
+    ``centerline_points`` is the datum polyline in world coordinates,
+    station 0 at the stop bar; ``stop_bar_ref`` is the same reference point
+    as `place_detectors` takes. Returned detectors carry ``corners_so`` so
+    the caller can re-station them after later centerline edits.
+    """
+    cl = Centerline(centerline_points)
+    s_ref, off_ref = cl.project(stop_bar_ref)
+
+    placed = []
+    for s in specs:
+        l0, l1 = s.lateral_offset_ft, s.lateral_offset_ft + s.width_ft
+        g0, g1 = s.setback_ft, s.setback_ft + s.length_ft
+        corners_so = [
+            (s_ref + g * units_per_ft, off_ref - l * units_per_ft)
+            for l, g in ((l0, g0), (l1, g0), (l1, g1), (l0, g1))]
+        placed.append(PlacedDetector(
+            spec=s,
+            points=[cl.point_at(st, off) for st, off in corners_so],
+            corners_so=corners_so))
+    return placed
+
+
+def expand_and_place_on_centerline(
+    template: ApproachTemplate,
+    centerline_points: Sequence[Point],
+    stop_bar_ref: Point,
+    units_per_ft: float = 1.0,
+) -> list[PlacedDetector]:
+    """One-call curvilinear form for the GUI: expand, then place along the
+    centerline (see both functions)."""
+    return place_detectors_on_centerline(expand_template(template),
+                                         centerline_points, stop_bar_ref,
+                                         units_per_ft)

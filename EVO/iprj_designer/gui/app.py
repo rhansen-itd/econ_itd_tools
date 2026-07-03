@@ -15,7 +15,10 @@ draw/edit approach centerline polylines (station 0 at the stop bar) with
 a live station/offset readout from model/geometry.py's Centerline engine.
 Session 7.4 wires these through model/centerline.py: every centerline in
 the opened project is reconstructed into its own CenterlineController, and
-the current set is written back out as Lineals on save.
+the current set is written back out as Lineals on save. Session 7.5 routes
+template placement through the station/offset engine whenever a centerline
+is drawn — detectors follow the approach curvature, and editing the
+centerline afterward re-stations the zones placed along it.
 
 Usage:
     python gui/app.py [site.iprj | background.png] [--port 8080]
@@ -30,9 +33,15 @@ arrows nudge · x/Del delete · Ctrl-drag copies the selected zone ·
 p / double-click zone properties · f fit view · Ctrl-S save.
 
 Template tool: pick a template from the toolbar dropdown, switch to the
-Template tool, click the stop-bar reference point (where the stop bar meets
-the left edge of the leftmost lane), then click again to aim upstream and
-place the whole detector set.
+Template tool, and click the stop-bar reference point (where the stop bar
+meets the left edge of the leftmost lane). With a centerline drawn, that
+one click places the whole detector set along the nearest centerline (live
+preview under the cursor); with no centerline, click again to aim upstream
+and place along that straight line. Centerline-placed zones stay attached:
+reshaping the centerline re-stations them. The .iprj cannot store the
+attachment itself, so reopening a project re-derives it — zones that are
+still exact station/offset rectangles on a centerline re-attach
+automatically (a notification reports how many).
 
 Centerline tool: pick the active centerline from its selector (or add a new
 one for another approach), then click along it starting at the stop bar
@@ -45,10 +54,13 @@ once; only the active one is editable.
 from __future__ import annotations
 
 import argparse
+import atexit
 import base64
 import io
 import math
+import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 from xml.sax.saxutils import escape
@@ -60,13 +72,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from nicegui import ui
 
 from gui.drawing import (DIM_OFF, CenterlineController, DrawingController,
-                         insert_zone, is_placeholder, next_output_number)
+                         derive_attachments, insert_zone, is_placeholder,
+                         next_output_number)
 from gui.viewport import Viewport
 from model import units
 from model.centerline import load_centerlines, save_centerlines
 from model.iprj_io import (Background, Condition, EventZone, Project, Sensor,
                            load_iprj, save_iprj)
-from model.templates import expand_and_place, load_template
+from model.templates import (expand_and_place, expand_and_place_on_centerline,
+                             load_template)
 
 REPO = Path(__file__).resolve().parents[3]
 TEMPLATES_DIR = Path(__file__).resolve().parents[1] / "templates"
@@ -123,8 +137,24 @@ class Viewer:
         self.project = project
         self.source = source
         self.bg = project.background
-        self.image = Image.open(io.BytesIO(units.decode_background_image(self.bg))) \
-            if self.bg.image_base64 else Image.new("RGB", (800, 600), "gray")
+        # Serve the background as a PNG *file*, never a PIL object: NiceGUI
+        # retains per-client state around PIL-sourced images (~2x the decoded
+        # bitmap, ~60 MB for Banks, per page request) which OOMs the server;
+        # a file source is streamed and costs nothing per client. Only the
+        # dimensions are kept — the pixels are never decoded server-side.
+        if self.bg.image_base64:
+            png = units.decode_background_image(self.bg)
+        else:
+            buf = io.BytesIO()
+            Image.new("RGB", (800, 600), "gray").save(buf, format="PNG")
+            png = buf.getvalue()
+        with Image.open(io.BytesIO(png)) as im:  # header only, lazy
+            self.image_w, self.image_h = im.size
+        fd, name = tempfile.mkstemp(prefix="iprj_bg_", suffix=".png")
+        with os.fdopen(fd, "wb") as f:
+            f.write(png)
+        self.image_file = Path(name)
+        atexit.register(lambda p=self.image_file: p.unlink(missing_ok=True))
         self.viewport = Viewport()
         self.mode = "Pan"
         self.show_zones = True     # layer toggles (background is CSS-only)
@@ -158,6 +188,11 @@ class Viewer:
         self.active_si = 0
         self.ctrl = DrawingController(project.sensors[0].event_zones,
                                       self.ft_per_px, self.next_output)
+        # Attachments don't persist in the .iprj, so re-derive them: zones
+        # that are exact station/offset rectangles on a loaded centerline
+        # follow centerline edits again after reopening the project.
+        self.derived_attachments = derive_attachments(
+            self.centerlines, [s.event_zones for s in project.sensors])
 
     def next_output(self) -> int:
         return next_output_number(s.event_zones for s in self.project.sensors)
@@ -181,6 +216,26 @@ class Viewer:
         self.centerlines.append(CenterlineController(self.ft_per_px))
         self.active_cli = len(self.centerlines) - 1
         return self.active_cli
+
+    def centerline_for(self, p) -> CenterlineController | None:
+        """The drawn centerline nearest world point *p* (smallest |offset|
+        of its projection) — the datum template placement follows — or None
+        when no controller has a usable (≥2 distinct points) datum yet."""
+        best, best_off = None, None
+        for ctrl in self.centerlines:
+            c = ctrl.current()
+            if c is None:
+                continue
+            off = abs(c.project(p)[1])
+            if best_off is None or off < best_off:
+                best, best_off = ctrl, off
+        return best
+
+    def reproject_attachments(self) -> None:
+        """After a manual zone edit: let every centerline re-derive its
+        attached zones' station/offset coords from their current points."""
+        for cl in self.centerlines:
+            cl.reproject()
 
     def sensor_at(self, p) -> int:
         """Index of the sensor within grab radius of world point p, or -1."""
@@ -215,6 +270,10 @@ class Viewer:
     def template_status(self) -> str:
         if self.template is None:
             return "mode: template | pick a template above"
+        if any(cl.current() is not None for cl in self.centerlines):
+            return (f"mode: template | {self.template.name} | click the "
+                    "stop-bar reference point (left edge of the leftmost "
+                    "lane) — detectors follow the nearest centerline")
         if self.template_ref is None:
             return (f"mode: template | {self.template.name} | click the "
                     "stop-bar reference point (left edge of the leftmost lane)")
@@ -322,31 +381,44 @@ class Viewer:
             x, y = w2i(self.ctrl.snap_indicator)
             parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{4 * lw:.1f}" '
                          f'fill="none" stroke="orange" stroke-width="{lw}"/>')
-        # template placement: reference marker, aim line, live detector preview
-        if self.mode == "Template" and self.template is not None \
-                and self.template_ref is not None:
-            rx, ry = w2i(self.template_ref)
-            parts.append(_cross(rx, ry, 5 * lw, "#00e5ff", lw))
+        # template placement: reference marker, aim line, live detector preview.
+        # With a usable centerline the preview follows it at the hover point
+        # (single click places); otherwise the legacy ref-then-aim flow.
+        if self.mode == "Template" and self.template is not None:
             cursor = self.template_cursor
-            if cursor is not None:
+            cl_ctrl = self.centerline_for(cursor) if cursor is not None else None
+            placed = []
+            fpp = self.ft_per_px()
+            if cl_ctrl is not None:
                 cx, cy = w2i(cursor)
-                parts.append(f'<line x1="{rx:.1f}" y1="{ry:.1f}" x2="{cx:.1f}" '
-                             f'y2="{cy:.1f}" stroke="#00e5ff" stroke-width="{lw}" '
-                             f'stroke-dasharray="{3 * lw} {2 * lw}"/>')
-                upstream = (cursor[0] - self.template_ref[0],
-                           cursor[1] - self.template_ref[1])
-                fpp = self.ft_per_px()
-                if fpp is not None and math.hypot(*upstream) > 1e-6:
+                parts.append(_cross(cx, cy, 5 * lw, "#00e5ff", lw))
+                if fpp is not None:
                     try:
-                        placed = expand_and_place(self.template, self.template_ref,
-                                                  upstream, 1.0 / fpp)
+                        placed = expand_and_place_on_centerline(
+                            self.template, cl_ctrl.points, cursor, 1.0 / fpp)
                     except ValueError:
                         placed = []
-                    for det in placed:
-                        parts.append(_polygon([w2i(pt) for pt in det.points],
-                                              fill="#00e5ff", fill_opacity="0.12",
-                                              stroke="#00e5ff", stroke_width=lw,
-                                              stroke_dasharray=f"{3 * lw} {2 * lw}"))
+            elif self.template_ref is not None:
+                rx, ry = w2i(self.template_ref)
+                parts.append(_cross(rx, ry, 5 * lw, "#00e5ff", lw))
+                if cursor is not None:
+                    cx, cy = w2i(cursor)
+                    parts.append(f'<line x1="{rx:.1f}" y1="{ry:.1f}" x2="{cx:.1f}" '
+                                 f'y2="{cy:.1f}" stroke="#00e5ff" stroke-width="{lw}" '
+                                 f'stroke-dasharray="{3 * lw} {2 * lw}"/>')
+                    upstream = (cursor[0] - self.template_ref[0],
+                               cursor[1] - self.template_ref[1])
+                    if fpp is not None and math.hypot(*upstream) > 1e-6:
+                        try:
+                            placed = expand_and_place(self.template, self.template_ref,
+                                                      upstream, 1.0 / fpp)
+                        except ValueError:
+                            placed = []
+            for det in placed:
+                parts.append(_polygon([w2i(pt) for pt in det.points],
+                                      fill="#00e5ff", fill_opacity="0.12",
+                                      stroke="#00e5ff", stroke_width=lw,
+                                      stroke_dasharray=f"{3 * lw} {2 * lw}"))
         return "".join(parts)
 
 
@@ -417,10 +489,10 @@ def build_ui(viewer: Viewer) -> None:
 
             def apply():
                 if width.value:
-                    units.calibrate_image_width(v.bg, v.image.width * f,
+                    units.calibrate_image_width(v.bg, v.image_w * f,
                                                 float(width.value))
                 elif height.value:
-                    units.calibrate_image_height(v.bg, v.image.height * f,
+                    units.calibrate_image_height(v.bg, v.image_h * f,
                                                  float(height.value))
                 else:
                     ui.notify("enter a width or a height", type="warning")
@@ -596,7 +668,7 @@ def build_ui(viewer: Viewer) -> None:
     def add_sensor():
         s = Sensor()
         s.position_x, s.position_y = units.image_to_world(
-            v.bg, (v.image.width / 2, v.image.height / 2))
+            v.bg, (v.image_w / 2, v.image_h / 2))
         v.project.sensors.append(s)
         v.set_active_sensor(len(v.project.sensors) - 1)
         update_sensor_options()
@@ -651,12 +723,20 @@ def build_ui(viewer: Viewer) -> None:
             refresh_overlay()
             refresh_status()
             return
-        upstream = (pw[0] - v.template_ref[0], pw[1] - v.template_ref[1])
-        if math.hypot(*upstream) < 1e-6:
-            ui.notify("click a point away from the reference to aim",
-                      type="warning")
-            return
-        placed = expand_and_place(v.template, v.template_ref, upstream, 1.0 / fpp)
+        cl_ctrl = v.centerline_for(pw)
+        if cl_ctrl is not None:
+            # curvilinear (Session 7.5): the click is the stop-bar reference;
+            # direction and curvature come from the nearest centerline
+            placed = expand_and_place_on_centerline(v.template, cl_ctrl.points,
+                                                    pw, 1.0 / fpp)
+        else:
+            upstream = (pw[0] - v.template_ref[0], pw[1] - v.template_ref[1])
+            if math.hypot(*upstream) < 1e-6:
+                ui.notify("click a point away from the reference to aim",
+                          type="warning")
+                return
+            placed = expand_and_place(v.template, v.template_ref, upstream,
+                                      1.0 / fpp)
         for det in placed:
             zone = EventZone(
                 enable=1, zone_name=det.spec.name,
@@ -664,11 +744,15 @@ def build_ui(viewer: Viewer) -> None:
                 phase_number=det.spec.phase, output_number=det.spec.output_number,
                 points=[(float(x), float(y)) for x, y in det.points])
             insert_zone(v.active_zones(), zone)
+            if cl_ctrl is not None and det.corners_so is not None:
+                cl_ctrl.attach(zone, det.corners_so)
         v.template_ref = None
         v.template_cursor = None
         refresh_overlay()
         refresh_status()
-        ui.notify(f"placed {len(placed)} detectors from {v.template.name} "
+        along = (f" along C{v.centerlines.index(cl_ctrl) + 1}"
+                 if cl_ctrl is not None else "")
+        ui.notify(f"placed {len(placed)} detectors from {v.template.name}{along} "
                   f"(outputs {placed[0].spec.output_number}-"
                   f"{placed[-1].spec.output_number})")
 
@@ -789,6 +873,7 @@ def build_ui(viewer: Viewer) -> None:
 
     def do_undo():
         v.ctrl.undo()  # ops carry their zone lists, so any mode is fine
+        v.reproject_attachments()
         refresh_overlay()
         refresh_status()
 
@@ -843,7 +928,9 @@ def build_ui(viewer: Viewer) -> None:
                 ui.notify("pick a template first", type="warning")
                 return
             pw = units.image_to_world(v.bg, p)
-            if v.template_ref is None:
+            if v.centerline_for(pw) is not None:
+                place_template(pw)  # curvilinear: one click, no aim needed
+            elif v.template_ref is None:
                 v.template_ref = pw
                 refresh_overlay()
                 refresh_status()
@@ -875,7 +962,9 @@ def build_ui(viewer: Viewer) -> None:
             # only redraw while something tracks the mouse
             if v.ctrl.pending or dragging or v.ctrl.snap_enabled:
                 refresh_overlay()
-        elif v.mode == "Template" and v.template_ref is not None:
+        elif v.mode == "Template" and v.template is not None:
+            # cursor tracked from the first hover: with a centerline the
+            # preview follows the mouse before any click
             v.template_cursor = units.image_to_world(v.bg, p)
             refresh_overlay()
         elif v.mode == "Centerline":
@@ -893,6 +982,7 @@ def build_ui(viewer: Viewer) -> None:
         elif v.mode in ("Draw", "Edit"):
             p = (e.args["offsetX"], e.args["offsetY"])
             v.ctrl.mouse_up(units.image_to_world(v.bg, p))
+            v.reproject_attachments()  # a drag may have moved an attached zone
             refresh_overlay()
             refresh_status()
         elif v.mode == "Centerline":
@@ -939,6 +1029,7 @@ def build_ui(viewer: Viewer) -> None:
             refresh_status()
             return
         if v.mode in ("Draw", "Edit") and v.ctrl.key(name, e.modifiers.ctrl):
+            v.reproject_attachments()  # nudge/undo may have moved attached zones
             refresh_overlay()
             refresh_status()
         elif v.mode == "Centerline" and v.centerline_ctrl.key(name, e.modifiers.ctrl):
@@ -971,7 +1062,7 @@ def build_ui(viewer: Viewer) -> None:
         size = await ui.run_javascript(
             "[document.getElementById('viewport').clientWidth,"
             " document.getElementById('viewport').clientHeight]")
-        v.viewport.fit((v.image.width, v.image.height), tuple(size))
+        v.viewport.fit((v.image_w, v.image_h), tuple(size))
         apply_transform()
         scale_label.set_text(status_scale())
 
@@ -1019,7 +1110,8 @@ def build_ui(viewer: Viewer) -> None:
             .classes("w-48").props("dense clearable")
         with template_sel:
             ui.tooltip("approach template to place (Template tool: click the "
-                       "stop-bar reference point, then click to aim and place)")
+                       "stop-bar reference point — follows the nearest "
+                       "centerline, or a second aim click without one)")
         ui.separator().props("vertical")
         with ui.button(icon="layers").props("flat dense"):
             ui.tooltip("layer visibility")
@@ -1053,8 +1145,8 @@ def build_ui(viewer: Viewer) -> None:
         with ui.element("div").props("id=viewport").classes("grow overflow-hidden") \
                 .style("height: calc(100vh - 120px); position: relative; "
                        "background: #111; cursor: crosshair;"):
-            ii = ui.interactive_image(v.image, content=v.svg(), cross="#00e5ff")
-            ii.style(f"width: {v.image.width}px; height: {v.image.height}px; "
+            ii = ui.interactive_image(v.image_file, content=v.svg(), cross="#00e5ff")
+            ii.style(f"width: {v.image_w}px; height: {v.image_h}px; "
                      f"max-width: none; position: absolute;")
             ii.on("mousedown", on_down,
                   ["offsetX", "offsetY", "button", "buttons", "ctrlKey"])
@@ -1093,6 +1185,11 @@ def build_ui(viewer: Viewer) -> None:
         scale_label = ui.label(status_scale()).classes("text-white font-mono")
 
     ui.timer(0.3, fit_view, once=True)
+    if v.derived_attachments:
+        ui.timer(0.8, lambda: ui.notify(
+            f"{v.derived_attachments} zone"
+            f"{'s' if v.derived_attachments != 1 else ''} re-attached to "
+            "centerlines (will follow centerline edits)"), once=True)
 
 
 def main():
@@ -1102,10 +1199,17 @@ def main():
     ap.add_argument("--port", type=int, default=8080)
     args = ap.parse_args()
 
+    # Load once, then hand ui.run a *root page function*. Without it,
+    # NiceGUI 3's script mode re-executes this whole script — argparse,
+    # load_iprj, Viewer, everything — on every page request via
+    # runpy.run_path, retaining a full project copy per client (~11 MB per
+    # GET on Banks; the pre-3.x behavior this code was written against
+    # built the page once). The Viewer stays shared across clients
+    # (single-user by design until Session 8.1); only the element tree is
+    # rebuilt per client.
     viewer = Viewer(open_project(args.path), args.path)
-    build_ui(viewer)
-    ui.run(port=args.port, title="iprj Designer", reload=False, show=False,
-           dark=True)
+    ui.run(lambda: build_ui(viewer), port=args.port, title="iprj Designer",
+           reload=False, show=False, dark=True)
 
 
 if __name__ in {"__main__", "__mp_main__"}:

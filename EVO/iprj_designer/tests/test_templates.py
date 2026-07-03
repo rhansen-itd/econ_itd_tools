@@ -2,10 +2,13 @@ import math
 
 import pytest
 
+from model.geometry import Centerline
 from model.templates import (ApproachTemplate, Lane, advance_setback_ft,
                               dilemma_setback_ft, expand_and_place,
+                              expand_and_place_on_centerline,
                               expand_template, lane_config_str, load_template,
-                              place_detectors, safe_stopping_distance_ft,
+                              place_detectors, place_detectors_on_centerline,
+                              safe_stopping_distance_ft,
                               save_template, template_from_dict,
                               template_to_dict)
 
@@ -226,3 +229,65 @@ def test_expand_and_place_matches_expand():
     specs = expand_template(t)
     placed = expand_and_place(t, (0.0, 0.0), (0.0, -1.0))
     assert [p.spec for p in placed] == specs
+
+
+# -- curvilinear placement (Session 7.5) --------------------------------------
+
+def test_curvilinear_straight_datum_matches_straight_placement():
+    """On a straight centerline the curvilinear form reproduces
+    place_detectors exactly — including a ref clicked off the datum, a
+    diagonal direction, and unit scaling."""
+    t = acceptance_case()
+    cases = [
+        # centerline (stop bar first, upstream), ref, upstream dir, units/ft
+        ([(100.0, 200.0), (100.0, -400.0)], (100.0, 200.0), (0.0, -1.0), 1.0),
+        ([(100.0, 200.0), (100.0, -400.0)], (88.0, 200.0), (0.0, -1.0), 1.0),
+        ([(50.0, 50.0), (650.0, -750.0)], (50.0, 50.0), (3.0, -4.0), 2.0),
+    ]
+    for cl, ref, upstream, upf in cases:
+        straight = expand_and_place(t, ref, upstream, upf)
+        curvy = expand_and_place_on_centerline(t, cl, ref, upf)
+        for a, b in zip(straight, curvy):
+            assert b.spec == a.spec
+            for (ax, ay), (bx, by) in zip(a.points, b.points):
+                assert bx == pytest.approx(ax, abs=1e-9)
+                assert by == pytest.approx(ay, abs=1e-9)
+
+
+def test_curvilinear_advance_follows_bend():
+    """A 90° bend 200 units upstream of the stop bar: at 45 mph the advance
+    loop (283.8 ft setback) lands on the second leg, rotated to follow it,
+    while detectors near the stop bar match straight placement."""
+    t = ApproachTemplate(lanes=[Lane("T")], speed_mph=45.0)
+    cl = [(0.0, 0.0), (0.0, -200.0), (-300.0, -200.0)]
+    placed = place_detectors_on_centerline(expand_template(t), cl, (0.0, 0.0))
+    by_kind = {p.spec.kind: p for p in placed}
+    # count loop straddles station -15..-10 on the first (straight-up) leg;
+    # SB traffic's right is -x, so lateral 0..12 ft runs x 0 -> -12
+    assert by_kind["count"].points == [(0, 15), (-12, 15), (-12, 10), (0, 10)]
+    # advance loop: stations 283.8..293.8 sit on the westbound second leg
+    # (x = 200 - station); driver's right there is +y (y = -200 + lateral)
+    expected = [(-83.8, -200.0), (-83.8, -188.0), (-93.8, -188.0), (-93.8, -200.0)]
+    for (x, y), (ex, ey) in zip(by_kind["advance"].points, expected):
+        assert x == pytest.approx(ex)
+        assert y == pytest.approx(ey)
+
+
+def test_curvilinear_corners_so_relocate_points():
+    """corners_so is the attachment record: locating each stored
+    (station, offset) on the datum reproduces the placed points."""
+    t = acceptance_case()
+    cl = [(0.0, 0.0), (0.0, -200.0), (-300.0, -200.0)]
+    placed = expand_and_place_on_centerline(t, cl, (5.0, 2.0), 1.5)
+    datum = Centerline(cl)
+    for det in placed:
+        assert det.corners_so is not None and len(det.corners_so) == 4
+        for (s, off), (x, y) in zip(det.corners_so, det.points):
+            px, py = datum.point_at(s, off)
+            assert px == pytest.approx(x, abs=1e-9)
+            assert py == pytest.approx(y, abs=1e-9)
+
+
+def test_straight_placement_carries_no_corners_so():
+    placed = expand_and_place(acceptance_case(), (0.0, 0.0), (0.0, -1.0))
+    assert all(det.corners_so is None for det in placed)
