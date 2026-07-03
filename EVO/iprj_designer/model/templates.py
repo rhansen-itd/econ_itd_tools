@@ -1,6 +1,6 @@
 """Approach-template schema and JSON I/O (see ROADMAP Session 6).
 
-An ApproachTemplate captures the reusable inputs a traffic engineer would
+An ApproachTemplate captures the reusable settings a traffic engineer would
 fill in for one intersection approach: lane geometry, design speed, which
 detectors to place, where numbering/phases start.
 
@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import math
 from collections import Counter
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Sequence
 
@@ -59,7 +59,6 @@ class ApproachTemplate:
     speed_mph: float = 45.0
     lanes: list[Lane] = field(default_factory=lambda: [Lane("T")])
     count_loops: bool = True  # global toggle: place a count loop per lane
-    starting_input: int = 1
     starting_output: int = 1
     direction: str = "N"
     thru_phase: int = 4
@@ -83,7 +82,12 @@ def template_to_dict(t: ApproachTemplate) -> dict:
 
 def template_from_dict(d: dict) -> ApproachTemplate:
     lanes = [Lane(**lane) for lane in d.get("lanes", [])]
-    kwargs = {k: v for k, v in d.items() if k != "lanes"}
+    # Ignore unknown keys so legacy/foreign templates still load — notably the
+    # retired `starting_input`: a detector's output channel maps 1:1 to the
+    # controller input it drives, so numbering is output-only (`starting_input`
+    # was redundant with `starting_output`).
+    known = {f.name for f in fields(ApproachTemplate)} - {"lanes"}
+    kwargs = {k: v for k, v in d.items() if k in known}
     return ApproachTemplate(lanes=lanes, **kwargs)
 
 
@@ -141,7 +145,7 @@ def save_template(template: ApproachTemplate, path: str | Path) -> None:
 # 45 mph -> 165.0 ft. The ROADMAP appendix's ~100/~200 ft figures were
 # placeholders; these formulas govern.
 #
-# Which detectors are generated (in input-numbering order):
+# Which detectors are generated (in output-numbering order):
 #
 # 1. Count loops (if ``count_loops``): 5 ft x lane width per lane, -15 ft.
 # 2. Stop-bar zones: 30 ft x lane width per lane, -5 ft.
@@ -196,7 +200,6 @@ class DetectorSpec:
     """One detector in the approach-local frame (conventions above)."""
     kind: str  # "count" | "stop_bar" | "dilemma" | "advance"
     name: str
-    input_number: int
     output_number: int
     phase: int
     length_ft: float  # along travel
@@ -231,7 +234,7 @@ def _numbered(base_names: list[str]) -> list[str]:
 
 def expand_template(template: ApproachTemplate) -> list[DetectorSpec]:
     """Expand a template into detector specs in the approach-local frame,
-    with auto-generated names and sequential input/output numbers."""
+    with auto-generated names and sequential output numbers."""
     prefix = TRAFFIC_DIRECTION[template.direction]
 
     def lane_phase(lane: Lane) -> int:
@@ -270,7 +273,6 @@ def expand_template(template: ApproachTemplate) -> list[DetectorSpec]:
     names = _numbered([r[1] for r in rows])
     return [
         DetectorSpec(kind=kind, name=name,
-                     input_number=template.starting_input + i,
                      output_number=template.starting_output + i,
                      phase=phase, length_ft=length, width_ft=width,
                      setback_ft=setback, lateral_offset_ft=lateral)

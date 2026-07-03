@@ -157,3 +157,69 @@ def test_centerline_degenerate_points():
 def test_offset_normal():
     assert geometry.offset_normal((1.0, 0.0)) == (0.0, 1.0)
     assert geometry.offset_normal((0.0, 1.0)) == (-1.0, 0.0)
+
+
+# -- rotation (Phase 2) --------------------------------------------------------
+
+def test_polygon_centroid_square():
+    assert geometry.polygon_centroid(SQUARE) == pytest.approx((5.0, 5.0))
+
+
+def test_polygon_centroid_winding_independent():
+    assert geometry.polygon_centroid(list(reversed(SQUARE))) == pytest.approx((5.0, 5.0))
+
+
+def test_polygon_centroid_area_weighted_not_vertex_mean():
+    # L-shape: 2x1 rect (area 2, centroid (1, .5)) + 1x1 on top (centroid
+    # (.5, 1.5)) -> area-weighted centroid (5/6, 5/6); the vertex mean is 1
+    lshape = [(0, 0), (2, 0), (2, 1), (1, 1), (1, 2), (0, 2)]
+    assert geometry.polygon_centroid(lshape) == pytest.approx((5 / 6, 5 / 6))
+
+
+def test_polygon_centroid_degenerate_falls_back_to_mean():
+    collinear = [(0.0, 0.0), (5.0, 0.0), (10.0, 0.0)]
+    assert geometry.polygon_centroid(collinear) == pytest.approx((5.0, 0.0))
+    assert geometry.polygon_centroid([(2.0, 4.0)]) == (2.0, 4.0)
+    assert geometry.polygon_centroid([(0.0, 0.0), (4.0, 2.0)]) == pytest.approx((2.0, 1.0))
+    with pytest.raises(ValueError):
+        geometry.polygon_centroid([])
+
+
+def test_rotate_points_about_explicit_pivot():
+    # +90 deg about the origin maps (10,0)->(0,10): screen-clockwise in y-down
+    rot = geometry.rotate_points([(10.0, 0.0)], 90.0, pivot=(0.0, 0.0))
+    assert rot[0] == pytest.approx((0.0, 10.0))
+
+
+def test_rotate_points_default_pivot_is_centroid():
+    rot = geometry.rotate_points(SQUARE, 90.0)
+    assert geometry.polygon_centroid(rot) == pytest.approx((5.0, 5.0))
+    # square rotated 90 about its center is the same square, corners cycled
+    for p, q in zip(rot, SQUARE[1:] + SQUARE[:1]):
+        assert p == pytest.approx(q, abs=1e-9)
+
+
+def test_rotate_points_roundtrip():
+    poly = [(1.0, 2.0), (8.0, 3.0), (7.0, 9.0), (2.0, 7.0)]
+    back = geometry.rotate_points(geometry.rotate_points(poly, 37.0), -37.0)
+    for p, q in zip(back, poly):
+        assert p == pytest.approx(q)
+
+
+def test_rotation_angle_deg_signs_and_edges():
+    pivot = (5.0, 5.0)
+    assert geometry.rotation_angle_deg(pivot, (10.0, 5.0), (5.0, 10.0)) == pytest.approx(90.0)
+    assert geometry.rotation_angle_deg(pivot, (5.0, 10.0), (10.0, 5.0)) == pytest.approx(-90.0)
+    assert geometry.rotation_angle_deg(pivot, (10.0, 5.0), (0.0, 5.0)) == pytest.approx(180.0)
+    assert geometry.rotation_angle_deg(pivot, pivot, (10.0, 5.0)) == 0.0
+    # magnitude is radius-independent
+    assert geometry.rotation_angle_deg(pivot, (6.0, 5.0), (5.0, 95.0)) == pytest.approx(90.0)
+
+
+def test_rotation_angle_feeds_rotate_points():
+    # the 2-click workflow: grab at `frm`, drag to `to`; rotating by the
+    # measured angle must carry `frm` onto the ray pivot->`to`
+    pivot, frm, to = (3.0, 4.0), (9.0, 4.0), (3.0, -2.0)
+    ang = geometry.rotation_angle_deg(pivot, frm, to)
+    moved = geometry.rotate_points([frm], ang, pivot=pivot)[0]
+    assert moved == pytest.approx((3.0, -2.0))

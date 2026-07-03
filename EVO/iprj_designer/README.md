@@ -1,8 +1,8 @@
 # iprj Designer
 
-A GUI tool for creating and editing Wavetronix/SmartSensor `.iprj` project files:
+A GUI tool for creating and editing Econolite Evo (Epiq) `.iprj` project files:
 draw detection loops of known real-world dimensions over a scaled background
-image, assign attributes (phase, output/input number, zone type), and export a
+image, assign attributes (phase, output number, zone type), and export a
 valid `.iprj`.
 
 ## Why
@@ -92,10 +92,14 @@ click/double-click selects/edits), arrow-key nudging, `f` fit-view, and
 Session 6.1 complete (2026-07-02): approach-template schema
 (`model/templates.py`) — lane configuration (movement + width + per-lane
 advance-detector toggle), design speed, a template-wide count-loops
-toggle, starting input/output numbers, approach direction, thru/LT phase —
+toggle, starting output number, approach direction, thru/LT phase —
 with JSON load/save, and a standalone form (`python gui/templates_ui.py`)
-to create/edit template files under `templates/`. No expansion/placement
-logic yet (Sessions 6.2–6.3).
+to create/edit template files under `templates/`.
+
+The Phase 1 MVP (data model, drawing core, attributes, templates,
+centerline placement, and the ROADMAP Phase 1 UX/file-management pass) is
+complete — see [DESIGN_HISTORY.md](DESIGN_HISTORY.md) for the full
+session-by-session build log and decisions. Current work is tracked in
+[ROADMAP.md](ROADMAP.md).
 
 Run tests with `pytest` from this directory (uses the repo-root `.venv`).
-Next: ROADMAP.md Session 6.2 (template expansion math).

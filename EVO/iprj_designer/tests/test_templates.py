@@ -15,13 +15,12 @@ from model.templates import (ApproachTemplate, Lane, advance_setback_ft,
 
 def acceptance_case() -> ApproachTemplate:
     """The Session 6 appendix example: 45 mph, L|T|T|R @ 12', count loops,
-    starting input 33, north approach (SB traffic), Ph4 thru / Ph7 LT."""
+    starting output 33, north approach (SB traffic), Ph4 thru / Ph7 LT."""
     return ApproachTemplate(
         name="45 mph north approach",
         speed_mph=45.0,
         lanes=[Lane("L"), Lane("T"), Lane("T"), Lane("R")],
         count_loops=True,
-        starting_input=33,
         starting_output=33,
         direction="N",
         thru_phase=4,
@@ -80,7 +79,7 @@ def test_json_is_human_editable(tmp_path):
     path = tmp_path / "t.json"
     save_template(acceptance_case(), path)
     text = path.read_text()
-    assert '"starting_input": 33' in text
+    assert '"starting_output": 33' in text
     assert '"movement": "L"' in text
 
 
@@ -108,7 +107,7 @@ def test_expand_acceptance_table():
     documented ITE formulas — the table's ~100/~200 were placeholders)."""
     specs = expand_template(acceptance_case())
     expected = [
-        # input, name, length, width, setback
+        # output, name, length, width, setback
         (33, "SBL Count", 5, 12, -15),
         (34, "SBT Count 1", 5, 12, -15),
         (35, "SBT Count 2", 5, 12, -15),
@@ -121,7 +120,7 @@ def test_expand_acceptance_table():
         (42, "Ph 4 Advance 1", 10, 12, 283.8),
         (43, "Ph 4 Advance 2", 10, 12, 283.8),
     ]
-    assert [(s.input_number, s.name, s.length_ft, s.width_ft) for s in specs] \
+    assert [(s.output_number, s.name, s.length_ft, s.width_ft) for s in specs] \
         == [(i, n, l, w) for i, n, l, w, _ in expected]
     for spec, (_, _, _, _, setback) in zip(specs, expected):
         assert spec.setback_ft == pytest.approx(setback)
@@ -136,17 +135,17 @@ def test_expand_acceptance_table():
         + ["dilemma"] + ["advance"] * 2
 
 
-def test_expand_without_count_loops_shifts_inputs():
+def test_expand_without_count_loops_shifts_outputs():
     t = acceptance_case()
     t.count_loops = False
     specs = expand_template(t)
     assert specs[0].name == "Ph 7 SBL Stop Bar"
-    assert specs[0].input_number == 33
+    assert specs[0].output_number == 33
     assert len(specs) == 7
 
 
 def test_expand_single_thru_lane_names_unnumbered():
-    t = ApproachTemplate(lanes=[Lane("T")], starting_input=1)
+    t = ApproachTemplate(lanes=[Lane("T")])
     names = [s.name for s in expand_template(t)]
     assert names == ["SBT Count", "Ph 4 SBT Stop Bar", "Ph 4 Dilemma",
                      "Ph 4 Advance"]

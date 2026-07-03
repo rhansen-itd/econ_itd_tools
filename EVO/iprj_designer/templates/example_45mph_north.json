@@ -25,7 +25,6 @@
     }
   ],
   "count_loops": true,
-  "starting_input": 33,
   "starting_output": 33,
   "direction": "N",
   "thru_phase": 4,

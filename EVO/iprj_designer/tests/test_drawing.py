@@ -298,6 +298,36 @@ def test_commit_fills_placeholder_slot_and_undo_restores_it():
     assert is_placeholder(zones[0])
 
 
+def test_insert_many_is_one_undoable_batch():
+    placeholder = EventZone(enable=0, zone_name="")
+    zones = [placeholder, square(100, 0, name="existing")]
+    ctrl = make_ctrl(zones)
+    template_zones = [square(0, 0, name="T1"), square(50, 0, name="T2"),
+                      square(200, 0, name="T3")]
+    ctrl.insert_many(template_zones)
+    # first fills the placeholder slot, the rest append
+    assert [z.zone_name for z in zones] == ["T1", "existing", "T2", "T3"]
+    assert len(ctrl._undo) == 1 and ctrl._undo[-1][0] == "batch"
+    ctrl.undo()
+    # the placeholder slot comes back (not removed), the appended ones do
+    assert len(zones) == 2
+    assert zones[0] is placeholder
+    assert is_placeholder(zones[0])
+    assert zones[1].zone_name == "existing"
+
+
+def test_insert_many_undo_does_not_disturb_earlier_undo_steps():
+    zones = [square(0, 0, name="manual")]
+    ctrl = make_ctrl(zones)
+    ctrl._insert(square(300, 0, name="manual-2"))
+    ctrl.insert_many([square(400, 0, name="T1"), square(450, 0, name="T2")])
+    assert [z.zone_name for z in zones] == ["manual", "manual-2", "T1", "T2"]
+    ctrl.undo()  # undoes the whole template batch, not one detector
+    assert [z.zone_name for z in zones] == ["manual", "manual-2"]
+    ctrl.undo()  # then the earlier single insert
+    assert [z.zone_name for z in zones] == ["manual"]
+
+
 def test_cycle_and_preselect_skip_placeholders():
     zones = [EventZone(enable=0), square(0, 0, name="A"),
              EventZone(enable=0), square(100, 0, name="B"), EventZone(enable=0)]

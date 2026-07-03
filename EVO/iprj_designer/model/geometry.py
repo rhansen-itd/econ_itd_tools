@@ -152,6 +152,65 @@ def dimensioned_rect(
     ]
 
 
+def polygon_centroid(poly: Sequence[Point]) -> Point:
+    """Area centroid (shoelace formula) — the natural rotation pivot.
+
+    Sign-independent of winding order and of y-down vs y-up. Degenerate
+    input (fewer than 3 vertices, or near-zero area such as a collinear
+    "polygon") falls back to the vertex mean.
+    """
+    n = len(poly)
+    if n == 0:
+        raise ValueError("polygon_centroid needs at least one point")
+    if n >= 3:
+        a2 = cx = cy = 0.0  # 2*signed area and unnormalized centroid sums
+        for i in range(n):
+            x1, y1 = poly[i]
+            x2, y2 = poly[(i + 1) % n]
+            cross = x1 * y2 - x2 * y1
+            a2 += cross
+            cx += (x1 + x2) * cross
+            cy += (y1 + y2) * cross
+        if abs(a2) > 1e-12:
+            return (cx / (3.0 * a2), cy / (3.0 * a2))
+    return (sum(x for x, _ in poly) / n, sum(y for _, y in poly) / n)
+
+
+def rotate_points(
+    points: Sequence[Point],
+    angle_deg: float,
+    pivot: Point | None = None,
+) -> list[Point]:
+    """Rotate *points* by *angle_deg* around *pivot* (default: the polygon's
+    `polygon_centroid`).
+
+    Uses the standard rotation matrix, so a positive angle is CCW in y-up
+    math — which renders as *clockwise on screen* in this project's y-down
+    world coordinates. Pair with `rotation_angle_deg` (same convention) and
+    the rotated shape follows the mouse either way.
+    """
+    if pivot is None:
+        pivot = polygon_centroid(points)
+    px, py = pivot
+    c, s = math.cos(math.radians(angle_deg)), math.sin(math.radians(angle_deg))
+    return [(px + (x - px) * c - (y - py) * s,
+             py + (x - px) * s + (y - py) * c) for x, y in points]
+
+
+def rotation_angle_deg(pivot: Point, from_pt: Point, to_pt: Point) -> float:
+    """Signed angle (degrees, (-180, 180]) that carries the ray
+    pivot→*from_pt* onto the ray pivot→*to_pt* — the angle to feed
+    `rotate_points` in a two-click/drag rotation workflow. Same sign
+    convention as `rotate_points`. Returns 0.0 when either point coincides
+    with the pivot."""
+    ax, ay = from_pt[0] - pivot[0], from_pt[1] - pivot[1]
+    bx, by = to_pt[0] - pivot[0], to_pt[1] - pivot[1]
+    if (ax == 0 and ay == 0) or (bx == 0 and by == 0):
+        return 0.0
+    angle = math.degrees(math.atan2(ax * by - ay * bx, ax * bx + ay * by))
+    return 180.0 if angle == -180.0 else angle
+
+
 def offset_normal(direction: Point) -> Point:
     """Unit normal along which positive `Centerline` offsets lie:
     *direction* (a unit vector) rotated 90° so that in y-down world space

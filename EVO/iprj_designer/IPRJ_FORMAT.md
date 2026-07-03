@@ -115,9 +115,9 @@ two-point calibration across the image's top edge (`units.calibrate_image_width`
 | `Enable` | 0/1 |
 | `ZoneName` | free text, e.g. `"PH 4 SB inside"`. The `"{index+1}: "` prefix is a **converter artifact**, not a vendor rule — only 172 of 2544 surveyed zones (all in converter-written files) carry it; vendor-authored names are plain |
 | `NrOfZonePoints` | vertex count (4 for rectangles; up to 10 seen). Matches the actual `ZonePoint` count in all 29 files, so `iprj_io` derives it from the point list on save |
-| `ZoneType` | integer enum: `0`, `1`, `2` observed. `0` is the default (all placeholders; advance/count zones); `1` appears on stop-bar zones ("SB…") in vendor files; `2` only in one legacy converter file. Vendor-UI names for the values **(open — needs vendor software)** |
+| `ZoneType` | integer enum, vendor-UI names confirmed 2026-07-03 (Phase 2): `0` **Motion**, `1` **Presence**, `2` **Sidewalk** (`model/domain.ZoneType`). Consistent with the survey: stop-bar zones ("SB…") are type 1 because stop-bar detection is presence detection; advance/count zones and all placeholders are 0. Sidewalk zones take no conditions |
 | `PhaseNumber` | signal phase (0–8 observed) |
-| `OutputNumber` | detector output/input channel; 0 and 17–64 observed across files |
+| `OutputNumber` | detector output channel (maps 1:1 to the controller input it drives — this software numbers by output only); 0 and 17–64 observed across files |
 | `EventMessageDelay`, `EventMessageExtend` | timing, integers |
 | `EtaEnable`, `EtaPoint_X`, `EtaPoint_Y` | ETA feature |
 | `ZonePoint_{k}_X`, `ZonePoint_{k}_Y` | polygon vertices, world px |
@@ -143,15 +143,38 @@ and `QueuelengthMax="3047.70"` — exactly 9999 ft in **meters**. Enabled
 conditions use wide-open sentinels for the un-filtered bounds:
 `VelocityMax="16091.79"` (≈9999 mph), `QueuelengthMax="3047.70"`,
 `EtaMax="999.00"`, and `Nr…Max="255"`; the designer writes the same
-sentinels for new conditions (`gui/app.py new_condition`) and edits
-velocities in mph via `units.mph_to_kmh/kmh_to_mph`. `ConditionClass`
-vendor-UI meaning **(open — needs vendor software)**; `0` observed on the
-real speed conditions.
+sentinels for new conditions (`model/domain.default_condition`) and edits
+velocities in mph via `units.mph_to_kmh/kmh_to_mph`. The vendor UI shows
+speed bounds as min 0 / max 9999 (mph).
+
+**Semantics (resolved 2026-07-03, Phase 2 — vendor software consulted;
+codes in `model/domain.py`):** there is no per-type condition schema on
+disk — every condition is written with the full attribute set, and which
+fields are meaningful follows from the owning zone's `ZoneType`:
+
+- **Presence (1)**: output, delay, extend, `Queuelength…`, and the
+  per-class `Nr…` vehicle-count filters.
+- **Motion (0)**: `ConditionClass`, `Direction`, delay, extend,
+  `Velocity…`, `Eta…` (plus output — the enabled speed conditions in the
+  wild all carry a real `OutputNumber`).
+- **Sidewalk (2)**: no conditions at all.
+
+`ConditionClass` is the **vehicle-class filter** of a Motion condition, not
+a condition-type discriminator: `0` all, `1` car, `2` bike/ped, `3` small
+truck, `4` big truck, `5` car + big truck, `6` car + small truck, `7` car +
+small + big truck (the `0` on the real speed conditions = "all classes").
+`Direction` is relative to the sensor: `0` both directions, `1`
+approaching, `2` receding.
 
 ### Ignore zones
 
 `Radarsensor_{i}_IgnoreZone_{j}_…`: `Enable`, `IgnoreEverything`, `ZoneName`,
 `NrOfZonePoints`, `ZonePoint_{k}_X/Y`
+
+Survey of the enabled ignore zones in the wild (48 across the site files):
+38 have `IgnoreEverything="1"`, 10 have `0`; every disabled placeholder is
+`0`. `model/domain.new_ignore_zone` defaults to `1` accordingly. What
+exactly a `0` zone still ignores **(open — needs vendor software)**.
 
 ### Annotations
 
@@ -204,7 +227,10 @@ endpoint with another Lineal is part of a centerline. Consequences:
 - [x] `ZoneType` observed values (0/1/2 with name correlations), observed
       `OutputNumber` range (0, 17–64), `ZoneName` prefix shown to be a
       converter artifact — documented in the Event zones table
-- [ ] **(open)** vendor-UI names for `ZoneType` values — needs vendor software
+- [x] vendor-UI names for `ZoneType` values, `ConditionClass` and
+      `Direction` codes, per-type condition-field relevance — resolved
+      2026-07-03 from the vendor software (Phase 2); see the Event zones
+      and Conditions sections and `model/domain.py`
 - [ ] **(open)** which attributes are mandatory for the vendor software to
       load a file — untestable without the vendor software; mitigated by
       writing the vendor's own form with full placeholder arrays preserved

@@ -18,19 +18,30 @@ the opened project is reconstructed into its own CenterlineController, and
 the current set is written back out as Lineals on save. Session 7.5 routes
 template placement through the station/offset engine whenever a centerline
 is drawn — detectors follow the approach curvature, and editing the
-centerline afterward re-stations the zones placed along it.
+centerline afterward re-stations the zones placed along it. Phase 1 adds a
+2-point Ruler tool for quick distance checks, an undo fix so a placed
+template is removed as one unit, a background-visibility fix, and in-app
+New/Open/Upload file management (see the New/Open/Upload buttons and the
+Ruler tool below).
 
 Usage:
     python gui/app.py [site.iprj | background.png] [--port 8080]
 
 Defaults to sites/Banks/banks.iprj. Open http://localhost:<port> in a
 browser. Mouse wheel zooms at the cursor; drag pans (in Pan mode, or with
-the middle button in any mode).
+the middle button in any mode). Use New/Open/Upload BG in the toolbar to
+switch projects without restarting the app.
 
-Keys: l draw · e edit toggle · s sensor mode · g snap · u / Ctrl-Z undo ·
-Esc cancel · digits/d + Enter dimension entry · n/b cycle selection ·
-arrows nudge · x/Del delete · Ctrl-drag copies the selected zone ·
-p / double-click zone properties · f fit view · Ctrl-S save.
+Keys: l draw · e edit toggle · s sensor mode · r ruler · g snap ·
+u / Ctrl-Z undo · Esc cancel · digits/d + Enter dimension entry ·
+n/b cycle selection · arrows nudge · x/Del delete · Ctrl-drag copies the
+selected zone · p / double-click zone properties · f fit view · Ctrl-S save.
+
+Ruler tool: click to set the first point, then move the mouse (or drag) to
+see the live distance in feet; click again — or release a drag — to set the
+second point. Click again to start a new measurement; Esc cancels a
+measurement in progress. The last ruler stays visible until cleared (the
+"clear markers & ruler" toolbar button) or replaced.
 
 Template tool: pick a template from the toolbar dropdown, switch to the
 Template tool, and click the stop-bar reference point (where the stop bar
@@ -75,7 +86,7 @@ from gui.drawing import (DIM_OFF, CenterlineController, DrawingController,
                          derive_attachments, insert_zone, is_placeholder,
                          next_output_number)
 from gui.viewport import Viewport
-from model import units
+from model import domain, units
 from model.centerline import load_centerlines, save_centerlines
 from model.iprj_io import (Background, Condition, EventZone, Project, Sensor,
                            load_iprj, save_iprj)
@@ -88,16 +99,13 @@ TEMPLATES_DIR = Path(__file__).resolve().parents[1] / "templates"
 PHASE_COLORS = ["#d62728", "#1f77b4", "#2ca02c", "#ff7f0e", "#9467bd",
                 "#8c564b", "#e377c2", "#bcbd22", "#17becf"]
 
-ZONE_TYPE_NAMES = {0: "0 — standard", 1: "1 — stop bar", 2: "2 — (legacy)"}
+# Vendor-confirmed ZoneType names (see model/domain.py): 0 Motion,
+# 1 Presence, 2 Sidewalk.
+ZONE_TYPE_NAMES = {int(t): f"{int(t)} — {name}"
+                   for t, name in domain.ZONE_TYPE_NAMES.items()}
 
-
-def new_condition(output: int = 0) -> Condition:
-    """Enabled condition with the vendor's wide-open filter sentinels
-    (observed in the field files: ≈9999 mph, 9999 ft queue, 255 counts)."""
-    return Condition(enable=1, output_number=output,
-                     velocity_max=16091.79, queuelength_max=3047.70,
-                     eta_max=999.0, nr_pedest_max=255, nr_cars_max=255,
-                     nr_small_trucks_max=255, nr_big_trucks_max=255)
+# Vendor-default condition factory moved to the model layer in Phase 2.
+new_condition = domain.default_condition
 
 
 def open_project(path: Path) -> Project:
@@ -115,6 +123,13 @@ def open_project(path: Path) -> Project:
 def template_files() -> dict[str, str]:
     TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
     return {str(p): p.name for p in sorted(TEMPLATES_DIR.glob("*.json"))}
+
+
+def iprj_files() -> dict[str, str]:
+    root = REPO / "sites"
+    if not root.is_dir():
+        return {}
+    return {str(p): str(p.relative_to(root)) for p in sorted(root.glob("**/*.iprj"))}
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +179,11 @@ class Viewer:
         self.cal_points: list[tuple[float, float]] = []  # world px, pending 2-pt
         self.drag_anchor: tuple[float, float] | None = None
         self.sensor_drag: dict | None = None  # in-flight sensor move
+        # 2-point ruler (Phase 1): click to start, click again (or a real
+        # drag-release) to end; ruler_pending is true between the two.
+        self.ruler_start: tuple[float, float] | None = None  # world px
+        self.ruler_end: tuple[float, float] | None = None    # world px
+        self.ruler_pending = False
         # px per SVG unit shrinks as we zoom in; keep overlay strokes readable
         self.overlay_px = 2.0
         # template placement (Session 6.3): ref click -> aim click -> place
@@ -265,7 +285,23 @@ class Viewer:
             reading = self.centerline_ctrl.station_readout((wx, wy))
             if reading:
                 return f"{base}   |   {reading}"
+        if self.mode == "Ruler" and self.ruler_start is not None and self.ruler_pending:
+            return f"{base}   |   distance: {self._ruler_reading(self.ruler_start, (wx, wy))}"
         return base
+
+    def _ruler_reading(self, p0, p1) -> str:
+        d = math.dist(p0, p1)
+        fpp = self.ft_per_px()
+        return f"{d * fpp:.1f} ft" if fpp is not None else f"{d:.1f} px (uncalibrated)"
+
+    def ruler_status(self) -> str:
+        if self.ruler_start is None:
+            return "mode: ruler | click to set the first point"
+        if self.ruler_pending:
+            return ("mode: ruler | drag or click to set the second point  "
+                    "[Esc cancels]")
+        return (f"mode: ruler | {self._ruler_reading(self.ruler_start, self.ruler_end)} "
+                "| click to start a new measurement")
 
     def template_status(self) -> str:
         if self.template is None:
@@ -364,6 +400,19 @@ class Viewer:
         for wp in self.cal_points:
             x, y = w2i(wp)
             parts.append(_cross(x, y, 6 * lw, "magenta", lw))
+        if self.ruler_start is not None and self.ruler_end is not None:
+            p0, p1 = w2i(self.ruler_start), w2i(self.ruler_end)
+            parts.append(f'<line x1="{p0[0]:.1f}" y1="{p0[1]:.1f}" x2="{p1[0]:.1f}" '
+                         f'y2="{p1[1]:.1f}" stroke="#ffab00" stroke-width="{lw}" '
+                         f'stroke-dasharray="{3 * lw} {2 * lw}"/>')
+            for p in (p0, p1):
+                parts.append(_cross(p[0], p[1], 4 * lw, "#ffab00", lw))
+            label = self._ruler_reading(self.ruler_start, self.ruler_end)
+            mx, my = (p0[0] + p1[0]) / 2, (p0[1] + p1[1]) / 2
+            parts.append(f'<text x="{mx:.1f}" y="{my - 5 * lw:.1f}" fill="#ffab00" '
+                         f'font-size="{font:.1f}" text-anchor="middle" '
+                         f'paint-order="stroke" stroke="black" '
+                         f'stroke-width="{font / 6:.2f}">{label}</text>')
         # in-progress drawing: clicked corners, rubber-band preview, snap dot
         preview = self.ctrl.preview_polygon()
         if preview and len(preview) >= 2:
@@ -426,11 +475,15 @@ class Viewer:
 # App
 # ---------------------------------------------------------------------------
 
-def build_ui(viewer: Viewer) -> None:
+def build_ui(viewer: Viewer, state: dict) -> None:
     v = viewer
 
+    # interactive_image's <img> sets opacity via an inline Vue :style
+    # binding, which always wins over a class selector — !important is
+    # required for .bg-off to actually hide it.
     ui.add_head_html(
-        "<style>body { background: #222; } .bg-off img { opacity: 0; }</style>"
+        "<style>body { background: #222; } "
+        ".bg-off img { opacity: 0 !important; }</style>"
         # keep Ctrl-S for project save instead of the browser's save dialog
         "<script>document.addEventListener('keydown', e => {"
         " if ((e.ctrlKey || e.metaKey) && e.key === 's') e.preventDefault();"
@@ -737,15 +790,19 @@ def build_ui(viewer: Viewer) -> None:
                 return
             placed = expand_and_place(v.template, v.template_ref, upstream,
                                       1.0 / fpp)
-        for det in placed:
-            zone = EventZone(
-                enable=1, zone_name=det.spec.name,
-                zone_type=1 if det.spec.kind == "stop_bar" else 0,
-                phase_number=det.spec.phase, output_number=det.spec.output_number,
-                points=[(float(x), float(y)) for x, y in det.points])
-            insert_zone(v.active_zones(), zone)
-            if cl_ctrl is not None and det.corners_so is not None:
-                cl_ctrl.attach(zone, det.corners_so)
+        zones = [EventZone(
+            enable=1, zone_name=det.spec.name,
+            zone_type=int(domain.ZoneType.PRESENCE if det.spec.kind == "stop_bar"
+                          else domain.ZoneType.MOTION),
+            phase_number=det.spec.phase, output_number=det.spec.output_number,
+            points=[(float(x), float(y)) for x, y in det.points])
+            for det in placed]
+        # one undo op for the whole template, not one per detector
+        v.ctrl.insert_many(zones)
+        if cl_ctrl is not None:
+            for zone, det in zip(zones, placed):
+                if det.corners_so is not None:
+                    cl_ctrl.attach(zone, det.corners_so)
         v.template_ref = None
         v.template_cursor = None
         refresh_overlay()
@@ -791,6 +848,77 @@ def build_ui(viewer: Viewer) -> None:
                 ui.button("Cancel", on_click=dialog.close)
         dialog.open()
 
+    # -- file management (New / Open / Upload background) ----------------------
+    # No file is currently open in the browser, so switching projects can't
+    # just mutate `v` in place — a fresh Viewer needs a fresh element tree
+    # (image size, SVG viewBox, etc). `state["viewer"]` is what the root page
+    # function (`main()`) hands to `build_ui` on each page load, so swapping
+    # it and reloading the client picks up the new project without
+    # restarting the server process.
+
+    def swap_viewer(new_viewer: Viewer):
+        state["viewer"] = new_viewer
+        ui.navigate.reload()
+
+    def new_project():
+        with ui.dialog() as dialog, ui.card().style("min-width: 420px"):
+            def start_blank():
+                dialog.close()
+                swap_viewer(Viewer(Project(background=Background()),
+                                   Path("untitled.png")))
+
+            async def start_from_upload(e):
+                try:
+                    img = Image.open(io.BytesIO(await e.file.read()))
+                    buf = io.BytesIO()
+                    img.convert("RGB").save(buf, format="PNG")
+                except Exception as exc:  # noqa: BLE001 — surface any decode error
+                    ui.notify(f"couldn't read image: {exc}", type="negative")
+                    return
+                bg = Background(image_base64=base64.b64encode(buf.getvalue())
+                                .decode("ascii"))
+                dialog.close()
+                swap_viewer(Viewer(Project(background=bg), Path(e.file.name)))
+
+            ui.label("New project").classes("text-lg")
+            ui.button("Blank canvas", on_click=start_blank).classes("w-full")
+            ui.separator()
+            ui.label("…or start from an uploaded background image:") \
+                .classes("text-xs text-gray-500")
+            ui.upload(auto_upload=True, on_upload=start_from_upload) \
+                .props('accept=".png,.jpg,.jpeg,.bmp"').classes("w-full")
+            ui.button("Cancel", on_click=dialog.close)
+        dialog.open()
+
+    def open_existing():
+        with ui.dialog() as dialog, ui.card().style("min-width: 480px"):
+            ui.label("Open project").classes("text-lg")
+            found = iprj_files()
+            if found:
+                ui.select(found, label="known sites",
+                          on_change=lambda e: path_in.set_value(e.value)) \
+                    .classes("w-full").props("dense clearable")
+            path_in = ui.input("path to .iprj", value=str(v.source)) \
+                .classes("w-full")
+
+            def apply():
+                p = Path(path_in.value).expanduser()
+                if not p.is_file():
+                    ui.notify(f"not found: {p}", type="negative")
+                    return
+                try:
+                    project = load_iprj(p)
+                except Exception as exc:  # noqa: BLE001 — surface any parse error
+                    ui.notify(f"failed to load {p}: {exc}", type="negative")
+                    return
+                dialog.close()
+                swap_viewer(Viewer(project, p))
+
+            with ui.row():
+                ui.button("Open", on_click=apply)
+                ui.button("Cancel", on_click=dialog.close)
+        dialog.open()
+
     # -- mouse handling (offsetX/Y == image px: element kept at natural size)
 
     def refresh_status():
@@ -805,6 +933,8 @@ def build_ui(viewer: Viewer) -> None:
         elif v.mode == "Centerline":
             status_label.set_text(f"C{v.active_cli + 1}/{len(v.centerlines)} | "
                                   f"{v.centerline_ctrl.status()}")
+        elif v.mode == "Ruler":
+            status_label.set_text(v.ruler_status())
         else:
             status_label.set_text(f"mode: {v.mode.lower()}")
         snap_switch.set_value(v.ctrl.snap_enabled)  # no-op when already equal
@@ -895,6 +1025,14 @@ def build_ui(viewer: Viewer) -> None:
     def toggle_zone_panel():
         zone_panel.set_visibility(not zone_panel.visible)
 
+    def clear_markers_and_ruler():
+        v.markers.clear()
+        v.ruler_start = None
+        v.ruler_end = None
+        v.ruler_pending = False
+        refresh_overlay()
+        refresh_status()
+
     def on_down(e):
         p = (e.args["offsetX"], e.args["offsetY"])
         button = e.args.get("button", 0)
@@ -940,6 +1078,17 @@ def build_ui(viewer: Viewer) -> None:
             v.centerline_ctrl.mouse_down(units.image_to_world(v.bg, p))
             refresh_overlay()
             refresh_status()
+        elif button == 0 and v.mode == "Ruler":
+            pw = units.image_to_world(v.bg, p)
+            if v.ruler_start is None or not v.ruler_pending:
+                v.ruler_start = pw
+                v.ruler_end = pw
+                v.ruler_pending = True
+            else:
+                v.ruler_end = pw
+                v.ruler_pending = False
+            refresh_overlay()
+            refresh_status()
 
     def on_move(e):
         p = (e.args["offsetX"], e.args["offsetY"])
@@ -972,6 +1121,9 @@ def build_ui(viewer: Viewer) -> None:
             v.centerline_ctrl.mouse_move(units.image_to_world(v.bg, p), dragging)
             if dragging:
                 refresh_overlay()
+        elif v.mode == "Ruler" and v.ruler_pending:
+            v.ruler_end = units.image_to_world(v.bg, p)
+            refresh_overlay()
 
     def on_up(e):
         v.drag_anchor = None
@@ -990,6 +1142,16 @@ def build_ui(viewer: Viewer) -> None:
             v.centerline_ctrl.mouse_up(units.image_to_world(v.bg, p))
             refresh_overlay()
             refresh_status()
+        elif v.mode == "Ruler" and v.ruler_pending:
+            # a real click-drag-release finishes the measurement in one
+            # gesture; a plain click leaves it pending for a second click
+            p = (e.args["offsetX"], e.args["offsetY"])
+            pw = units.image_to_world(v.bg, p)
+            if math.dist(pw, v.ruler_start) > v.ctrl.handle_radius / 3:
+                v.ruler_end = pw
+                v.ruler_pending = False
+                refresh_overlay()
+                refresh_status()
 
     def on_dblclick(e):
         # the two mousedowns already selected the zone under the cursor
@@ -1018,6 +1180,9 @@ def build_ui(viewer: Viewer) -> None:
         if name == "s":
             tool.value = "Sensor"
             return
+        if name == "r":
+            tool.value = "Ruler"
+            return
         if name in ("p", "Enter") and v.mode == "Edit" \
                 and v.ctrl.dim_stage == DIM_OFF:
             zone_properties()
@@ -1025,6 +1190,13 @@ def build_ui(viewer: Viewer) -> None:
         if name == "Escape" and v.mode == "Template" and v.template_ref is not None:
             v.template_ref = None
             v.template_cursor = None
+            refresh_overlay()
+            refresh_status()
+            return
+        if name == "Escape" and v.mode == "Ruler" and v.ruler_pending:
+            v.ruler_start = None
+            v.ruler_end = None
+            v.ruler_pending = False
             refresh_overlay()
             refresh_status()
             return
@@ -1049,6 +1221,10 @@ def build_ui(viewer: Viewer) -> None:
             v.template_cursor = None
         if e.value != "Centerline":
             v.centerline_ctrl.end_drag()
+        if e.value != "Ruler" and v.ruler_pending:
+            v.ruler_start = None
+            v.ruler_end = None
+            v.ruler_pending = False
         refresh_overlay()
         refresh_status()
 
@@ -1071,11 +1247,17 @@ def build_ui(viewer: Viewer) -> None:
     with ui.row().classes("w-full items-center gap-2 px-2 no-wrap overflow-x-auto"):
         title_label = ui.label(f"iprj Designer — {v.source.name}") \
             .classes("text-lg text-white whitespace-nowrap")
+        with ui.button(icon="note_add", on_click=new_project).props("flat dense"):
+            ui.tooltip("new project (blank or from an uploaded image)")
+        with ui.button(icon="folder_open", on_click=open_existing).props("flat dense"):
+            ui.tooltip("open an existing .iprj file")
+        ui.separator().props("vertical")
         tool = ui.toggle(["Pan", "Draw", "Edit", "Sensor", "Marker",
-                          "Calibrate 2-pt", "Template", "Centerline"], value="Pan",
-                         on_change=change_tool).props("dense")
+                          "Calibrate 2-pt", "Template", "Centerline", "Ruler"],
+                         value="Pan", on_change=change_tool).props("dense")
         with tool:
-            ui.tooltip("accelerators: l draw · e edit toggle · s sensor · Esc cancel")
+            ui.tooltip("accelerators: l draw · e edit toggle · s sensor · "
+                       "r ruler · Esc cancel")
         snap_switch = ui.switch("snap", on_change=toggle_snap).props("dense")
         with snap_switch:
             ui.tooltip("vertex/midpoint snapping (g)")
@@ -1128,9 +1310,8 @@ def build_ui(viewer: Viewer) -> None:
         with ui.button(icon="fit_screen", on_click=fit_view).props("flat dense"):
             ui.tooltip("fit image to window (f)")
         with ui.button(icon="wrong_location",
-                       on_click=lambda: (v.markers.clear(), refresh_overlay())) \
-                .props("flat dense"):
-            ui.tooltip("clear markers")
+                       on_click=clear_markers_and_ruler).props("flat dense"):
+            ui.tooltip("clear markers & ruler")
         ui.space()
         with ui.button(icon="save", on_click=save).props("flat dense"):
             ui.tooltip("save (Ctrl-S)")
@@ -1206,10 +1387,13 @@ def main():
     # GET on Banks; the pre-3.x behavior this code was written against
     # built the page once). The Viewer stays shared across clients
     # (single-user by design until Session 8.1); only the element tree is
-    # rebuilt per client.
-    viewer = Viewer(open_project(args.path), args.path)
-    ui.run(lambda: build_ui(viewer), port=args.port, title="iprj Designer",
-           reload=False, show=False, dark=True)
+    # rebuilt per client. `state["viewer"]` is looked up fresh on every page
+    # load rather than captured once, so New/Open (Phase 1) can swap in a
+    # different Viewer and reload the client to pick it up — no server
+    # restart required.
+    state = {"viewer": Viewer(open_project(args.path), args.path)}
+    ui.run(lambda: build_ui(state["viewer"], state), port=args.port,
+           title="iprj Designer", reload=False, show=False, dark=True)
 
 
 if __name__ in {"__main__", "__mp_main__"}:

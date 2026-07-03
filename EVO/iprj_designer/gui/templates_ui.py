@@ -2,7 +2,7 @@
 
 Minimal NiceGUI form for creating/editing approach-template JSON files
 (model/templates.py): name, design speed, lane configuration, detector
-toggles, starting input/output, approach direction, thru/LT phase. Template
+toggles, starting output, approach direction, thru/LT phase. Template
 management stays lightweight this session — pick a file, edit the form,
 save; no expansion/placement logic (that's Session 6.2/6.3), and no
 duplicate/rename workflow (edit the JSON file directly for that).
@@ -77,7 +77,6 @@ def build_ui(template: ApproachTemplate, path: Path | None) -> None:
         speed.value = t.speed_mph
         direction.value = t.direction
         count_loops.value = t.count_loops
-        starting_input.value = t.starting_input
         starting_output.value = t.starting_output
         thru_phase.value = t.thru_phase
         lt_phase.value = t.lt_phase
@@ -95,7 +94,6 @@ def build_ui(template: ApproachTemplate, path: Path | None) -> None:
             speed_mph=float(speed.value or 0),
             lanes=lanes,
             count_loops=bool(count_loops.value),
-            starting_input=int(starting_input.value or 0),
             starting_output=int(starting_output.value or 0),
             direction=direction.value,
             thru_phase=int(thru_phase.value or 0),
@@ -182,8 +180,6 @@ def build_ui(template: ApproachTemplate, path: Path | None) -> None:
                            'is on, e.g. "N" = north approach (SB traffic)')
             count_loops = ui.checkbox("Count loops")
         with ui.row().classes("items-center gap-4"):
-            starting_input = ui.number("Starting input #", min=0,
-                                       precision=0).classes("w-40")
             starting_output = ui.number("Starting output #", min=0,
                                         precision=0).classes("w-40")
         with ui.row().classes("items-center gap-4"):

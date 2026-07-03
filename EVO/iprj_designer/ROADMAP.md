@@ -1,776 +1,277 @@
-# Roadmap — iprj Designer
+# Roadmap — iprj Designer (Phase 2 & Refinement)
 
-Work is broken into sessions sized for one focused Claude Code sitting.
-Each session ends with something runnable/testable and a short update to this
-file (check the boxes, note decisions). Sessions 1–4 produce a usable MVP;
-5–8 layer on the advanced features.
+Phase 1 (Sessions 1–7: data model, drawing core, attributes, templates,
+centerline placement) is complete — see [[DESIGN_HISTORY.md]] for that build
+history and the decisions made along the way.
 
-**Architecture rule that makes the phasing work:** everything under
-`model/` (iprj I/O, units, geometry, templates) is pure Python with no GUI
-imports. The GUI is a thin shell over it. This is what lets the eventual
-webserver upgrade — and even a framework swap — happen without touching the
-core.
+Work below is broken into phases, targeted at different Claude models per
+[[CLAUDE.md]] model-routing rules:
+* **Fable** — pure Python math, geometry, schema, and tests (`model/`).
+* **Sonnet** — NiceGUI wiring, UI interactions, file management (`gui/`).
+* **Opus** — cross-module architectural planning.
 
-Proposed layout as code lands:
-
-```
-EVO/iprj_designer/
-├── README.md / ROADMAP.md / IPRJ_FORMAT.md / CLAUDE.md
-├── model/          # pure python: iprj_io.py, units.py, geometry.py, templates.py
-├── gui/            # framework-specific shell
-├── templates/      # approach-template JSON files
-└── tests/          # round-trip + geometry tests (pytest)
-```
+Tell the agent "do Phase X of ROADMAP.md" (or "Phase X.Y") to run a scope
+below; check off items and log decisions in [[DESIGN_HISTORY.md]] as they
+land, the same way Phase 1 sessions did.
 
 ---
 
-## Session 1 — Data model & iprj round-trip (no GUI)
+## Phase 1 — Quick Wins, Fixes & File Management (Target: Sonnet)
 
-The foundation everything else sits on; also resolves the format unknowns in
-IPRJ_FORMAT.md.
+UI and state-wiring tasks that require no complex geometry or schema changes.
 
 Scope:
-- [x] Dataclasses: `Project`, `Background/Calibration`, `Sensor`, `EventZone`,
-      `Condition`, `IgnoreZone`, `Lineal`, `TextLabel` (`model/iprj_io.py`)
-- [x] `load_iprj(path) -> Project` and `save_iprj(project, path)` with
-      byte-faithful attribute round-trip (order/format tolerant)
-- [x] pytest round-trip tests against every file in `sites/**/*.iprj`
-      (29/29 files, `tests/test_roundtrip.py`)
-- [x] `units.py`: ft↔m↔px conversions; calibration constructors
-      (image-width-known, two-points-known-distance); note the scale is
-      re-derived from the reference pair, not the rounded `MeterPerPixel`
-- [x] Resolve the IPRJ_FORMAT.md verification checklist; update that doc
-      (two items remain open pending vendor software — see doc)
-- [x] Small script: `scripts/overlay_zones.py` — zones verified landing on
-      the lanes for Banks and US95&SH8
+- [x] Update documentation terminology: replace references of
+      "Wavetronix/SmartSensor" with "Econolite Evo (Epiq)".
+- [x] Fix background visibility toggle.
+- [x] Fix Template Undo stack: ensure the `DrawingController` captures the
+      bulk insertion of a template as a single, undoable operation that
+      removes all associated zones.
+- [x] Add 2-Point Ruler Tool: a simple canvas tool for quick distance checks
+      (click to start, drag to see live distance in feet, click to end).
+- [x] In-App File Management: add UI elements to start a New file, Open an
+      existing `.iprj` file, and Upload a background PNG without restarting
+      the app via CLI.
 
 Suggested prompt:
-> In EVO/iprj_designer, do Session 1 of ROADMAP.md: build the pure-Python iprj
-> data model and load/save round-trip per IPRJ_FORMAT.md, with pytest tests
-> against all iprj files under sites/. Resolve the open questions in
-> IPRJ_FORMAT.md and update it with findings. Finish with a quick matplotlib
-> overlay script proving zones land correctly on the background image.
+> [Sonnet] In EVO/iprj_designer, do Phase 1 of ROADMAP.md: execute the quick
+> UI wins, fix the undo stack for templates, add the 2-point ruler, and
+> build the in-app file management UI.
 
-## Session 2 — Framework spike & scaled image viewer
+## Phase 2 — Domain Accuracy & Core Geometry (Target: Fable)
 
-Decision session: pick the GUI framework by building the same tiny prototype
-in the candidates and comparing feel.
-
-Leading candidate: **NiceGUI** — Python-only, browser-based (so the webserver
-upgrade is "already done"), `interactive_image` gives mouse down/move/up with
-image coordinates plus an SVG overlay layer, `ui.keyboard` for key commands,
-and toolbars/dialogs are trivial later. Cost: zoom/pan and hover-coordinate
-readout must be built by hand (viewBox math).
-Alternative: **Dash/plotly** — zoom + hover coords for free (the part liked in
-the EVO plotly tools), but mousemove-granularity drawing and mid-draw keyboard
-dimension entry fight the framework (server round-trips, JS escape hatches).
-Fallback if neither feels right: FastAPI + a small JS canvas (Konva.js), still
-driving the Python model.
+Pure math and data schema work. *(Note: ask user for exact Econolite vehicle
+codes, speeds, and direction codes before starting.)*
 
 Scope:
-- [x] Spike A (NiceGUI): load an image, zoom/pan, live cursor readout in
-      feet, click to drop a marker — all worked; Spike B (Dash) not needed
-- [x] Calibration UI: enter known image width/height in feet, OR click two
-      points and type the distance; writes the model's Calibration
-      (`units.calibrate_*` on the loaded `Background`)
-- [x] Record the framework decision + rationale at the bottom of this file
-- [x] Keep: `gui/app.py` opens a project (new-from-image or existing .iprj
-      via Session 1 loader) and renders background + existing zones;
-      zoom/pan math isolated in `gui/viewport.py` (pure python, tested)
+- [x] Fix Loop Types mapping: update to correct vendor specs (0=Motion,
+      1=Presence, 2=Sidewalk — vendor-UI names, confirmed 2026-07-03).
+- [x] Update condition schema to accurately support different condition
+      types (direction, speed, vehicle type) and their specific fields.
+- [x] Build pure-Python geometry/schema models for Ignore Zones and generic
+      Lineals.
+- [x] Implement rotation math: calculate rotation of polygons around a
+      calculated centroid or a user-provided 2D pivot point.
 
 Suggested prompt:
-> In EVO/iprj_designer, do Session 2 of ROADMAP.md: spike the GUI framework
-> (start with NiceGUI) — scaled background image viewer with zoom/pan, live
-> cursor position in feet, and both calibration methods (known image
-> width/height; two clicked points + known distance). Render existing zones
-> from an iprj loaded with the Session 1 model. Record the framework decision
-> in ROADMAP.md.
+> [Fable] In EVO/iprj_designer, do Phase 2 of ROADMAP.md. First, ask me for
+> the specific Econolite codes. Then, update the schema/domain accuracy for
+> loops and conditions, build the pure-Python models for Ignore
+> Zones/Lineals, and implement the planar geometry math for element
+> rotation.
 
-## Session 3 — Drawing core
+## Phase 3 — UX Overhaul & Multi-Select
 
-Port the interaction model of pyatspm's `video/calibrate.py`
-(`~/pyatspm/src/atspm/video/calibrate.py`) to the chosen framework, upgraded
-for real-world dimensions.
+Split into planning and UI implementation.
+
+### Phase 3.1 — Toolbar & Mode Planning (Target: Opus)
 
 Scope:
-- [x] Free draw: click 4 corners → loop polygon
-- [x] **Dimensioned draw** (primary workflow): click point 1, move mouse to
-      set direction, press `d` (or start typing digits) → enter first length
-      (e.g. 10 ft along the click direction = short side), then second length
-      (e.g. 20 ft, extruded toward the mouse side) → rectangle placed
-- [x] Snapping (toggle, like `g` in the video tool): snap to other zones'
-      vertices; edge midpoints included as snap candidates for adjacent lanes
-- [x] Edit mode: select (click / `n`/`b` cycle) zones, drag vertex, drag body
-      to move, **Ctrl-drag to copy** — copy is the fast path for laying out
-      identical lane loops
-- [x] Undo (point-level while drawing, op-level after: add/move/delete),
-      delete (`x`/Del)
-- [x] Status line showing mode / snap / pending dimension entry
+- [x] Design a dynamic, context-sensitive command palette to replace the
+      overflowing toolbar.
+- [x] Plan the restructuring of "Draw" mode into specific sub-modes (Loop,
+      Lineal, Ignore Zone).
+- [x] Evaluate if a default "Pan" mode is necessary or can be handled
+      implicitly.
+- [x] Output a design document/plan for Sonnet to implement.
+
+Output: [[PHASE3_UI_PLAN.md]] — two-tier toolbar (persistent chrome + per-tool
+context bar), 6 primary tools with sub-types, a `DrawKind` draw-target
+descriptor generalizing `DrawingController`, Pan dropped for a default Select
+tool with implicit pan gestures, and multi-select as a selection set reusing
+the existing `("batch", …)` undo entry. Includes a Fable-first / Sonnet-second
+3.2 sub-session sequencing (3.2a controller + model, 3.2b toolbar, 3.2c
+multi-select/rotate).
 
 Suggested prompt:
-> In EVO/iprj_designer, do Session 3 of ROADMAP.md: implement the drawing
-> core — free 4-point loops, dimensioned rectangle drawing (click, aim,
-> type lengths in feet), vertex snapping, edit mode with move/copy/delete and
-> undo. Use ~/pyatspm/src/atspm/video/calibrate.py as the behavioral
-> reference for the state machine and snapping.
+> [Opus] In EVO/iprj_designer, do Phase 3.1 of ROADMAP.md: output a UI
+> architecture plan to reorganize the toolbar, restructure the draw modes,
+> and handle multi-select gracefully.
 
-## Session 4 — Attributes & full iprj write-out (MVP complete)
+### Phase 3.2 — UI Implementation
 
-Scope:
-- [x] Per-zone properties: name, `PhaseNumber`, `OutputNumber` (auto-increment
-      on consecutive draws/copies), `ZoneType`, delay/extend
-- [x] Sensor management: place/move sensor(s), azimuth, height; assign zones
-      to a sensor
-- [x] Basic Conditions editing (enable, output, class, velocity range) —
-      table form is fine
-- [x] Save to `.iprj` (embed background PNG base64) and reload — verified by
-      pytest + Playwright; loading in the vendor software still unverified
-      (no vendor software on this machine — see the open item in
-      IPRJ_FORMAT.md)
-- [x] Open-existing-iprj → edit → save workflow solid (Playwright run on
-      banks.iprj: sensor switch, zone dialog, draw, save-as, reload)
+The Phase 3.1 plan ([[PHASE3_UI_PLAN.md]] — the source of truth for all three
+sub-sessions below) splits this into a **Fable-first pure-python pass** then two
+**Sonnet** wiring passes: the controller/model generalization (draw-kind
+abstraction, multi-select state, lineal round-trip) lands finished code for the
+NiceGUI work to sit on, per [[CLAUDE.md]] routing. Do 3.2a → 3.2b → 3.2c in
+order.
 
-Suggested prompt:
-> In EVO/iprj_designer, do Session 4 of ROADMAP.md: zone attribute editing
-> (phase, output with auto-increment, type, name), sensor placement and zone
-> assignment, basic conditions, and full save-to-iprj including the embedded
-> background image. End-to-end: new project from image → calibrate → draw →
-> attributes → save → reopen.
+#### Phase 3.2a — Controller & model (Target: Fable)
 
-## Session 5 — Toolbar & UX pass
-
-Scope:
-- [x] Toolbar for tool/mode selection (keyboard shortcuts stay as
-      accelerators) — this was planned-for, now build it
-- [x] Zone list/table panel synced with canvas selection; edit attributes
-      from the table
-- [x] Visual polish: colors by phase, labels on zones, selected-zone
-      highlight, layer toggles (background/zones/sensors)
-- [x] Keyboard/interaction refinements discovered while using Sessions 3–4
+Scope (plan §4, §6, §7 — pure-python, pytest-covered, no GUI imports):
+- [ ] `DrawKind` draw-target descriptor + generalize
+      `DrawingController._commit_zone`; add the 2-click `segment` draw path;
+      retarget the controller between element lists (event zones / ignore
+      zones / lineals).
+- [ ] Multi-select state (`selection` list + `anchor`), a marquee hit helper in
+      `model/geometry.py`, and group move/delete/nudge as `("batch", …)` undo
+      ops (reusing the existing batch entry).
+- [ ] `load_lineals`/`save_lineals` for non-chain stray Lineals, with the
+      endpoint-coincidence guard (plan §4.3).
+- [ ] Accelerator fixes at the seam (plan §2.1): drop `d` from `_key_draw`'s
+      dimension trigger (digits still start it); remove the `l`/`e` set-mode
+      shortcuts from `DrawingController.key`.
 
 Suggested prompt:
-> In EVO/iprj_designer, do Session 5 of ROADMAP.md: add the toolbar, a synced
-> zone table panel, and visual polish (phase colors, labels, layer toggles).
-> Keep all keyboard shortcuts working as accelerators.
+> [Fable] In EVO/iprj_designer, do Phase 3.2a of ROADMAP.md per
+> PHASE3_UI_PLAN.md §4/§6/§7: the `DrawKind` draw-target abstraction,
+> multi-select controller state with batch-undo group ops, the marquee/group
+> geometry helpers, generic-lineal round-trip, and the §2.1 accelerator-seam
+> fixes — all pure-python, pytest-covered, no GUI imports.
 
-## Session 6 — Approach templates
+#### Phase 3.2b — Toolbar & draw kinds (Target: Sonnet)
 
-Split by model per [[CLAUDE.md]] model-routing: schema/UI sub-sessions go to
-Sonnet, the pure-math expansion goes to Fable. Do 6.1 → 6.2 → 6.3 in order —
-each hands a concrete artifact to the next (schema → expansion function →
-UI wired to it).
-
-### Session 6.1 — Template schema & basic inputs (Target: Sonnet)
-
-Scope:
-- [x] Template schema (JSON in `templates/`): lane configuration (e.g.
-      `L | T | T | R` with widths), approach speed, count loops on/off,
-      lane-by-lane advance detectors on/off, starting input/output number,
-      approach direction, thru phase, LT phase
-- [x] Minimal UI inputs for approach speed / lane configuration (form only —
-      no placement logic yet; that's 6.3)
-- [x] Template create/edit stays minimal (edit JSON + reload) this session
+Scope (plan §3, §4, §5):
+- [ ] Two-tier toolbar: persistent chrome row + per-tool context bar via
+      `set_visibility` toggles; File menu; Draw/Measure sub-type toggles;
+      accelerators per plan §2.1.
+- [ ] Drop Pan; default to Select; space/middle-drag pan; marquee on
+      empty-canvas left-drag.
+- [ ] Wire the three draw kinds (Loop / Ignore Zone / Lineal) to the sub-type
+      toggle; render generic lineals distinctly from centerlines; surface the
+      10/100 cap `ValueError`s as notifications.
 
 Suggested prompt:
-> [Sonnet] In EVO/iprj_designer, do Session 6.1 of ROADMAP.md: define the
-> approach-template JSON schema (lanes, widths, speed, detector toggles,
-> starting input/output, direction, phases) and a basic NiceGUI form for
-> entering it. No expansion/placement logic yet — that's Fable's Session 6.2.
+> [Sonnet] In EVO/iprj_designer, do Phase 3.2b of ROADMAP.md per
+> PHASE3_UI_PLAN.md §3/§4/§5: build the two-tier toolbar, drop Pan for a
+> default Select tool with implicit pan, and wire the Loop/Ignore/Lineal draw
+> kinds (built on 3.2a's `DrawKind`) to the sub-type toggle.
 
-### Session 6.2 — Template expansion math (Target: Fable)
+#### Phase 3.2c — Multi-select sync & rotation (Target: Sonnet)
 
-Scope:
-- [x] `model/templates.py`: expand a template into a detector list — count
-      loops (5'×lane at stop bar offset), stop-bar zones (30'×lane),
-      dilemma-zone and advance detectors placed by **ITE kinematic
-      calculations** from approach speed (document formulas + assumed
-      perception-reaction time and deceleration in the module)
-- [x] Naming convention auto-generated (e.g. `SBL Count`, `Ph 4 SBT Stop Bar 1`,
-      `Ph 4 Dilemma`) with sequential input numbers from the starting input
-- [x] Pure-python, pytest-covered against the acceptance case in the
-      appendix below — no GUI imports
+Scope (plan §6.4, §6.5):
+- [ ] Multi-select GUI sync: zone table `selection="multiple"`, `svg()`
+      highlights for every selected zone, marquee rectangle + rotation-pivot
+      preview.
+- [ ] Wire the 2-click rotate workflow to `geometry.rotate_points` /
+      `rotation_angle_deg`; rotating an attached zone detaches it (plan §6.4).
 
 Suggested prompt:
-> [Fable] In EVO/iprj_designer, do Session 6.2 of ROADMAP.md: implement
-> `model/templates.py` — pure-python expansion of the Session 6.1 schema
-> into a detector list, using ITE kinematic calculations for dilemma-zone
-> and advance-detector placement from approach speed, with auto
-> naming/numbering. Document the kinematic formulas and assumed
-> perception-reaction time/deceleration in the module. Write pytest
-> coverage against the example template table in the ROADMAP appendix
-> (Session 6 acceptance case). No GUI code — hand off a function callable
-> with a template + a stop-bar reference point/direction.
+> [Sonnet] In EVO/iprj_designer, do Phase 3.2c of ROADMAP.md per
+> PHASE3_UI_PLAN.md §6: sync multi-selection to the zone table and overlay,
+> and add the 2-click rotate workflow wired to Fable's rotation math
+> (rotation detaches attached zones).
 
-### Session 6.3 — Wire expansion into the canvas (Target: Sonnet)
+## Phase 4 — Advanced Template Engine
+
+Replacing the old static template logic with a hybrid mathematical approach
+where math seeds flexible defaults.
+
+### Phase 4.1 — Math & Schema (Target: Fable)
 
 Scope:
-- [x] Placement UI: pick template, click stop-bar reference point, aim
-      direction (2nd click or mouse) → calls `model/templates.py` and
-      places all resulting zones
-- [x] Wire the Session 6.1 form values into the expansion call
+- [ ] Update `model/templates.py` to use `extension_time` and detector length
+      alongside approach speed to calculate continuous dilemma zone coverage.
+      **Crucial intent:** These ITE kinematic calculations are meant to *seed*
+      the default values (setback, length) for the template generation,
+      creating a smart baseline that the schema/UI allows the user to
+      explicitly override. Do not make the math a rigid constraint.
+- [ ] Add schema support for dynamic placeholders that get injected at
+      placement time: approach direction, relevant phases, and **Base Output**.
+- [ ] Refactor output numbering to a Base + Offset model: the template schema
+      should store an `output_offset` (e.g., 0, 1, 2). At placement time, the
+      user provides a `Base Output` (e.g., 32), and the assigned output is
+      calculated as `Base Output + output_offset`.
+- [ ] Add schema support for lane-spanning detectors (e.g.,
+      `spanning_lanes: [1, 2]`).
+- [ ] Define anchor point logic (Station 0) defaulting to the lane line
+      between the exclusive left-turn lanes and the thru lanes (i.e., the
+      right side of the last exclusive left-turn lane).
+
+**Notes for the Fable session (keep the engine flexible):**
+- *Seed, don't constrain.* Write every kinematic result (setback, length, the
+  extension-driven spacing) into the schema as an **editable default**; the
+  expansion reads the stored value, so a 4.2 user override fully replaces the
+  computed one. The math runs to populate defaults, not as a placement-time
+  hard rule.
+- *Continuous coverage* = no detection gap between successive advance
+  detectors: size/space them so a vehicle at design speed stays held by the
+  controller (detector length + `extension_time` gap-out) from one zone into
+  the next. Document the formula and the assumed `extension_time`, the way
+  Session 6.2 documented its PRT/deceleration constants (see the decisions log
+  / [[DESIGN_HISTORY.md]]).
+- *One channel — output only.* The detection unit's **output channel maps 1:1
+  to the controller input it drives**, and `.iprj` stores only `OutputNumber`,
+  so this software numbers by *output* exclusively (the redundant "input" alias
+  was removed — see the 2026-07-03 decisions-log entry). The numbering model is
+  a single space: `Base Output + output_offset`, no separate input number.
+- *Placeholders vs. literals.* `direction`/`thru_phase`/`lt_phase` are baked
+  into today's template JSON; the new schema should let each be **either a
+  fixed value or a placeholder** resolved at placement. Existing templates
+  (baked values) must still load — treat a present value as a literal, an
+  absent/sentinel one as "prompt at placement."
+- *Anchor changes the existing reference convention.* Session 6.2 placed from
+  the leftmost lane's left edge; Station 0 now sits at the last
+  exclusive-left/thru lane line, so lateral offsets are recomputed relative to
+  the new anchor — re-pin the appendix acceptance case to it.
+- *Fable budget* (per [[CLAUDE.md]] — one bounded piece per session): run 4.1
+  as two passes — **schema first** (placeholders, Base+Offset, `spanning_lanes`,
+  anchor config), **then the kinematic seeding** that fills the defaults.
 
 Suggested prompt:
-> [Sonnet] In EVO/iprj_designer, do Session 6.3 of ROADMAP.md: wire the
-> Session 6.2 template-expansion function into the canvas — pick a
-> template, click a stop-bar reference point, aim direction, and place all
-> resulting zones via the existing DrawingController/insert_zone path.
+> [Fable] In EVO/iprj_designer, do Phase 4.1 of ROADMAP.md: update the template
+> math to include extension times for continuous dilemma zone coverage. Use
+> this math to *seed* default schema values, not constrain them. Implement the
+> Base Output + output_offset numbering logic, add schema support for
+> lane-spanning, and configure the anchor point logic.
 
-## Session 7 — Centerline datum placement
-
-Same split: the station/offset math is Fable's, the drawing UI is
-Sonnet's. 7.3 (persistence) and 7.5 (the placement refactor) are both
-`model/`-shaped work — default both to Fable per [[CLAUDE.md]]
-model-routing; only pull in Opus first on 7.5 if it turns out to need
-re-deciding how re-stationing interacts with the undo model (an
-architecture question, not a math one — 7.3's persistence approach is
-already decided, see the Session 7.2 decisions-log entry below).
-
-### Session 7.1 — Station/offset geometry engine (Target: Fable)
+### Phase 4.2 — Grid Editor UI (Target: Sonnet)
 
 Scope:
-- [x] Station/offset engine in `model/geometry.py`: point + orientation at
-      any station along a polyline (point-to-point segments, no arcs)
-- [x] Pure-python, pytest-covered
+- [ ] Build a standalone template editor using NiceGUI Flexbox/CSS Grid columns
+      for physical lanes.
+- [ ] Allow merging cells across lanes (using the Phase 4.1 `spanning_lanes`
+      schema).
+- [ ] Allow user overrides of Fable's mathematically pre-populated (seeded)
+      kinematic values.
 
 Suggested prompt:
-> [Fable] In EVO/iprj_designer, do Session 7.1 of ROADMAP.md: implement a
-> station/offset engine in `model/geometry.py` — given a point-to-point
-> polyline (station 0 at one end), return point + orientation at any
-> station/offset. Pure python, pytest-covered, no GUI imports.
+> [Sonnet] In EVO/iprj_designer, do Phase 4.2 of ROADMAP.md: build the CSS
+> Grid/Flexbox lane column UI for editing templates, supporting merged cells
+> across lanes and overriding the seeded kinematic values.
 
-### Session 7.2 — Centerline drawing UI (Target: Sonnet)
+### Phase 4.3 — Canvas Placement UI (Target: Sonnet)
 
 Scope:
-- [x] Draw an approach "centerline" polyline on the canvas (datum: taken
-      along the line between leftmost thru lane and LT lane), station 0 at
-      the stop bar
-- [x] Edit centerline after the fact (stretch: keep simple if hairy)
+- [ ] Wire the new template engine to the canvas.
+- [ ] Prompt the user for the dynamic placeholders (phase, direction, and Base
+      Output) at placement time.
+- [ ] Snap the template to the defined anchor point on the canvas.
 
 Suggested prompt:
-> [Sonnet] In EVO/iprj_designer, do Session 7.2 of ROADMAP.md: add
-> centerline polyline drawing/editing on the canvas (station 0 at the stop
-> bar), using the Session 7.1 `model/geometry.py` engine for any live
-> station readout.
+> [Sonnet] In EVO/iprj_designer, do Phase 4.3 of ROADMAP.md: wire the advanced
+> template engine to the canvas and add the UI prompt for dynamic placeholders
+> (including Base Output) during placement.
 
-### Session 7.3 — Centerline persistence in `.iprj` (Target: Fable)
+## Phase 5 — Webserver Deployment (Future)
 
-The vendor format has no native polyline entity — the closest is `Lineal`
-(`model/iprj_io.py`), a fixed 2-point line. Persist the centerline through
-that instead of adding a new schema concept: one `Lineal` per segment on
-save, chained back into an ordered polyline by shared vertices on load.
+### Phase 5.1 — Architecture Plan (Target: Opus)
 
 Scope:
-- [x] Save: given a centerline's ordered points, emit one `Lineal` per
-      segment (station *i* → *i+1*), `Enable=1`
-- [x] Load: given a project's enabled `Lineal`s, reconstruct the ordered
-      point list by walking them as an undirected graph of segments and
-      chaining runs that share an endpoint — station 0 is the end of the
-      chain reachable from the endpoint that appears in only one segment
-- [x] Document the identification rule (revised from the original
-      one-centerline-per-project scoping — see the 7.3 decisions-log
-      entries): `Lineal` carries no name/tag, so a Lineal sharing an
-      endpoint with another Lineal is part of a centerline; each ≥2-segment
-      simple open chain is one centerline (**multiple per project** —
-      intersecting roads). A lone segment is a stray reference line, never
-      a centerline; single-segment centerlines are midpoint-split on save
-      so they remain recognizable. Noted in IPRJ_FORMAT.md
-- [x] Pure-python round-trip pytest coverage in `model/`: points → Lineals
-      → points reproduces the same sequence (order-independent input, since
-      a chain of undirected segments doesn't carry direction on its own)
-
-Suggested prompt:
-> [Fable] In EVO/iprj_designer, do Session 7.3 of ROADMAP.md: implement
-> `.iprj` persistence for the Session 7.2 centerline through the existing
-> `Lineal` entity — one Lineal per segment on save, reconstructed into an
-> ordered polyline by chaining shared vertices on load (station 0 = the
-> chain endpoint that appears in only one segment). Pure python in
-> `model/`, pytest-covered round-trip, no GUI imports. Document the
-> one-centerline-per-project assumption in IPRJ_FORMAT.md.
-
-### Session 7.4 — Wire centerline persistence into the GUI (Target: Sonnet)
-
-Scope:
-- [x] On project open, reconstruct the centerlines (Session 7.3,
-      `load_centerlines` — plural: typically one per approach/road) from
-      the loaded project's `Lineal`s and seed the GUI with them
-      (`CenterlineController` currently holds a single polyline — extend
-      it or hold one controller per centerline)
-- [x] On save, write the current centerline point lists out as `Lineal`s
-      via the Session 7.3 `save_centerlines`
-
-Suggested prompt:
-> [Sonnet] In EVO/iprj_designer, do Session 7.4 of ROADMAP.md: wire the
-> Session 7.3 `load_centerlines`/`save_centerlines` into `gui/app.py` —
-> reconstruct all centerlines on project open (extend the single-polyline
-> `CenterlineController`, or hold one per centerline) and write them back
-> out as Lineals on save.
-
-### Session 7.5 — Curvilinear placement refactor (Target: Fable; escalate to Opus only if it needs an architecture call)
-
-Scope:
-- [x] Place loops (and template expansions from Session 6) by station/offset
-      so advance detectors follow approach curvature; loop orientation from
-      local segment direction
-- [x] Re-station attached zones when the centerline is edited afterward
-
-Suggested prompt:
-> [Fable, or Opus first if the undo/re-stationing interaction needs a
-> design decision] In EVO/iprj_designer, do Session 7.5 of ROADMAP.md:
-> refactor loop/template placement to go through the Session 7.1
-> station/offset engine instead of straight-line placement, so detectors
-> follow centerline curvature, and re-station attached zones when the
-> centerline is edited.
-
-## Session 8 — Webserver deployment (future)
-
-### Session 8.1 — Multi-session architecture plan (Target: Opus)
-
-Scope:
-- [ ] Decide how per-user/per-project state is isolated across concurrent
-      NiceGUI sessions (in-memory `Viewer`/`Project` today is single-process,
-      single-project — define what changes)
+- [ ] Decide how per-user/project state is isolated across concurrent
+      NiceGUI sessions.
 - [ ] Decide project file management approach (server-side open/save vs.
-      upload/download) and whether auth is in scope
-- [ ] Produce a plan handed to Session 8.2 — this session is a decision
-      document, not code
+      upload/download) and whether auth is in scope.
+- [ ] Output a plan for Phase 5.2 — this phase is a decision document, not
+      code.
 
 Suggested prompt:
-> [Opus] In EVO/iprj_designer, do Session 8.1 of ROADMAP.md: design
-> multi-session state isolation for the NiceGUI app (today's `Viewer`
-> holds one `Project` in process memory), plus a project file management
-> approach (server-side vs. upload/download) and whether auth is in scope.
-> Produce a plan for Session 8.2 to implement — no code changes this
-> session.
+> [Opus] In EVO/iprj_designer, do Phase 5.1 of ROADMAP.md: design
+> multi-session state isolation for the NiceGUI app, a project file
+> management approach (server-side vs. upload/download), and whether auth
+> is in scope. Produce a plan for Phase 5.2 to implement — no code changes
+> this session.
 
-### Session 8.2 — Hardening & packaging (Target: Sonnet)
+### Phase 5.2 — Implementation (Target: Sonnet)
 
-Scope (define fully once 8.1 lands):
-- [ ] Implement the Session 8.1 plan: multi-session safety, project file
-      management, harden NiceGUI serving for other users
-- [ ] Packaging (`pip install` entry point or container)
+Scope (define fully once 5.1 lands):
+- [ ] Implement the Phase 5.1 plan: multi-session safety and project file
+      management, harden NiceGUI serving for other users.
+- [ ] Packaging (`pip install` entry point or container).
 
 Suggested prompt:
-> [Sonnet] In EVO/iprj_designer, do Session 8.2 of ROADMAP.md: implement
-> the Session 8.1 architecture plan — multi-session state isolation,
-> project file management, and hardened NiceGUI serving — then package as
-> a `pip install` entry point or container.
-
----
-
-## Decisions log
-
-*(append as made)*
-
-- 2026-07-01 — Planning docs created; framework leaning NiceGUI pending
-  Session 2 spike.
-- 2026-07-02 — Session 1 done. Model dataclasses stay in the file's own
-  units (world px, y-down); feet enter via `model/units.py` only. Each
-  entity carries an `extra: dict[str, str]` for unrecognized attributes, so
-  foreign/converter files round-trip losslessly. `save_iprj` always writes
-  the vendor dialect (`Config` root, one `<Configuration>` per attribute,
-  vendor-canonical key order); the loader accepts both dialects.
-- 2026-07-02 — Calibration: vendor files round `MeterPerPixel` to 2 decimals
-  (0.08 vs true 0.0762 at Banks), so `units.effective_meter_per_pixel`
-  re-derives the scale from `MeterReference0/1` + `ReferenceLength` and only
-  falls back to the stored value when the pair is stale (ex27bg2 case).
-- 2026-07-02 — `NrOfZonePoints` always equals the actual vertex count in
-  real files, so it is derived from the point list on save, not stored.
-- 2026-07-02 — **Framework decision: NiceGUI** (Session 2 spike; Dash spike
-  not needed). The one feared cost — hand-built zoom/pan — turned out small:
-  keep `interactive_image` at its natural pixel size and zoom/pan with a CSS
-  transform, so mouse events keep reporting true image coordinates at any
-  zoom and all viewport math is ~50 lines of pure python
-  (`gui/viewport.py`, unit-tested). Everything else was free: SVG overlay
-  in image coordinates for zones/markers/reference, dialogs, mode toggle,
-  wheel/drag events with throttling. Verified headless with Playwright
-  (installed in the venv, dev-only): zero console errors; cursor readout at
-  image center reads exactly (1000, 2400) px on the 2000×4800 Banks image;
-  two-point calibration of the raw image at 750 ft over 3000 px yields
-  exactly 0.250 ft/px. Revisit only if hands-on feel disappoints.
-- 2026-07-02 — Overlay stroke widths/fonts are specified in image px divided
-  by the current zoom so they stay readable; the overlay SVG is regenerated
-  on zoom. Fine at Session-2 scale; revisit if redraw cost bites once
-  drawing interactions land (Session 3).
-- 2026-07-02 — **Session 3 done.** The draw/edit state machine is pure
-  python in `gui/drawing.py` (`DrawingController`, world-px coordinates, no
-  NiceGUI imports — same testability pattern as `viewport.py`); planar
-  geometry (hit tests, snap search, dimensioned rectangle) in
-  `model/geometry.py`. Both pytest-covered; plus a Playwright end-to-end run
-  on Banks (keyboard-driven 10×20 ft rectangle measured exactly 10.0/20.0 ft
-  in the overlay SVG, delete/undo, zero console errors).
-- 2026-07-02 — Dimensioned draw: the aim direction stays live with the mouse
-  while typing side 1 and is **frozen when side 1 is committed**, so the
-  mouse is then free to pick the extrude side without swinging the
-  rectangle. With an empty side-2 buffer the preview extrudes to the mouse's
-  perpendicular distance. Dimension entry requires calibration (status-line
-  message otherwise).
-- 2026-07-02 — Snapping defaults off (`g` toggles, as in the video tool);
-  candidates are other zones' vertices **plus edge midpoints**. Snap and
-  vertex-grab radii are divided by the current zoom so they feel constant on
-  screen. Vertex drags snap live; body drags snap-correct on release
-  (calibrate.py behavior).
-- 2026-07-02 — Undo: point-level while a loop is pending, then an operation
-  stack (add / delete / move-or-reshape) rather than calibrate.py's
-  pop-last-shape — edit actions are undoable too. Redo deferred until it's
-  missed in practice.
-- 2026-07-02 — New zones land on the first sensor's `event_zones` (a default
-  `Sensor` is created for image-only projects) with placeholder names
-  "Zone N"; attributes/numbering are Session 4. Mode changes go through the
-  toolbar toggle (`l`/`e` accelerators just set it), so toolbar and keyboard
-  stay in sync.
-- 2026-07-02 — **Session 4 done (MVP complete).** Zone properties dialog
-  (`p`/Enter/double-click in Edit mode, or the "Zone props…" button):
-  enable, name, phase, output, type, delay/extend, sensor reassignment, and
-  a conditions table. Sensor tool (`s`): drag to move, click for properties
-  (azimuth/elevation, height in ft ↔ meters stored, GPS); "Add sensor"
-  places at image center. "Active sensor" selector picks which sensor
-  receives new zones (`DrawingController.retarget`). Save/Save As write the
-  vendor dialect with the embedded PNG; the date attribute is re-stamped on
-  save. Verified end-to-end with pytest (116) plus two Playwright runs
-  (new-from-image and banks.iprj), zero console errors.
-- 2026-07-02 — Condition units are metric in the file: velocities **km/h**
-  (the one real speed condition stores 40.23 = exactly 25 mph), queue
-  lengths meters. Enabled conditions carry wide-open sentinels
-  (16091.79 km/h ≈ 9999 mph, 3047.70 m = 9999 ft, 255 counts); new
-  conditions are created with the same sentinels. The GUI edits velocities
-  in mph. See IPRJ_FORMAT.md.
-- 2026-07-02 — New zones fill the first *placeholder* slot (Enable=0, empty
-  name, no points) instead of appending, so vendor files keep their fixed
-  64-slot arrays and never grow past index 63; from-scratch projects just
-  append (sparse converter-form files are known-accepted). `n`/`b` cycling
-  and edit-mode preselection skip placeholders.
-- 2026-07-02 — `OutputNumber` auto-assigns as max-across-all-sensors + 1 on
-  draw *and* Ctrl-drag copy (outputs are rack channels, shared
-  project-wide); a copy also bumps a trailing number in the source name
-  ("SBT Count 1" → "SBT Count 2"). Undo ops now carry the zone list they
-  touched, so undo works across active-sensor switches.
-- 2026-07-02 — Vendor-software load test of a generated file remains the one
-  open MVP item (no vendor software available here); mitigations unchanged
-  (we write the vendor's own dialect, and sparse files are field-proven).
-- 2026-07-02 — **Session 5 done.** Toolbar rebuilt as a dense icon row
-  (undo/delete/zone-props buttons, a snap switch two-way-bound to
-  `ctrl.snap_enabled`, a layers menu) with tooltips documenting the matching
-  accelerator; the existing `l`/`e`/`s` tool toggle and Draw/Edit/Sensor
-  keys are unchanged. Added a `ui.table` zone list (name/phase/output/type,
-  one row per non-placeholder zone across all sensors) in a right-hand
-  panel: row click selects (switches active sensor + Edit mode + canvas
-  selection), row double-click opens the zone-properties dialog directly —
-  `zone_properties()` now takes optional `(si, zi)` so it isn't limited to
-  the current canvas selection. Layer toggles are three booleans on `Viewer`
-  (`show_zones`/`show_labels`/`show_sensors`, checked in `svg()`) plus a
-  CSS-opacity toggle for the background image (kept out of the SVG since
-  the background is the raw `<img>`, not overlay content).
-- 2026-07-02 — New accelerators: arrow keys nudge the selected zone by
-  0.5 ft (falls back to 2 world-px uncalibrated) via `DrawingController`
-  (pure python, pytest-covered) — a burst of arrow presses coalesces into
-  one undo step, same pattern as drag; any other key breaks the coalesce.
-  `f` re-fits the view, `Ctrl-S` saves (a small head-script blocks the
-  browser's own save-page dialog so the accelerator isn't shadowed).
-  Verified end-to-end with Playwright against banks.iprj: zone table
-  populated (18 rows), row click/dblclick, layer menu, arrow-nudge status
-  message ("nudged 0.5 ft"), f/Ctrl-S — zero console errors.
-- 2026-07-02 — **Model-routing policy adopted** (see [[CLAUDE.md]]): Fable
-  for pure-python math (`model/`, plus any future pure-python controller
-  that lands under `gui/` the way `gui/drawing.py` did), Sonnet for
-  NiceGUI wiring, Opus for cross-module architecture decisions. Sessions
-  6–8 below are split into model-tagged sub-sessions along this line
-  (schema/UI → math → wiring, in that order, so each hands the next a
-  concrete artifact). One deviation from the routing as first proposed:
-  Session 7.3 (centerline-following placement refactor) is pure
-  `model/geometry.py`-shaped work, so it defaults to Fable rather than the
-  "Opus or Fable" toss-up — Opus only enters if re-stationing turns out to
-  need a real architecture decision (how it interacts with undo/model
-  persistence), as a plan handed to the Fable session, not as a
-  replacement for it.
-- 2026-07-02 — **Session 6.1 done.** `model/templates.py`: `Lane`
-  (movement — one or more of L/T/R, validated; width_ft; per-lane
-  advance_detector toggle) and `ApproachTemplate` (name, speed_mph, lanes,
-  a single template-wide `count_loops` toggle, starting_input/output,
-  `direction` — the compass side of the intersection the approach sits on,
-  e.g. "N" = north approach carrying SB traffic, not the travel
-  direction — thru_phase, lt_phase). JSON load/save mirrors `iprj_io.py`'s
-  pattern; `lane_config_str` renders the `12'L | 12'T | 12'T | 12'R` form
-  from the roadmap for previews. No expansion/naming logic lives here yet —
-  that's Session 6.2, added to this same module. `templates/` holds
-  `example_45mph_north.json`, the appendix acceptance case below.
-  `gui/templates_ui.py` is a standalone NiceGUI form (own `ui.run`, not
-  wired into `gui/app.py` yet — that's 6.3): Open/New/Save/Save As over
-  `templates/*.json`, per-lane rows with add/delete, and a live lane-config
-  preview string. Verified headless with Playwright: loaded the example
-  template, added a lane, saved, reloaded the saved JSON — zero console
-  errors.
-
-- 2026-07-02 — **Session 6.2 done.** Expansion lives in `model/templates.py`
-  as a two-stage API: `expand_template(t) -> list[DetectorSpec]` (abstract
-  approach-local layout: names, input/output numbers, phases, sizes,
-  setbacks, lateral offsets) and `place_detectors(specs, stop_bar_ref,
-  upstream_dir, units_per_ft)` -> 4-corner polygons in world y-down
-  coordinates; `expand_and_place` is the one-call form for Session 6.3.
-  `stop_bar_ref` is where the stop bar meets the leftmost lane's left edge;
-  `upstream_dir` points away from the intersection; `units_per_ft` lets the
-  GUI pass px-per-ft and get world px back. Conventions: setbacks are
-  positive-upstream to the detector's downstream edge (count loops at -15
-  sit past the bar; the 30' stop-bar zone at -5 straddles it); a lane is on
-  the LT phase only when its movement is exactly "L"; advance/dilemma
-  detection goes only to thru lanes (per-lane advance toggles on turn-only
-  lanes are ignored); the dilemma zone spans first-to-last thru lane;
-  duplicate base names get " 1"/" 2" suffixes, unique ones stay bare.
-- 2026-07-02 — **ITE kinematics chosen for 6.2** (appendix ~100/~200 were
-  placeholders; formulas govern): advance detectors at the safe stopping
-  distance `v·t_pr + v²/2a` with t_pr = 1.0 s and a = 10 ft/s² (ITE
-  detection-design values) → 283.8 ft at 45 mph; dilemma detector's
-  downstream edge at the 2.5 s indecision-zone end → 165.0 ft at 45 mph.
-  Constants are module-level in `templates.py` if field practice wants
-  different assumptions.
-
-- 2026-07-02 — **Session 6.3 done.** A new "Template" tool in `gui/app.py`'s
-  toolbar toggle sits alongside Pan/Draw/Edit/Sensor/Marker/Calibrate: a
-  `template` select (populated from `templates/*.json`, same files the 6.1
-  editor writes) loads an `ApproachTemplate` via `load_template`; the click
-  sequence is stop-bar reference point, then aim upstream (mouse tracks a
-  live dashed line plus a translucent preview of every detector, recomputed
-  each move via `expand_and_place`), then a second click commits. Placement
-  requires calibration (same guard as dimensioned draw) and calls
-  `expand_and_place(template, ref, upstream, 1/ft_per_px)`, converting each
-  `PlacedDetector` to an `EventZone` (`zone_type=1` for `kind=="stop_bar"`,
-  else 0; `output_number` from `DetectorSpec.output_number` — the format has
-  no separate input-channel field, and the acceptance case runs input/output
-  in lockstep) and inserting it through the existing `insert_zone` (first
-  placeholder slot, else append) so template placement and manual drawing
-  share one insertion path. Esc backs out an in-progress placement; leaving
-  the Template tool clears it too. Verified end-to-end with Playwright
-  against `banks.iprj` + the appendix's `example_45mph_north.json`: 11 zones
-  landed with exactly the acceptance case's names/phases/outputs
-  (33–43), interleaved correctly into the existing zone table; zero console
-  errors.
-
-- 2026-07-02 — **Session 7.1 done.** `Centerline` in `model/geometry.py`:
-  station 0 at the first point, `locate(station, offset) -> (point, unit
-  tangent)` (with `point_at`/`direction_at` shorthands) and the inverse
-  `project(point) -> (station, offset)` — the inverse isn't in the 7.1
-  scope line but 7.2's live readout and 7.3's re-stationing both need it,
-  so it ships with the engine. Conventions: positive offset is to the
-  *right of travel in y-down world space* (`offset_normal`, the CCW normal
-  in y-up math); orientation is per-segment with no corner blending, a
-  station exactly on an interior vertex taking the downstream segment;
-  stations beyond either end **extrapolate along the terminal segments**
-  (and `project` mirrors this), so a centerline drawn a little short still
-  places a 283.8 ft advance detector; consecutive duplicate input points
-  are dropped, fewer than two distinct points raises. Unit-agnostic like
-  the rest of the module — stations/offsets are in whatever unit the
-  polyline's coordinates are.
-
-- 2026-07-02 — **Session 7.2 done.** New "Centerline" tool in `gui/app.py`'s
-  toolbar toggle: `gui/drawing.py`'s `CenterlineController` (pure python,
-  pytest-covered, same testability bar as `DrawingController`) accumulates
-  clicked points into a polyline — click the stop bar first (station 0),
-  then click upstream. A click either grabs an existing vertex within
-  `handle_radius` or appends a new one, and either way the same
-  mouse-down/drag/up gesture repositions it before release, so placing and
-  reshaping share one motion; `x`/Del deletes the selected vertex, `u`/
-  Ctrl-Z undoes (whole-points-list snapshots — simpler than
-  `DrawingController`'s op stack, appropriate for one small polyline).
-  `station_readout()` wraps the live points in a Session 7.1 `Centerline`
-  and reports `project(cursor)` in feet (or px, uncalibrated) via the
-  position label whenever the tool is active; the polyline itself renders
-  on the canvas at all times (like zones/sensors) with a "0" label at the
-  stop-bar vertex, so it stays visible as a spatial reference once drawn.
-  Verified end-to-end with Playwright: tool selection, two clicks placed a
-  centerline, live station/offset readout appeared while hovering, a
-  vertex drag undid cleanly — zero console errors.
-  **Open decision, resolved 2026-07-02:** the centerline was session-local
-  Viewer state, not persisted in the `.iprj` schema. Decision (owner call,
-  no Opus session needed): store it through the vendor's existing `Lineal`
-  entity — one `Lineal` per centerline segment (it's a fixed 2-point line,
-  so a polyline becomes a chain of them) — and reconstruct the ordered
-  polyline on load by rolling consecutive `Lineal`s back up based on shared
-  vertices. No new schema/attribute keys. Scoped as the new Session 7.3
-  below; the old 7.3 (curvilinear placement refactor) is renumbered 7.5.
-
-- 2026-07-02 — **Session 7.3 done.** `model/centerline.py`:
-  `centerline_to_lineals` / `lineals_to_centerline` (pure conversion) plus
-  project-level `save_centerline` / `load_centerline` for Session 7.4 to
-  wire in. Save writes segment *i* as `point_0`=point *i*,
-  `point_1`=point *i+1* — the per-segment point order is a direction hint,
-  so load recovers station 0 exactly (the chain end that is its terminal
-  segment's `point_0`), not just up-to-reversal; foreign files where the
-  hint is ambiguous fall back to the lower-indexed Lineal's end,
-  deterministically. Load identifies the centerline as the largest simple
-  open chain (vertices matched at the vendor's 2-decimal precision;
-  cycles and branching components are never candidates) among enabled
-  Lineals. `save_centerline` replaces in place: blanks the old chain's
-  slots to placeholder form, then fills placeholder slots before
-  appending, so vendor files keep their fixed 100-Lineal array; enabled
-  reference lines in other components and disabled-with-geometry Lineals
-  are untouched. One consciously accepted edge (tested + documented in
-  IPRJ_FORMAT.md): a *lone* vendor reference line in a project with no
-  centerline is indistinguishable from a 2-point centerline, so load
-  reports it as one and the first save replaces it — consistent in both
-  directions. 24 tests in `tests/test_centerline.py`, including shuffled
-  Lineal order, flipped segments, and full save_iprj/load_iprj file
-  round-trips.
-
-- 2026-07-02 — **Session 7.3 revised (owner correction, same day):** the
-  one-centerline-per-project assumption was wrong — a project typically
-  holds two or more (intersecting roads). New identification rule (owner
-  call): any Lineal sharing an endpoint with another Lineal is part of a
-  centerline; each ≥2-segment simple open chain is one centerline, and a
-  *lone* segment is a stray reference line, never a centerline. API went
-  plural: `load_centerlines`/`save_centerlines` return/take a list of
-  point lists (file order = chain-first-appearance order), and save
-  replaces the whole set of chains, leaving lone strays and
-  branching/cyclic components untouched. Consequence handled: a genuine
-  single-segment (straight) centerline would read back as a stray, so
-  save midpoint-splits it into two collinear Lineals — it reloads with
-  one interpolated mid vertex, geometrically identical. Remaining edge
-  (documented in IPRJ_FORMAT.md): two centerlines drawn with a coincident
-  *vertex* misjoin — crossing mid-segment, the normal intersecting-roads
-  case, is fine. Still 24 tests / 191 total green; banks.iprj end-to-end
-  re-verified with three centerlines including a straight one.
-
-- 2026-07-02 — **Session 7.4 done (chose one-controller-per-centerline).**
-  `Viewer.centerlines: list[CenterlineController]` seeded from
-  `load_centerlines(project)` on open (falling back to one empty controller
-  for a from-scratch project); `active_cli` picks the editable one and
-  `Viewer.centerline_ctrl` is now a property returning it, so the
-  mouse/keyboard/status wiring from Session 7.2 is unchanged. A toolbar
-  "centerline" selector (mirroring the sensor selector) plus an "add
-  centerline" button switch/create controllers; `svg()` renders every
-  centerline (dim green when inactive, bright + vertex-selectable when
-  active) so intersecting-road context stays visible while editing one.
-  `do_save` calls `save_centerlines(v.project, [cl.points for cl in
-  v.centerlines])` before `save_iprj`; empty/1-point controllers are passed
-  through and dropped by `save_centerlines` itself, so an unfinished new
-  centerline just doesn't persist. **Verified** in a follow-up pass once the
-  tool-permission fault cleared: 191/191 pytest green, plus a Playwright
-  run against a scratch copy of `banks.iprj` (never the fixture itself —
-  Save/Ctrl-S write in place over `v.source`, so the app was launched
-  against a copy) that drew a 3-point and a 2-point centerline, switched
-  between them via the toolbar selector, Saved As to a new file, and
-  reloaded it: both centerlines came back (the 2-point one midpoint-split
-  to 3, per the Session 7.3 convention), zero console errors. One process
-  note for future sessions: a first attempt drove the save dialog with an
-  unscoped `input` locator and also sent Ctrl-S while `v.source` pointed at
-  the real fixture, which briefly overwrote `sites/Banks/banks.iprj` on
-  disk before it was caught and restored with `git checkout` — always
-  launch `gui/app.py` against a scratch copy when Playwright-testing save
-  paths, never the fixture directly.
-
-- 2026-07-02 — **Session 7.5 done (no Opus escalation needed).**
-  `model/templates.py`: `place_detectors_on_centerline` /
-  `expand_and_place_on_centerline` map each detector corner to a
-  (station, offset) on a Session 7.1 `Centerline` and locate it there, so
-  detectors follow approach curvature and take orientation from the local
-  segment. Sign mapping (documented in the module): the centerline is
-  drawn stop-bar-first, so `setback_ft` adds directly to station; positive
-  `Centerline` offset is the driver's *left* (tangent points upstream), so
-  `lateral_offset_ft` subtracts. The clicked stop-bar reference is
-  *projected* onto the datum, keeping its straight-placement meaning; on a
-  straight datum the curvilinear form reproduces `place_detectors` exactly
-  (pytest-pinned). `PlacedDetector.corners_so` carries the per-corner
-  station/offset as the attachment record.
-- 2026-07-02 — Re-stationing resolved without an architecture change to
-  the undo model: `CenterlineController` keeps an `attached` registry
-  (zone → corner station/offsets) and re-derives attached zones' points
-  from it after *every* centerline mutation — drag (live), vertex
-  add/delete, and snapshot undo — so undoing a centerline edit restores
-  the zones for free (they're derived state, no zone-side undo ops
-  needed). The reverse direction: the GUI calls `reproject` after manual
-  zone edits (drag/nudge/undo), re-deriving the stored station/offsets
-  from the zone's moved points, so a hand-adjusted detector keeps its
-  adjustment through later centerline edits; untouched zones keep their
-  exact placement coords (guard against `project`'s tiny corner-case
-  drift). Attachments are session-local — `Lineal` can't carry them, so a
-  reloaded project's zones sit where saved but no longer follow edits
-  (noted in the app docstring; acceptable, same status the centerline
-  itself had before 7.3).
-- 2026-07-02 — GUI flow: with any usable centerline drawn, the Template
-  tool is one click — live 11-detector preview follows the hover point
-  along the *nearest* centerline (smallest |offset| of the projection, no
-  distance cap — draw the approach's centerline first or expect
-  attachment to the nearest one), and the click places + attaches. With
-  no centerline the Session 6.3 ref-then-aim two-click flow is unchanged.
-  Manual free/dimensioned draw stays straight-line and unattached — the
-  refactor covers engine-placed detectors, where curvature matters
-  (283.8 ft advance loops), not a hand-drawn 5 ft loop. Ctrl-drag copies
-  of attached zones are deliberately *not* attached.
-- 2026-07-02 — Verified: 200/200 pytest (9 new: straight-datum
-  equivalence incl. off-datum ref + unit scaling, 90°-bend advance-loop
-  rotation with hand-computed corners, corners_so round-trip, attachment
-  restation/undo/reproject). Playwright end-to-end: bent 3-point
-  centerline, one-click template placement ("along C1", outputs 33–43,
-  zone table 11 rows), vertex drag moved the advance detector ~40 img px,
-  `u` restored it to 0.00 px residual, zero console errors. Process note:
-  the e2e ran against a small *generated* scratch project — banks.iprj in
-  the NiceGUI app plus headless Chromium OOM-kills on this 6.5 GB machine
-  (the server alone reached ~1.4 GB RSS); the banks-scale math is already
-  pinned by pytest.
-
-- 2026-07-02 — **Memory: NiceGUI 3 script mode was re-executing the whole
-  app per page request.** Measured: server ready at 162 MB, then ~11 MB
-  *permanently retained per GET of /* on Banks (OOM-killed this 6.5 GB
-  machine during the 7.5 e2e). tracemalloc traced it to
-  `ui_run.py: runpy.run_path(sys.argv[0])` — with UI built in the global
-  scope, NiceGUI 3 re-runs the entire script (argparse → `load_iprj` 8 MB
-  XML parse → new `Viewer` → `build_ui`) for *every* page request and
-  retains a full project copy per client. Fix: `main()` now loads the
-  project once and passes `ui.run(lambda: build_ui(viewer), ...)` — a root
-  page function — so only the (small) element tree builds per client and
-  the one Viewer stays shared (single-user semantics unchanged; Session
-  8.1 owns multi-session). After: 130 MB flat across 51 GETs, Banks +
-  headless Chromium runs comfortably. Two consequences: the Session-4
-  "poll startup with a socket, not GETs" caveat is root-caused (each GET
-  was a full project re-parse) and no longer load-bearing, and shrinking
-  the background image is unnecessary — the server never decodes pixels
-  anyway (see next entry).
-- 2026-07-02 — Background image is now served as a temp *file*
-  (`Viewer.image_file`), never a PIL object: NiceGUI retained per-client
-  state around PIL-sourced `interactive_image` (~60 MB/request on Banks,
-  measured before the root-function fix made it moot); a file source is
-  streamed. Only the dimensions (`image_w`/`image_h`) are kept — pixels
-  are never decoded server-side. `Viewer.image` (PIL) is gone.
-- 2026-07-02 — **Attachments re-derived on project open** (owner request —
-  7.5 attachments were session-local since `.iprj` can't carry them).
-  Heuristic in `gui/drawing.py`: a 4-corner zone whose corners form an
-  exact station/offset rectangle on a loaded centerline (two distinct
-  stations x two distinct offsets, each corner reproduced by `locate`,
-  tol 0.05 world px — 10x the vendor's 2-decimal rounding, well under
-  hand-drawn slop) is attached to the laterally nearest centerline;
-  `derive_attachments` runs in `Viewer.__init__` and a notification
-  reports the count. Corner readings are collected *per segment* and the
-  rectangle searched over the (tiny) combination space, because plain
-  `project()` picks the wrong segment for corners on the concave side of
-  a bend — caught live when the bend-straddling dilemma zone came back
-  10/11 in the e2e; regression-tested. Known accepted edges: a zone
-  hand-moved *off* the exact grid on a curved leg reloads unattached
-  (its reprojected corners are no longer a station/offset rectangle);
-  a hand-drawn rectangle drawn perfectly on-grid re-attaches — which is
-  the behavior the owner asked for ("appears snapped → assume attached").
-  205 pytest green; e2e extended: place → Save As → relaunch → "11 zones
-  re-attached" notification → vertex drag re-stations identically
-  (39.5 px, matching the in-session drag) → zero console errors; Banks
-  browser smoke at 130 MB RSS, 18 rows, zero console errors.
-
-## Appendix — example template (acceptance case for Session 6)
-
-45 mph approach, lanes `12' L | 12' T | 12' T | 12' R`, count loops, starting
-input 33, lane-by-lane advance detectors, north approach (SB traffic),
-phase 4 thru / phase 7 LT:
-
-| Input | Description | Length (ft) | Width (ft) | Distance from stop bar (ft) |
-|---|---|---|---|---|
-| 33 | SBL Count | 5 | 12 | -15 |
-| 34 | SBT Count 1 | 5 | 12 | -15 |
-| 35 | SBT Count 2 | 5 | 12 | -15 |
-| 36 | SBR Count | 5 | 12 | -15 |
-| 37 | Ph 7 SBL Stop Bar | 30 | 12 | -5 |
-| 38 | Ph 4 SBT Stop Bar 1 | 30 | 12 | -5 |
-| 39 | Ph 4 SBT Stop Bar 2 | 30 | 12 | -5 |
-| 40 | Ph 4 SBR Stop Bar | 30 | 12 | -5 |
-| 41 | Ph 4 Dilemma | 20 | 24 (across thru lanes) | ~100 (ITE kinematic) |
-| 42 | Ph 4 Advance 1 | 10 | 12 | ~200 (ITE kinematic) |
-| 43 | Ph 4 Advance 2 | 10 | 12 | ~200 (ITE kinematic) |
-
-Distances for dilemma/advance are placeholders — compute from ITE kinematics
-at the template's design speed. (Session 6.2's documented formulas give
-165.0 ft dilemma / 283.8 ft advance at 45 mph — see the decisions log.)
+> [Sonnet] In EVO/iprj_designer, do Phase 5.2 of ROADMAP.md: implement the
+> Phase 5.1 architecture plan — multi-session state isolation, project file
+> management, and hardened NiceGUI serving — then package as a
+> `pip install` entry point or container.

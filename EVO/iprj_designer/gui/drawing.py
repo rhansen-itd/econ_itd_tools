@@ -96,7 +96,9 @@ class DrawingController:
         self._nudging = False         # coalesces an arrow-key burst into one undo op
         # ops carry the zones list they touched, so undo works across sensor
         # retargets: ("add", zones, zone) | ("replace", zones, i, old, new) |
-        # ("delete", zones, i, zone) | ("points", zone, pts)
+        # ("delete", zones, i, zone) | ("points", zone, pts) |
+        # ("batch", [sub_op, ...]) — a bulk insert (e.g. a template) undone
+        # as one step, in reverse sub_op order
         self._undo: list[tuple] = []
         self.message = ""             # transient feedback for the status line
 
@@ -137,6 +139,28 @@ class DrawingController:
         self.zones.append(zone)
         self._undo.append(("add", self.zones, zone))
         return len(self.zones) - 1
+
+    def insert_many(self, zones: list[EventZone]) -> list[int]:
+        """Insert every zone in *zones* (placeholder slot else append, same
+        rule as `_insert`) as one undoable operation: a single `undo()` call
+        removes all of them, restoring any placeholder slots they took over.
+        Used for bulk placements (e.g. an approach template) so undo doesn't
+        require one press per detector."""
+        sub_ops: list[tuple] = []
+        indices = []
+        for zone in zones:
+            for i, z in enumerate(self.zones):
+                if is_placeholder(z):
+                    sub_ops.append(("replace", self.zones, i, z, zone))
+                    self.zones[i] = zone
+                    indices.append(i)
+                    break
+            else:
+                self.zones.append(zone)
+                sub_ops.append(("add", self.zones, zone))
+                indices.append(len(self.zones) - 1)
+        self._undo.append(("batch", sub_ops))
+        return indices
 
     def _reset_dim(self) -> None:
         self.dim_stage = DIM_OFF
@@ -389,6 +413,15 @@ class DrawingController:
             self.message = "nothing to undo"
             return
         op = self._undo.pop()
+        if op[0] == "batch":
+            _, sub_ops = op
+            for sub in reversed(sub_ops):
+                self._undo_one(sub)
+            self.message = f"undid placement of {len(sub_ops)} zones"
+        else:
+            self._undo_one(op)
+
+    def _undo_one(self, op: tuple) -> None:
         if op[0] == "add":
             _, zones, zone = op
             idx = next((i for i, z in enumerate(zones) if z is zone), None)
