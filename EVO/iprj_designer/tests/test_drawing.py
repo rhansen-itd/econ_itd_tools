@@ -1,10 +1,11 @@
 import pytest
 
-from gui.drawing import (DIM_LENGTH1, DIM_LENGTH2, DIM_OFF, CenterlineController,
-                         DrawingController, bumped_name, derive_attachments,
-                         is_placeholder, next_output_number)
-from model import geometry
-from model.iprj_io import EventZone
+from gui.drawing import (DIM_LENGTH1, DIM_LENGTH2, DIM_OFF, IGNORE_KIND,
+                         LINEAL_KIND, CenterlineController, DrawingController,
+                         bumped_name, derive_attachments, is_placeholder,
+                         next_output_number)
+from model import domain, geometry
+from model.iprj_io import EventZone, IgnoreZone, Lineal
 
 FT_PER_PX = 0.25  # 10 ft == 40 world px
 
@@ -82,7 +83,6 @@ def test_dimensioned_rectangle_extrude_side_follows_mouse():
     ctrl = make_ctrl()
     ctrl.mouse_down((100, 100))
     ctrl.mouse_move((200, 100))
-    ctrl.key("d")
     for k in "10":
         ctrl.key(k)
     ctrl.key("Enter")
@@ -98,7 +98,6 @@ def test_direction_frozen_when_first_length_committed():
     ctrl = make_ctrl()
     ctrl.mouse_down((0, 0))
     ctrl.mouse_move((100, 0))
-    ctrl.key("d")
     for k in "10":
         ctrl.key(k)
     ctrl.key("Enter")
@@ -135,7 +134,6 @@ def test_dimension_preview_rectangle():
     ctrl = make_ctrl()
     ctrl.mouse_down((0, 0))
     ctrl.mouse_move((100, 0))
-    ctrl.key("d")
     for k in "10":
         ctrl.key(k)
     prev = ctrl.preview_polygon()
@@ -412,6 +410,58 @@ def test_nudge_without_selection_is_a_noop():
     assert not ctrl.key("ArrowRight")
 
 
+# -- rotate (Phase 3.2c) ------------------------------------------------------
+
+def test_selection_centroid_of_one_square():
+    ctrl = make_ctrl([square(0, 0, size=40)])
+    ctrl.set_mode("edit")
+    ctrl.selected = 0
+    assert ctrl.selection_centroid() == pytest.approx((20, 20))
+
+
+def test_selection_centroid_none_without_selection():
+    ctrl = make_ctrl([square(0, 0)])
+    assert ctrl.selection_centroid() is None
+
+
+def test_rotate_selection_90deg_about_its_own_centroid():
+    ctrl = make_ctrl([square(0, 0, size=40)])
+    ctrl.set_mode("edit")
+    ctrl.selected = 0
+    pivot = ctrl.selection_centroid()
+    rotated = ctrl.rotate_selection(90, pivot)
+    assert rotated == [ctrl.zones[0]]
+    assert ctrl.zones[0].points == pytest.approx(
+        geometry.rotate_points([(0, 0), (40, 0), (40, 40), (0, 40)], 90, pivot))
+
+
+def test_rotate_selection_is_one_batch_undo_step():
+    ctrl = make_ctrl([square(0, 0), square(100, 0)])
+    ctrl.select_many([0, 1])
+    orig = [list(ctrl.zones[0].points), list(ctrl.zones[1].points)]
+    ctrl.rotate_selection(45, (50, 20))
+    assert ctrl.zones[0].points != orig[0]
+    assert ctrl.zones[1].points != orig[1]
+    ctrl.undo()
+    assert ctrl.zones[0].points == orig[0]
+    assert ctrl.zones[1].points == orig[1]
+
+
+def test_rotate_selection_zero_angle_is_a_noop_and_not_undoable():
+    ctrl = make_ctrl([square(0, 0)])
+    ctrl.selected = 0
+    orig = list(ctrl.zones[0].points)
+    assert ctrl.rotate_selection(0.0, (20, 20)) == []
+    assert ctrl.zones[0].points == orig
+    ctrl.undo()  # nothing was pushed onto the undo stack
+    assert ctrl.message == "nothing to undo"
+
+
+def test_rotate_selection_without_selection_is_a_noop():
+    ctrl = make_ctrl([square(0, 0)])
+    assert ctrl.rotate_selection(90, (20, 20)) == []
+
+
 def test_status_line_reports_state():
     ctrl = make_ctrl()
     assert "draw" in ctrl.status()
@@ -669,3 +719,309 @@ def test_derive_attachments_skips_placeholders_and_disabled():
     disabled = EventZone(enable=0, zone_name="off", points=[
         (20, -100), (32, -100), (32, -140), (20, -140)])
     assert derive_attachments([ctrl], [[EventZone(), disabled]]) == 0
+
+
+# -- draw kinds (Phase 3.2a) ----------------------------------------------------
+
+def make_kind_ctrl(kind, items=None, numbered=False):
+    items = items if items is not None else []
+    return DrawingController(
+        items, lambda: FT_PER_PX,
+        next_output=(lambda: 99) if numbered else None, kind=kind)
+
+
+def ignore_square(x=0.0, y=0.0, size=40.0):
+    return domain.new_ignore_zone(
+        [(x, y), (x + size, y), (x + size, y + size), (x, y + size)])
+
+
+def test_ignore_kind_draws_into_ignore_list():
+    ignores: list = []
+    ctrl = make_kind_ctrl(IGNORE_KIND, ignores)
+    for p in [(0, 0), (40, 0), (40, 40), (0, 40)]:
+        ctrl.mouse_down(p)
+    assert len(ignores) == 1
+    assert isinstance(ignores[0], IgnoreZone)
+    assert ignores[0].enable == 1
+    assert ignores[0].zone_name == "Ignore 1"
+    assert ignores[0].points == [(0, 0), (40, 0), (40, 40), (0, 40)]
+
+
+def test_ignore_kind_fills_placeholder_and_undo_restores_it():
+    placeholder = IgnoreZone(enable=0)
+    ignores = [placeholder]
+    ctrl = make_kind_ctrl(IGNORE_KIND, ignores)
+    draw_square(ctrl)
+    assert len(ignores) == 1 and ignores[0] is not placeholder
+    ctrl.undo()
+    assert ignores[0] is placeholder
+
+
+def test_ignore_kind_cap_sets_warning_not_exception():
+    ignores = [ignore_square(x=50.0 * i) for i in range(10)]
+    ctrl = make_kind_ctrl(IGNORE_KIND, ignores)
+    draw_square(ctrl, 600, 0)
+    assert len(ignores) == 10                 # nothing added
+    assert "10" in ctrl.warning
+    ctrl.undo()
+    assert len(ignores) == 10                 # no undo op was recorded
+
+
+def test_ignore_kind_gets_dimensioned_draw_for_free():
+    ignores: list = []
+    ctrl = make_kind_ctrl(IGNORE_KIND, ignores)
+    ctrl.mouse_down((100, 100))
+    ctrl.mouse_move((200, 100))
+    for k in "10":
+        ctrl.key(k)
+    ctrl.key("Enter")
+    ctrl.mouse_move((150, 300))
+    for k in "20":
+        ctrl.key(k)
+    ctrl.key("Enter")
+    assert ignores[0].points == pytest.approx(
+        [(100, 100), (140, 100), (140, 180), (100, 180)])
+
+
+def test_ignore_kind_with_next_output_does_not_number():
+    ignores: list = []
+    ctrl = make_kind_ctrl(IGNORE_KIND, ignores, numbered=True)
+    draw_square(ctrl)                          # would raise if it tried
+    assert not hasattr(ignores[0], "output_number")
+
+
+def test_lineal_kind_commits_after_two_clicks():
+    lineals: list = []
+    ctrl = make_kind_ctrl(LINEAL_KIND, lineals)
+    ctrl.mouse_down((0, 0))
+    assert lineals == [] and ctrl.pending == [(0, 0)]
+    ctrl.mouse_down((100, 50))
+    assert len(lineals) == 1 and ctrl.pending == []
+    assert isinstance(lineals[0], Lineal) and lineals[0].enable == 1
+    assert lineals[0].point_0 == (0.0, 0.0)
+    assert lineals[0].point_1 == (100.0, 50.0)
+    ctrl.undo()
+    assert lineals == []
+
+
+def test_lineal_kind_preview_is_a_segment():
+    ctrl = make_kind_ctrl(LINEAL_KIND)
+    ctrl.mouse_down((0, 0))
+    ctrl.mouse_move((60, 30))
+    assert ctrl.preview_polygon() == [(0, 0), (60, 30)]
+
+
+def test_lineal_kind_has_no_dimension_entry():
+    ctrl = make_kind_ctrl(LINEAL_KIND)
+    ctrl.mouse_down((0, 0))
+    ctrl.mouse_move((100, 0))
+    assert not ctrl.key("1")
+    assert ctrl.dim_stage == DIM_OFF
+
+
+def test_lineal_kind_never_snaps():
+    lineals = [domain.new_lineal((0, 0), (100, 0))]
+    ctrl = make_kind_ctrl(LINEAL_KIND, lineals)
+    ctrl.key("g")                              # snap on
+    ctrl.snap_radius = 12.0
+    ctrl.mouse_down((97, 3))                   # near (100, 0) — must NOT snap
+    assert ctrl.pending == [(97, 3)]
+    assert ctrl.snap_indicator is None
+
+
+def test_lineal_kind_cap_sets_warning():
+    lineals = [domain.new_lineal((0, 10.0 * i), (50, 10.0 * i))
+               for i in range(domain.MAX_LINEALS)]
+    ctrl = make_kind_ctrl(LINEAL_KIND, lineals)
+    ctrl.mouse_down((0, -50))
+    ctrl.mouse_down((50, -50))
+    assert len(lineals) == domain.MAX_LINEALS
+    assert "100" in ctrl.warning
+
+
+def test_lineal_edit_drag_endpoint_and_undo():
+    lineals = [domain.new_lineal((0, 0), (100, 0))]
+    ctrl = make_kind_ctrl(LINEAL_KIND, lineals)
+    ctrl.set_mode("edit")
+    assert ctrl.selected == 0                  # preselected
+    ctrl.handle_radius = 5.0
+    ctrl.mouse_down((99, 1))                   # grab endpoint (100, 0)
+    ctrl.mouse_move((120, 30), dragging=True)
+    ctrl.mouse_up((120, 30))
+    assert lineals[0].point_1 == (120, 30)
+    ctrl.undo()
+    assert lineals[0].point_1 == (100, 0)
+
+
+def test_lineal_edit_body_drag_moves_both_endpoints():
+    lineals = [domain.new_lineal((0, 0), (100, 0))]
+    ctrl = make_kind_ctrl(LINEAL_KIND, lineals)
+    ctrl.set_mode("edit")
+    ctrl.mouse_down((50, 2))                   # on the segment body
+    ctrl.mouse_move((60, 22), dragging=True)
+    ctrl.mouse_up((60, 22))
+    assert lineals[0].point_0 == (10, 20)
+    assert lineals[0].point_1 == (110, 20)
+
+
+def test_retarget_switches_kind_and_undo_reaches_across():
+    zones, lineals = [], []
+    ctrl = make_ctrl(zones)
+    draw_square(ctrl)
+    ctrl.retarget(lineals, kind=LINEAL_KIND)
+    ctrl.mouse_down((0, 0))
+    ctrl.mouse_down((100, 0))
+    assert len(zones) == 1 and len(lineals) == 1
+    ctrl.undo()
+    assert lineals == []
+    ctrl.undo()
+    assert zones == []
+
+
+def test_retarget_without_kind_keeps_kind():
+    ctrl = make_kind_ctrl(IGNORE_KIND, [])
+    ctrl.retarget([])
+    assert ctrl.kind is IGNORE_KIND
+
+
+# -- multi-select (Phase 3.2a) --------------------------------------------------
+
+def three_squares_ctrl():
+    zones = [square(0, 0, name="A"), square(100, 0, name="B"),
+             square(200, 0, name="C")]
+    ctrl = make_ctrl(zones)
+    ctrl.set_mode("edit")
+    return ctrl, zones
+
+
+def test_selected_property_mirrors_selection():
+    ctrl, _ = three_squares_ctrl()
+    ctrl.selected = 1
+    assert ctrl.selection == [1] and ctrl.anchor == 1
+    ctrl.selected = -1
+    assert ctrl.selection == [] and ctrl.selected == -1
+
+
+def test_shift_click_toggles_membership():
+    ctrl, _ = three_squares_ctrl()
+    ctrl.mouse_down((20, 20))                  # plain click selects A only
+    ctrl.mouse_up((20, 20))
+    assert ctrl.selection == [0]
+    ctrl.mouse_down((120, 20), shift=True)     # shift-click adds B
+    assert ctrl.selection == [0, 1] and ctrl.anchor == 1
+    ctrl.mouse_down((120, 20), shift=True)     # shift-click removes B
+    assert ctrl.selection == [0] and ctrl.anchor == 0
+
+
+def test_plain_click_on_unselected_zone_collapses_group():
+    ctrl, _ = three_squares_ctrl()
+    ctrl.select_many([0, 1])
+    ctrl.mouse_down((220, 20))                 # body of C
+    ctrl.mouse_up((220, 20))
+    assert ctrl.selection == [2]
+
+
+def test_marquee_selects_every_intersecting_zone():
+    ctrl, _ = three_squares_ctrl()
+    hits = ctrl.marquee_select((-5, -5), (150, 50))
+    assert hits == [0, 1]
+    assert ctrl.selection == [0, 1] and ctrl.anchor == 1
+    ctrl.marquee_select((195, -5), (250, 50), additive=True)
+    assert ctrl.selection == [0, 1, 2]
+
+
+def test_marquee_skips_placeholders_and_disabled():
+    zones = [square(0, 0, name="A"), EventZone(enable=0),
+             square(100, 0, name="off")]
+    zones[2].enable = 0
+    ctrl = make_ctrl(zones)
+    ctrl.set_mode("edit")
+    assert ctrl.marquee_select((-5, -5), (300, 50)) == [0]
+
+
+def test_group_drag_moves_all_selected_as_one_undo():
+    ctrl, zones = three_squares_ctrl()
+    ctrl.select_many([0, 1])
+    ctrl.mouse_down((20, 20))                  # grab a selected member
+    ctrl.mouse_move((30, 25), dragging=True)
+    ctrl.mouse_up((30, 25))
+    assert zones[0].points[0] == (10, 5)
+    assert zones[1].points[0] == (110, 5)
+    assert zones[2].points[0] == (200, 0)      # unselected zone untouched
+    assert ctrl.selection == [0, 1] and ctrl.anchor == 0
+    ctrl.undo()
+    assert zones[0].points[0] == (0, 0)
+    assert zones[1].points[0] == (100, 0)
+    assert "group move" in ctrl.message
+
+
+def test_group_delete_is_one_undoable_batch():
+    ctrl, zones = three_squares_ctrl()
+    ctrl.select_many([0, 2])
+    ctrl.delete_selected()
+    assert [z.zone_name for z in zones] == ["B"]
+    assert ctrl.selection == []
+    ctrl.undo()
+    assert [z.zone_name for z in zones] == ["A", "B", "C"]
+
+
+def test_group_nudge_coalesces_into_one_undo():
+    ctrl, zones = three_squares_ctrl()
+    ctrl.select_many([0, 1])
+    ctrl.key("ArrowRight")
+    ctrl.key("ArrowRight")
+    assert zones[0].points[0] == pytest.approx((4, 0))
+    assert zones[1].points[0] == pytest.approx((104, 0))
+    ctrl.undo()
+    assert zones[0].points[0] == (0, 0)
+    assert zones[1].points[0] == (100, 0)
+
+
+def test_escape_clears_multi_selection():
+    ctrl, _ = three_squares_ctrl()
+    ctrl.select_many([0, 1, 2])
+    assert ctrl.key("Escape")
+    assert ctrl.selection == []
+
+
+def test_cycle_collapses_selection_to_one():
+    ctrl, _ = three_squares_ctrl()
+    ctrl.select_many([0, 1])
+    ctrl.key("n")
+    assert len(ctrl.selection) == 1
+
+
+def test_retarget_clears_selection():
+    ctrl, _ = three_squares_ctrl()
+    ctrl.select_many([0, 1])
+    ctrl.retarget([])
+    assert ctrl.selection == []
+
+
+def test_status_reports_selection_count():
+    ctrl, _ = three_squares_ctrl()
+    ctrl.select_many([0, 1])
+    assert "2 zones" in ctrl.status()
+
+
+# -- accelerator seam (PHASE3_UI_PLAN §2.1) -------------------------------------
+
+def test_controller_no_longer_owns_mode_shortcuts():
+    ctrl = make_ctrl([square(0, 0)])
+    assert not ctrl.key("e")
+    assert ctrl.mode == "draw"
+    assert not ctrl.key("l")
+    assert ctrl.mode == "draw"
+    ctrl.set_mode("edit")
+    assert not ctrl.key("e")
+    assert ctrl.mode == "edit"
+
+
+def test_d_no_longer_starts_dimension_entry():
+    ctrl = make_ctrl()
+    ctrl.mouse_down((0, 0))
+    ctrl.mouse_move((100, 0))
+    assert not ctrl.key("d")
+    assert ctrl.dim_stage == DIM_OFF
+    assert ctrl.key("1")                       # digits still do
+    assert ctrl.dim_stage == DIM_LENGTH1

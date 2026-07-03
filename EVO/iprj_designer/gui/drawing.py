@@ -5,11 +5,31 @@ Ported from the interaction model of pyatspm's ``video/calibrate.py`` (free
 upgraded with the dimensioned-rectangle workflow: click a corner, aim with
 the mouse, type the two side lengths in feet.
 
+Phase 3.2a generalizes the controller along two axes (PHASE3_UI_PLAN §4/§6):
+
+* **Draw kinds** — a `DrawKind` descriptor bundles what differs between
+  element kinds (factory, slot-insertion, placeholder test, polygon vs
+  2-click segment shape) so the same click/snap/dimension/undo machinery
+  draws event zones, ignore zones, and generic lineals. `retarget` switches
+  both the live list and the kind; the undo stack survives because every op
+  carries the list it touched.
+* **Multi-select** — `selection` (ordered index list) plus `anchor` (the
+  primary member) replace the single index; `selected` remains as a
+  compatibility property. Group move/nudge/delete reuse the existing
+  ``("batch", …)`` undo entry. Shift-click toggles membership (Ctrl-drag
+  still copies); `marquee_select` takes a rubber-band rectangle.
+
+Phase 3.2c adds `selection_centroid`/`rotate_selection`: the pivot seed and
+the batch-undo commit for the GUI's 2-click rotate workflow (the click
+tracking and live preview angle live in `gui/app.py`, alongside the other
+Select-tool sub-interactions like the marquee).
+
 The controller operates entirely in world-pixel coordinates (y-down); the
 GUI converts mouse events before feeding them in and renders from the state
 exposed here (``pending``, ``preview_polygon()``, ``snap_indicator``,
-``selected``, ``status()``). Feet enter only through the ``ft_per_px``
-supplier, so an uncalibrated background simply disables dimensioned draw.
+``selected``/``selection``, ``status()``, ``warning``). Feet enter only
+through the ``ft_per_px`` supplier, so an uncalibrated background simply
+disables dimensioned draw.
 """
 
 from __future__ import annotations
@@ -17,10 +37,11 @@ from __future__ import annotations
 import copy
 import itertools
 import re
+from dataclasses import dataclass, field
 from typing import Callable
 
-from model import geometry
-from model.iprj_io import EventZone, Point
+from model import domain, geometry
+from model.iprj_io import EventZone, Lineal, Point
 
 # Stages of dimensioned-rectangle entry
 DIM_OFF = 0      # not entering dimensions
@@ -66,15 +87,82 @@ def bumped_name(name: str | None) -> str:
     return name or ""
 
 
-class DrawingController:
-    """Mutates a live ``list[EventZone]`` (a sensor's zones) in world px."""
+def element_points(el) -> list[Point]:
+    """The editable vertex list of any drawable element. A `Lineal` stores
+    its two endpoints as scalar fields; everything else carries `.points`."""
+    if isinstance(el, Lineal):
+        return [p for p in (el.point_0, el.point_1) if p is not None]
+    return el.points
 
-    def __init__(self, zones: list[EventZone],
+
+def set_element_points(el, pts: list[Point]) -> None:
+    if isinstance(el, Lineal):
+        el.point_0, el.point_1 = pts[0], pts[1]
+    else:
+        el.points = pts
+
+
+def _element_name(el) -> str:
+    return getattr(el, "zone_name", "") or \
+        ("lineal" if isinstance(el, Lineal) else "zone")
+
+
+@dataclass(frozen=True)
+class DrawKind:
+    """Draw-target descriptor (PHASE3_UI_PLAN §4.1): everything that differs
+    between element kinds, leaving the controller's interaction machinery
+    untouched. ``make`` receives the committed points plus a 1-based ordinal
+    (count of real elements + 1) for default naming; ``insert`` is the
+    slot-else-append helper and may raise ValueError at the vendor cap,
+    which the controller surfaces via ``warning``."""
+
+    name: str                                   # "loop" | "ignore" | "lineal"
+    shape: str                                  # "polygon" (4-click/dim) | "segment" (2-click)
+    make: Callable[[list[Point], int], object]
+    insert: Callable[[list, object], int]
+    is_placeholder: Callable[[object], bool]
+    numbered: bool = False                      # assign next_output on commit/copy
+    # Generic lineals share the iprj Lineal pool with centerline chains: an
+    # endpoint coincident with any other lineal/centerline vertex merges into
+    # a chain on reload (model/domain.py), so their kind must never snap.
+    snappable: bool = True
+    style: dict = field(default_factory=dict)   # render hints for the GUI svg()
+
+
+LOOP_KIND = DrawKind(
+    name="loop", shape="polygon",
+    make=lambda pts, seq: EventZone(enable=1, zone_name=f"Zone {seq}",
+                                    points=pts),
+    insert=insert_zone, is_placeholder=is_placeholder, numbered=True,
+    style={})  # phase-colored fill — the GUI's existing zone rendering
+
+IGNORE_KIND = DrawKind(
+    name="ignore zone", shape="polygon",
+    make=lambda pts, seq: domain.new_ignore_zone(pts, name=f"Ignore {seq}"),
+    insert=domain.insert_ignore_zone,
+    is_placeholder=domain.is_placeholder_ignore,
+    style={"stroke": "#ffd54f", "dash": "6 4"})  # yellow dashed, per svg()
+
+LINEAL_KIND = DrawKind(
+    name="lineal", shape="segment",
+    make=lambda pts, seq: domain.new_lineal(pts[0], pts[1]),
+    insert=domain.insert_lineal, is_placeholder=domain.is_placeholder_lineal,
+    snappable=False,
+    style={"stroke": "#9e9e9e", "width": 1})  # thin gray ≠ centerline green
+
+
+class DrawingController:
+    """Mutates a live element list (a sensor's zones, its ignore zones, or
+    the project lineal pool — per the active `DrawKind`) in world px."""
+
+    def __init__(self, zones: list,
                  ft_per_px: Callable[[], float | None],
-                 next_output: Callable[[], int] | None = None):
+                 next_output: Callable[[], int] | None = None,
+                 kind: DrawKind = LOOP_KIND):
         self.zones = zones
         self.ft_per_px = ft_per_px
         self.next_output = next_output
+        self.kind = kind
 
         self.mode = "draw"            # "draw" | "edit"
         self.snap_enabled = False
@@ -90,29 +178,86 @@ class DrawingController:
         self.dim_length1_ft = 0.0
         self.dim_dir: Point | None = None  # frozen when length 1 is committed
 
-        self.selected = -1
+        self.selection: list[int] = []    # selected indices, in selection order
+        self.anchor = -1                  # primary/last-clicked member
         self._drag_vertex: int | None = None
         self._drag_body: dict | None = None
         self._nudging = False         # coalesces an arrow-key burst into one undo op
         # ops carry the zones list they touched, so undo works across sensor
         # retargets: ("add", zones, zone) | ("replace", zones, i, old, new) |
         # ("delete", zones, i, zone) | ("points", zone, pts) |
-        # ("batch", [sub_op, ...]) — a bulk insert (e.g. a template) undone
-        # as one step, in reverse sub_op order
+        # ("batch", [sub_op, ...]) — a bulk insert (e.g. a template) or a
+        # group move/delete undone as one step, in reverse sub_op order
         self._undo: list[tuple] = []
         self.message = ""             # transient feedback for the status line
+        self.warning = ""             # cap/guard errors the GUI should notify
+
+    # -- selection -------------------------------------------------------------
+
+    @property
+    def selected(self) -> int:
+        """Compatibility view of the selection: its anchor, or -1."""
+        return self.anchor if self.selection else -1
+
+    @property
+    def dragging(self) -> bool:
+        """Whether a vertex or body drag is in progress — the GUI's signal
+        (PHASE3_UI_PLAN §5/§6.2) that a Select-tool mouse-down landed on
+        something, so an empty-canvas drag is a marquee instead."""
+        return self._drag_vertex is not None or self._drag_body is not None
+
+    @selected.setter
+    def selected(self, i: int) -> None:
+        if i is None or i < 0:
+            self.selection, self.anchor = [], -1
+        else:
+            self.selection, self.anchor = [i], i
+
+    def toggle_select(self, i: int) -> None:
+        """Shift-click: toggle *i* in/out of the selection set."""
+        if i in self.selection:
+            self.selection.remove(i)
+            if self.anchor == i:
+                self.anchor = self.selection[-1] if self.selection else -1
+        else:
+            self.selection.append(i)
+            self.anchor = i
+
+    def select_many(self, indices: list[int], additive: bool = False) -> None:
+        """Replace (or, *additive*, extend) the selection; the last index
+        becomes the anchor."""
+        if not additive:
+            self.selection = []
+        for i in indices:
+            if i not in self.selection:
+                self.selection.append(i)
+        if self.selection:
+            self.anchor = self.selection[-1]
+        else:
+            self.anchor = -1
+
+    def marquee_select(self, corner_a: Point, corner_b: Point,
+                       additive: bool = False) -> list[int]:
+        """Select every enabled element whose geometry touches the
+        rubber-band rectangle; returns the hit indices."""
+        hits = [i for i in self._real_indices()
+                if self.zones[i].enable and geometry.polygon_intersects_rect(
+                    element_points(self.zones[i]), corner_a, corner_b)]
+        self.select_many(hits, additive)
+        return hits
 
     # -- helpers -------------------------------------------------------------
 
     def _polygons(self) -> list[list[Point]]:
-        return [z.points for z in self.zones]
+        return [element_points(z) for z in self.zones]
 
     def _real_indices(self) -> list[int]:
-        return [i for i, z in enumerate(self.zones) if not is_placeholder(z)]
+        return [i for i, z in enumerate(self.zones)
+                if not self.kind.is_placeholder(z)]
 
     def _snapped(self, p: Point, exclude: int | None = None) -> Point:
         self.snap_indicator = None
-        if not self.snap_enabled:
+        if not self.snap_enabled or not self.kind.snappable:
             return p
         target = geometry.find_snap(p, self._polygons(), self.snap_radius, exclude)
         if target is not None:
@@ -120,25 +265,35 @@ class DrawingController:
             return target
         return p
 
-    def _commit_zone(self, points: list[Point]) -> None:
-        zone = EventZone(enable=1,
-                         zone_name=f"Zone {len(self._real_indices()) + 1}",
-                         points=[(float(x), float(y)) for x, y in points])
-        if self.next_output is not None:
-            zone.output_number = self.next_output()
-        self._insert(zone)
-        self.message = f"placed {zone.zone_name}" + (
-            f" (output {zone.output_number})" if zone.output_number else "")
+    def _commit_element(self, points: list[Point]) -> None:
+        pts = [(float(x), float(y)) for x, y in points]
+        el = self.kind.make(pts, len(self._real_indices()) + 1)
+        if self.kind.numbered and self.next_output is not None:
+            el.output_number = self.next_output()
+        if self._insert(el) == -1:
+            return  # vendor cap; warning already set
+        name = getattr(el, "zone_name", "") or self.kind.name
+        out = getattr(el, "output_number", 0)
+        self.message = f"placed {name}" + (f" (output {out})" if out else "")
 
-    def _insert(self, zone: EventZone) -> int:
-        for i, z in enumerate(self.zones):
-            if is_placeholder(z):
-                self._undo.append(("replace", self.zones, i, z, zone))
-                self.zones[i] = zone
-                return i
-        self.zones.append(zone)
-        self._undo.append(("add", self.zones, zone))
-        return len(self.zones) - 1
+    def _insert(self, el) -> int:
+        """Insert via the kind's slot-else-append helper, recording the undo
+        op; returns the index used, or -1 (with ``warning`` set) when the
+        vendor cap rejects it."""
+        zones = self.zones
+        slot = next((i for i, z in enumerate(zones)
+                     if self.kind.is_placeholder(z)), None)
+        old = zones[slot] if slot is not None else None
+        try:
+            idx = self.kind.insert(zones, el)
+        except ValueError as exc:  # vendor cap (10 ignore / 100 lineals)
+            self.message = self.warning = str(exc)
+            return -1
+        if idx == slot:
+            self._undo.append(("replace", zones, idx, old, el))
+        else:
+            self._undo.append(("add", zones, el))
+        return idx
 
     def insert_many(self, zones: list[EventZone]) -> list[int]:
         """Insert every zone in *zones* (placeholder slot else append, same
@@ -150,7 +305,7 @@ class DrawingController:
         indices = []
         for zone in zones:
             for i, z in enumerate(self.zones):
-                if is_placeholder(z):
+                if self.kind.is_placeholder(z):
                     sub_ops.append(("replace", self.zones, i, z, zone))
                     self.zones[i] = zone
                     indices.append(i)
@@ -171,45 +326,71 @@ class DrawingController:
     def _hit_zone(self, p: Point) -> int:
         for i in range(len(self.zones) - 1, -1, -1):  # topmost first
             z = self.zones[i]
-            if z.enable and len(z.points) >= 3 and \
-                    geometry.polygon_hit(p, z.points, self.handle_radius / 2):
+            if not z.enable:
+                continue
+            pts = element_points(z)
+            if len(pts) >= 3 and \
+                    geometry.polygon_hit(p, pts, self.handle_radius / 2):
+                return i
+            if len(pts) == 2 and geometry.point_segment_distance(
+                    p, pts[0], pts[1]) <= self.handle_radius / 2:
                 return i
         return -1
 
     # -- mouse ---------------------------------------------------------------
 
-    def mouse_down(self, p: Point, ctrl: bool = False) -> None:
+    def mouse_down(self, p: Point, ctrl: bool = False, shift: bool = False) -> None:
         self.message = ""
+        self.warning = ""
         self._nudging = False
         if self.mode == "draw":
             if self.dim_stage != DIM_OFF:
                 return  # dimensions are committed with Enter, not clicks
             self.pending.append(self._snapped(p))
-            if len(self.pending) == 4:
-                self._commit_zone(self.pending)
+            needed = 2 if self.kind.shape == "segment" else 4
+            if len(self.pending) == needed:
+                self._commit_element(self.pending)
                 self.pending = []
         elif self.mode == "edit":
-            if self.selected != -1:
+            if self.selected != -1 and not shift:
                 zone = self.zones[self.selected]
-                for i, pt in enumerate(zone.points):
+                pts = element_points(zone)
+                for i, pt in enumerate(pts):
                     if geometry.dist(p, pt) <= self.handle_radius:
                         self._drag_vertex = i
-                        self._undo.append(("points", zone, list(zone.points)))
+                        self._undo.append(("points", zone, list(pts)))
                         return
             hit = self._hit_zone(p)
             if hit == -1:
                 return
-            self.selected = hit
-            zone = self.zones[hit]
+            if shift:
+                self.toggle_select(hit)
+                return
             if ctrl:
-                zone = copy.deepcopy(zone)
-                zone.zone_name = bumped_name(zone.zone_name)
-                if self.next_output is not None:
+                zone = copy.deepcopy(self.zones[hit])
+                if getattr(zone, "zone_name", None) is not None:
+                    zone.zone_name = bumped_name(zone.zone_name)
+                if self.kind.numbered and self.next_output is not None:
                     zone.output_number = self.next_output()
-                self.selected = self._insert(zone)
+                idx = self._insert(zone)
+                if idx == -1:
+                    return  # vendor cap; warning already set
+                self.selected = idx
+                self._drag_body = {"anchor": p,
+                                   "orig": {idx: list(element_points(zone))}}
+                return
+            if hit in self.selection and len(self.selection) > 1:
+                # group drag: keep the set, re-anchor on the grabbed member
+                self.anchor = hit
+                orig = {i: list(element_points(self.zones[i]))
+                        for i in self.selection}
+                self._undo.append(("batch", [("points", self.zones[i], list(o))
+                                             for i, o in orig.items()]))
             else:
-                self._undo.append(("points", zone, list(zone.points)))
-            self._drag_body = {"anchor": p, "orig": list(zone.points)}
+                self.selected = hit
+                orig = {hit: list(element_points(self.zones[hit]))}
+                self._undo.append(("points", self.zones[hit], list(orig[hit])))
+            self._drag_body = {"anchor": p, "orig": orig}
 
     def mouse_move(self, p: Point, dragging: bool = False) -> None:
         self.cursor = p
@@ -219,43 +400,49 @@ class DrawingController:
         elif self.mode == "edit" and dragging:
             if self._drag_vertex is not None and self.selected != -1:
                 zone = self.zones[self.selected]
-                zone.points[self._drag_vertex] = self._snapped(p, self.selected)
+                pts = list(element_points(zone))
+                pts[self._drag_vertex] = self._snapped(p, self.selected)
+                set_element_points(zone, pts)
             elif self._drag_body is not None:
                 dx = p[0] - self._drag_body["anchor"][0]
                 dy = p[1] - self._drag_body["anchor"][1]
-                self.zones[self.selected].points = [
-                    (x + dx, y + dy) for x, y in self._drag_body["orig"]]
+                for i, orig in self._drag_body["orig"].items():
+                    set_element_points(self.zones[i],
+                                       [(x + dx, y + dy) for x, y in orig])
 
     def mouse_up(self, p: Point) -> None:
         if self._drag_vertex is not None:
             self._drag_vertex = None
         elif self._drag_body is not None:
-            if self.snap_enabled and self.selected != -1:
+            # snap-on-release stays single-zone; a group already moved as one
+            if self.snap_enabled and self.kind.snappable \
+                    and len(self._drag_body["orig"]) == 1 and self.selected != -1:
                 zone = self.zones[self.selected]
+                pts = element_points(zone)
                 corr = geometry.translation_to_snap(
-                    zone.points, self._polygons(), self.snap_radius, self.selected)
+                    pts, self._polygons(), self.snap_radius, self.selected)
                 if corr is not None:
-                    zone.points = [(x + corr[0], y + corr[1]) for x, y in zone.points]
+                    set_element_points(
+                        zone, [(x + corr[0], y + corr[1]) for x, y in pts])
             self._drag_body = None
         self.snap_indicator = None
 
     # -- keyboard ------------------------------------------------------------
 
     def key(self, name: str, ctrl: bool = False) -> bool:
-        """Handle a key press; returns True if it changed anything."""
+        """Handle a key press; returns True if it changed anything.
+
+        Mode/tool accelerators (`d`/`l`/`e`/`v`/`z`/`i`…) are handled at the
+        app level per PHASE3_UI_PLAN §2.1 — the controller no longer owns
+        any set-mode shortcut."""
         self.message = ""
+        self.warning = ""
         if name not in ARROWS:
             self._nudging = False
         if name == "g":
             self.snap_enabled = not self.snap_enabled
             if not self.snap_enabled:
                 self.snap_indicator = None
-            return True
-        if name == "e":
-            self.set_mode("edit" if self.mode == "draw" else "draw")
-            return True
-        if name == "l":
-            self.set_mode("draw")
             return True
         if name == "u" or (ctrl and name == "z"):
             self.undo()
@@ -268,7 +455,12 @@ class DrawingController:
         return self._key_edit(name)
 
     def _key_draw(self, name: str) -> bool:
-        starts_dim = name == "d" or (name.isdigit() and len(name) == 1)
+        # dimension entry starts by typing a digit after the first corner
+        # (the old `d` trigger is gone — `d` is the Draw tool accelerator,
+        # PHASE3_UI_PLAN §2.1) and only for polygon kinds: a segment is two
+        # clicks, no dimensions.
+        starts_dim = name.isdigit() and len(name) == 1 \
+            and self.kind.shape == "polygon"
         if self.dim_stage == DIM_OFF:
             if not starts_dim or len(self.pending) != 1:
                 if starts_dim and not self.pending:
@@ -279,7 +471,7 @@ class DrawingController:
                 self.message = "calibrate the background before dimensioned draw"
                 return True
             self.dim_stage = DIM_LENGTH1
-            self.dim_buffer = name if name.isdigit() else ""
+            self.dim_buffer = name
             return True
 
         # in dimension entry
@@ -321,7 +513,7 @@ class DrawingController:
             self.pending[0], self.dim_dir,
             self.dim_length1_ft / fpp, length_ft / fpp,
             self.cursor if self.cursor is not None else self.pending[0])
-        self._commit_zone(rect)
+        self._commit_element(rect)
         self.pending = []
         self._reset_dim()
         return True
@@ -345,20 +537,39 @@ class DrawingController:
         return False
 
     def _nudge(self, ux: float, uy: float) -> bool:
-        """Move the selected zone one small step; a burst of arrow presses
-        coalesces into a single undo op."""
-        if self.selected == -1 or self.selected >= len(self.zones):
+        """Move the selection one small step; a burst of arrow presses
+        coalesces into a single undo op (single zone or group batch)."""
+        targets = [self.zones[i] for i in self.selection if i < len(self.zones)]
+        if not targets:
             return False
-        zone = self.zones[self.selected]
         fpp = self.ft_per_px()
         step = NUDGE_FT / fpp if fpp else 2.0  # world px
         if not (self._nudging and self._undo
-                and self._undo[-1][0] == "points" and self._undo[-1][1] is zone):
-            self._undo.append(("points", zone, list(zone.points)))
+                and self._same_nudge_op(self._undo[-1], targets)):
+            if len(targets) == 1:
+                self._undo.append(
+                    ("points", targets[0], list(element_points(targets[0]))))
+            else:
+                self._undo.append(("batch", [
+                    ("points", z, list(element_points(z))) for z in targets]))
         self._nudging = True
-        zone.points = [(x + ux * step, y + uy * step) for x, y in zone.points]
-        self.message = f"nudged {NUDGE_FT:g} ft" if fpp else f"nudged {step:g} px"
+        for zone in targets:
+            set_element_points(zone, [(x + ux * step, y + uy * step)
+                                      for x, y in element_points(zone)])
+        unit = f"{NUDGE_FT:g} ft" if fpp else f"{step:g} px"
+        self.message = f"nudged {unit}" if len(targets) == 1 \
+            else f"nudged {len(targets)} zones {unit}"
         return True
+
+    @staticmethod
+    def _same_nudge_op(op: tuple, targets: list) -> bool:
+        """Whether *op* is the undo entry an in-progress nudge burst of
+        *targets* wrote — the coalescing test."""
+        if len(targets) == 1:
+            return op[0] == "points" and op[1] is targets[0]
+        return (op[0] == "batch" and len(op[1]) == len(targets)
+                and all(sub[0] == "points" and sub[1] is z
+                        for sub, z in zip(op[1], targets)))
 
     # -- commands ------------------------------------------------------------
 
@@ -374,11 +585,14 @@ class DrawingController:
             real = self._real_indices()
             self.selected = real[-1] if real else -1
 
-    def retarget(self, zones: list[EventZone]) -> None:
-        """Point the controller at another sensor's zone list (active-sensor
-        switch). In-progress interactions reset; the undo stack survives
+    def retarget(self, zones: list, kind: DrawKind | None = None) -> None:
+        """Point the controller at another element list (active-sensor
+        switch, or a draw-kind switch when *kind* is given). In-progress
+        interactions and the selection reset; the undo stack survives
         because each op carries the list it touched."""
         self.zones = zones
+        if kind is not None:
+            self.kind = kind
         self.pending = []
         self._reset_dim()
         self._drag_vertex = None
@@ -417,7 +631,13 @@ class DrawingController:
             _, sub_ops = op
             for sub in reversed(sub_ops):
                 self._undo_one(sub)
-            self.message = f"undid placement of {len(sub_ops)} zones"
+            kinds = {sub[0] for sub in sub_ops}
+            if kinds == {"points"}:
+                self.message = f"undid group move of {len(sub_ops)} zones"
+            elif kinds == {"delete"}:
+                self.message = f"restored {len(sub_ops)} zones"
+            else:
+                self.message = f"undid placement of {len(sub_ops)} zones"
         else:
             self._undo_one(op)
 
@@ -431,33 +651,76 @@ class DrawingController:
             zones.pop(idx)
             if zones is self.zones and self.selected >= len(zones):
                 self.selected = len(zones) - 1
-            self.message = f"undid add of {zone.zone_name or 'zone'}"
+            self.message = f"undid add of {_element_name(zone)}"
         elif op[0] == "replace":
             _, zones, idx, old, new = op
             if idx < len(zones) and zones[idx] is new:
                 zones[idx] = old
             if zones is self.zones and self.selected == idx:
                 self.selected = -1
-            self.message = f"undid add of {new.zone_name or 'zone'}"
+            self.message = f"undid add of {_element_name(new)}"
         elif op[0] == "delete":
             _, zones, idx, zone = op
             zones.insert(idx, zone)
             if zones is self.zones:
                 self.selected = idx
-            self.message = f"restored {zone.zone_name or 'zone'}"
+            self.message = f"restored {_element_name(zone)}"
         elif op[0] == "points":
             _, zone, pts = op
-            zone.points = pts
+            set_element_points(zone, pts)
             self.message = "undid move"
 
     def delete_selected(self) -> None:
-        if self.mode != "edit" or self.selected == -1:
+        if self.mode != "edit" or not self.selection:
             self.message = "nothing selected"
             return
-        zone = self.zones.pop(self.selected)
-        self._undo.append(("delete", self.zones, self.selected, zone))
-        self.message = f"deleted {zone.zone_name or 'zone'}"
-        self.selected = min(self.selected, len(self.zones) - 1)
+        if len(self.selection) == 1:
+            idx = self.selection[0]
+            zone = self.zones.pop(idx)
+            self._undo.append(("delete", self.zones, idx, zone))
+            self.message = f"deleted {_element_name(zone)}"
+            self.selected = min(idx, len(self.zones) - 1)
+            return
+        # group delete: high index first so recorded indices stay valid;
+        # batch undo replays reversed, restoring low-to-high
+        sub_ops = []
+        for idx in sorted(self.selection, reverse=True):
+            if idx >= len(self.zones):
+                continue
+            zone = self.zones.pop(idx)
+            sub_ops.append(("delete", self.zones, idx, zone))
+        self._undo.append(("batch", sub_ops))
+        self.message = f"deleted {len(sub_ops)} zones"
+        self.selected = -1
+
+    def selection_centroid(self) -> Point | None:
+        """Combined-points centroid of every selected element — the pivot
+        seed shown before the user clicks to place one (PHASE3_UI_PLAN
+        §6.4). None with nothing selected."""
+        pts = [p for i in self.selection if i < len(self.zones)
+               for p in element_points(self.zones[i])]
+        return geometry.polygon_centroid(pts) if pts else None
+
+    def rotate_selection(self, angle_deg: float, pivot: Point) -> list:
+        """Rotate every selected element's points by *angle_deg* about
+        *pivot* (model.geometry conventions) as one batch undo op. Returns
+        the rotated elements so the GUI can detach any that were following
+        a centerline — a hand-rotate breaks the exact station/offset fit an
+        attachment relies on (PHASE3_UI_PLAN §6.4). A near-zero angle (two
+        clicks with no mouse movement between them) is a no-op: nothing is
+        touched and the empty return tells the caller there's nothing to
+        detach either."""
+        targets = [self.zones[i] for i in self.selection if i < len(self.zones)]
+        if not targets or abs(angle_deg) < 1e-9:
+            return []
+        self._undo.append(("batch", [("points", z, list(element_points(z)))
+                                     for z in targets]))
+        for z in targets:
+            set_element_points(
+                z, geometry.rotate_points(element_points(z), angle_deg, pivot))
+        self.message = f"rotated {len(targets)} element" \
+            + ("" if len(targets) == 1 else "s")
+        return targets
 
     # -- render state --------------------------------------------------------
 
@@ -467,8 +730,9 @@ class DrawingController:
             return None
         cursor = self.snap_indicator or self.cursor
         if self.dim_stage == DIM_OFF:
+            limit = 2 if self.kind.shape == "segment" else 4
             pts = list(self.pending)
-            if cursor is not None and len(pts) < 4:
+            if cursor is not None and len(pts) < limit:
                 pts.append(cursor)
             return pts
         fpp = self.ft_per_px()
@@ -508,7 +772,10 @@ class DrawingController:
     def status(self) -> str:
         parts = [f"mode: {self.mode}", f"snap: {'ON' if self.snap_enabled else 'off'}"]
         if self.mode == "draw":
-            if self.dim_stage == DIM_LENGTH1:
+            if self.kind.shape == "segment":
+                parts.append("click the end point" if self.pending
+                             else f"click the start point of a {self.kind.name}")
+            elif self.dim_stage == DIM_LENGTH1:
                 parts.append(f"side 1 (ft): {self.dim_buffer}_  [aim with mouse, Enter]")
             elif self.dim_stage == DIM_LENGTH2:
                 parts.append(f"side 1 = {self.dim_length1_ft:g} ft | "
@@ -518,14 +785,18 @@ class DrawingController:
                              + ("  [or type a length]" if len(self.pending) == 1 else ""))
             else:
                 parts.append("click a corner (type digits after the 1st for a dimensioned rect)")
+        elif len(self.selection) > 1:
+            parts.append(f"selected: {len(self.selection)} zones"
+                         "  [drag moves all, arrows nudge, x deletes,"
+                         " Shift-click toggles]")
+        elif self.selected != -1 and self.selected < len(self.zones):
+            z = self.zones[self.selected]
+            name = getattr(z, "zone_name", "") or f"#{self.selected + 1}"
+            parts.append(f"selected: {name}"
+                         "  [drag body/corner, Ctrl-drag copies, arrows nudge,"
+                         " x deletes, n/b cycles]")
         else:
-            if self.selected != -1 and self.selected < len(self.zones):
-                z = self.zones[self.selected]
-                parts.append(f"selected: {z.zone_name or f'#{self.selected + 1}'}"
-                             "  [drag body/corner, Ctrl-drag copies, arrows nudge,"
-                             " x deletes, n/b cycles]")
-            else:
-                parts.append("click a zone to select")
+            parts.append("click a zone to select")
         if self.message:
             parts.append(self.message)
         return " | ".join(parts)

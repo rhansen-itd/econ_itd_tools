@@ -60,6 +60,57 @@ def polygon_hit(pt: Point, poly: Sequence[Point], tolerance: float = 0.0) -> boo
     return False
 
 
+def _orient(a: Point, b: Point, c: Point) -> float:
+    """Cross product (b-a) x (c-a): >0 c left of ab (y-up), <0 right, 0 collinear."""
+    return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+
+
+def _within_bbox(a: Point, b: Point, c: Point) -> bool:
+    """Whether *c* (known collinear with ab) lies within ab's bounding box."""
+    return (min(a[0], b[0]) <= c[0] <= max(a[0], b[0])
+            and min(a[1], b[1]) <= c[1] <= max(a[1], b[1]))
+
+
+def segments_intersect(a: Point, b: Point, c: Point, d: Point) -> bool:
+    """Whether closed segments ab and cd share any point (touching counts)."""
+    o1, o2 = _orient(a, b, c), _orient(a, b, d)
+    o3, o4 = _orient(c, d, a), _orient(c, d, b)
+    if o1 * o2 < 0 and o3 * o4 < 0:
+        return True
+    if o1 == 0 and _within_bbox(a, b, c):
+        return True
+    if o2 == 0 and _within_bbox(a, b, d):
+        return True
+    if o3 == 0 and _within_bbox(c, d, a):
+        return True
+    return o4 == 0 and _within_bbox(c, d, b)
+
+
+def polygon_intersects_rect(poly: Sequence[Point], corner_a: Point,
+                            corner_b: Point) -> bool:
+    """Whether *poly* touches the axis-aligned rectangle spanned by two
+    opposite corners — the marquee-selection hit test. Handles open
+    2-point "polygons" (lineal segments) as segments; touching counts."""
+    pts = list(poly)
+    if not pts:
+        return False
+    xmin, xmax = sorted((corner_a[0], corner_b[0]))
+    ymin, ymax = sorted((corner_a[1], corner_b[1]))
+    for x, y in pts:  # any vertex inside the rect
+        if xmin <= x <= xmax and ymin <= y <= ymax:
+            return True
+    if len(pts) == 1:
+        return False
+    rect = [(xmin, ymin), (xmax, ymin), (xmax, ymax), (xmin, ymax)]
+    edges = zip(pts, pts[1:] + pts[:1]) if len(pts) >= 3 else [(pts[0], pts[1])]
+    for e1, e2 in edges:  # any edge crossing a rect edge
+        for r1, r2 in zip(rect, rect[1:] + rect[:1]):
+            if segments_intersect(e1, e2, r1, r2):
+                return True
+    # rect entirely inside the polygon
+    return len(pts) >= 3 and point_in_polygon(rect[0], pts)
+
+
 def snap_points(poly: Sequence[Point], midpoints: bool = True) -> list[Point]:
     """Snap candidates a polygon offers: its vertices, plus edge midpoints
     (useful when butting a loop against the middle of a neighbor's edge)."""

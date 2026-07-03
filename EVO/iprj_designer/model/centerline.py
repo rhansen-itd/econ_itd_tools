@@ -158,6 +158,84 @@ def _find_chains(lineals: Sequence[Lineal]) -> list[tuple[list[Point], list[Line
     return results
 
 
+def _stray_indices(lineals: Sequence[Lineal]) -> list[int]:
+    """Indices of the *stray* Lineals: enabled, two distinct endpoints,
+    sharing no endpoint (2-decimal key) with any other usable segment —
+    i.e. single-segment components, which the chain reader treats as
+    vendor-drawn reference lines rather than centerlines."""
+    usable: list[tuple[int, _Key, _Key]] = []
+    for i, l in enumerate(lineals):
+        if not l.enable or l.point_0 is None or l.point_1 is None:
+            continue
+        k0, k1 = _key(l.point_0), _key(l.point_1)
+        if k0 != k1:
+            usable.append((i, k0, k1))
+    degree: dict[_Key, int] = {}
+    for _, k0, k1 in usable:
+        degree[k0] = degree.get(k0, 0) + 1
+        degree[k1] = degree.get(k1, 0) + 1
+    return [i for i, k0, k1 in usable if degree[k0] == 1 and degree[k1] == 1]
+
+
+def load_lineals(project: Project) -> list[Lineal]:
+    """The project's generic (non-chain stray) Lineals, as fresh working
+    copies for the GUI's editable pool — `save_lineals` writes the edited
+    set back, mirroring the `load_centerlines`/`save_centerlines` split."""
+    return [Lineal(enable=1,
+                   point_0=(float(l.point_0[0]), float(l.point_0[1])),
+                   point_1=(float(l.point_1[0]), float(l.point_1[1])),
+                   extra=dict(l.extra))
+            for l in (project.lineals[i] for i in _stray_indices(project.lineals))]
+
+
+def save_lineals(project: Project, lineals: Sequence[Lineal]) -> list[Lineal]:
+    """Write *lineals* as the project's full set of generic strays,
+    replacing the previous set in place (placeholder slots first, append
+    when the 100-slot array is full — same slot policy as
+    `save_centerlines`, whose chains and other components are untouched).
+
+    **Endpoint-coincidence guard:** a stray that shares an endpoint
+    (2-decimal key) with any other enabled Lineal — a centerline chain
+    vertex, another stray, or an earlier lineal in this same call — would
+    be re-read as part of a centerline chain on the next load (see the
+    module docstring), so it is *not* written; the skipped Lineals are
+    returned for the caller to surface. Zero-length segments are skipped
+    for the same reason (unusable geometry). Call this *after*
+    `save_centerlines` so the guard sees the final chain vertices.
+    Entries without real geometry (placeholders) are ignored.
+    """
+    for i in _stray_indices(project.lineals):
+        slot = project.lineals[i]
+        slot.enable = 0
+        slot.point_0 = (0.0, 0.0)
+        slot.point_1 = (0.0, 0.0)
+    taken: set[_Key] = set()
+    for l in project.lineals:
+        if l.enable and l.point_0 is not None and l.point_1 is not None:
+            taken.add(_key(l.point_0))
+            taken.add(_key(l.point_1))
+    skipped: list[Lineal] = []
+    free = (l for l in project.lineals if _is_free_slot(l))
+    for lin in lineals:
+        if not lin.enable or lin.point_0 is None or lin.point_1 is None:
+            continue
+        k0, k1 = _key(lin.point_0), _key(lin.point_1)
+        if k0 == k1 or k0 in taken or k1 in taken:
+            skipped.append(lin)
+            continue
+        taken.update((k0, k1))
+        p0 = (float(lin.point_0[0]), float(lin.point_0[1]))
+        p1 = (float(lin.point_1[0]), float(lin.point_1[1]))
+        slot = next(free, None)
+        if slot is None:
+            project.lineals.append(Lineal(enable=1, point_0=p0, point_1=p1))
+        else:
+            slot.enable = 1
+            slot.point_0 = p0
+            slot.point_1 = p1
+    return skipped
+
+
 def lineals_to_centerlines(lineals: Sequence[Lineal]) -> list[list[Point]]:
     """Reconstruct every centerline's ordered points from a project's
     Lineals (see module docstring for how they are identified and

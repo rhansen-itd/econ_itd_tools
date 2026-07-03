@@ -882,6 +882,141 @@ Suggested prompt:
   acceptance case still numbers 33–43. Historical entries above keep their
   original "input" wording as the record of what was built at the time.
 
+- 2026-07-03 — **Phase 3.2a (Fable): DrawKind, multi-select, lineal
+  round-trip, accelerator seam.** Pure-python pass per PHASE3_UI_PLAN
+  §4/§6/§7; no GUI wiring touched beyond one `app.py` docstring line.
+  Decisions made at the seams:
+  - `DrawKind` (frozen dataclass in `gui/drawing.py`) generalizes only the
+    commit target — `make(points, seq)` / `insert` / `is_placeholder` /
+    `shape` — with instances `LOOP_KIND` / `IGNORE_KIND` / `LINEAL_KIND`.
+    `Lineal`'s two endpoint fields are adapted through module-level
+    `element_points`/`set_element_points`, so the `("points", …)` undo op
+    shape is unchanged and the stack still survives retargets (now
+    including kind switches: `retarget(zones, kind=…)`). Cap `ValueError`s
+    from `domain.insert_*` are caught in `_insert` and surfaced on a new
+    one-shot `ctrl.warning` field for 3.2b to `ui.notify`.
+  - `LINEAL_KIND` sets `snappable=False`: a lineal endpoint must never snap
+    (endpoint coincidence merges it into a centerline chain on reload).
+    Belt-and-braces, `save_lineals` — added to `model/centerline.py` beside
+    the chain logic it reuses — *skips* endpoint-coincident or degenerate
+    strays and returns the skipped list for the GUI to report; call it
+    after `save_centerlines` so the guard sees the final chain vertices.
+    `load_lineals` returns working copies of the single-segment components,
+    mirroring the centerline load/save split.
+  - Multi-select is `selection: list[int]` + `anchor`; `selected` became a
+    property (get = anchor, set = collapse-to-one), so every existing
+    `gui/app.py` call site — including its `ctrl.selected -= 1` index fixup
+    — works unchanged. **Shift-click toggles membership; Ctrl-drag keeps
+    its existing copy meaning** (the plan's "Ctrl/Shift-click" was
+    ambiguous and Ctrl was already taken). Group move/nudge/delete write
+    one `("batch", …)` op (delete recorded high-index-first so undo
+    restores low-to-high); nudge bursts coalesce for groups as they did for
+    singles. Marquee = `geometry.polygon_intersects_rect` (touching counts;
+    handles 2-point segments) + `ctrl.marquee_select(a, b, additive=)`.
+    Snap-on-release stays single-zone — a group already moved as one rigid
+    delta.
+  - §2.1 accelerator fixes landed: `d` no longer starts dimension entry
+    (digits after the first corner do — hint text updated); `l`/`e`
+    set-mode shortcuts removed from `DrawingController.key`. The app-level
+    `l`/`e` bindings still route those keys until 3.2b moves all tool
+    accelerators up. Suite: 274 tests pass (39 new across
+    `test_drawing.py`, `test_geometry.py`, new `test_lineals.py`).
+
+- 2026-07-03 — **Phase 3.2b (Sonnet): two-tier toolbar, Pan dropped,
+  draw kinds wired.** NiceGUI wiring per PHASE3_UI_PLAN §3/§4/§5 on top of
+  3.2a's controller/model. Decisions made at the seams:
+  - Row 1 (chrome) holds the file menu (New/Open/Save/Save As), the 6-tool
+    toggle (Select/Draw/Template/Centerline/Sensor/Measure), snap, undo,
+    layers, fit, save, and the zone-panel toggle. Row 2 (context bar) is
+    *one* row built once at page load; every tool's controls live in it
+    simultaneously and `update_context_bar()` calls `.set_visibility()` on
+    each control per the active tool/sub-type, rather than the "one row per
+    tool" reading of the plan diagram — this lets a control genuinely
+    shared across tools (the sensor selector shows for Draw, Select, *and*
+    Sensor) exist once instead of three times.
+  - Draw's sub-type toggle and Select share one `DrawingController`
+    (`Viewer.draw_kind_name` + `draw_zones()`/`set_draw_kind()`): switching
+    sub-type or active sensor calls `ctrl.retarget(...)`, so Select always
+    edits whatever the Draw toggle last pointed at — picking "Ignore Zone"
+    in Draw and then switching to Select edits ignore zones. The zone table
+    stays Loop-only (it has no columns for ignore zones/lineals); selecting
+    a table row forces the toggle back to Loop first.
+  - Pan is gone. `space_pan` (a `Viewer` flag toggled by the keyboard
+    handler's keyup/keydown on the space key) and the existing
+    middle-button check now gate the pan branch in `on_down`; Select's
+    empty-canvas drag is a marquee instead. The marquee-vs-click/drag
+    decision needed one small addition to `gui/drawing.py`: a public
+    `DrawingController.dragging` property (vertex-or-body-drag in
+    progress), so the GUI can tell "nothing was hit" apart from "something
+    was hit but didn't move" without reaching into the controller's
+    underscore-prefixed drag state. `on_down` snapshots `selection`/`anchor`
+    before calling `mouse_down` and starts a marquee only when neither
+    changed and nothing is dragging — a shift-click toggle or a ctrl-drag
+    copy always changes one of those, so they're correctly never mistaken
+    for a marquee start.
+  - Selection-set membership (`zi in ctrl.selection`, not `== ctrl.selected`)
+    now drives the white-outline highlight for all three kinds — event
+    zones, ignore zones (now white-vs-yellow-dashed), and lineals
+    (white-vs-gray) — so a marquee's multi-selection is visible immediately
+    rather than only from 3.2c onward. The zone **table**'s selection sync
+    stays single (`selection="single"`), and rotate/bulk-edit are still
+    out of scope — both remain 3.2c per the plan.
+  - Verified with a scripted Playwright/Chromium session (not just pytest,
+    since `gui/` has no unit coverage by design): every tool/sub-type
+    switch, the keyboard accelerators, an empty-canvas marquee (0 hits) and
+    a full-image marquee (7 zones), a 2-click Lineal placement, a 4-click
+    Ignore Zone placement + undo, and a Save As round-trip — checked the
+    saved file's stray-lineal and ignore-zone counts against expectations
+    with no browser console/page errors. Suite: 274 tests pass unchanged
+    (3.2b is GUI wiring; the one `drawing.py` addition is a read-only
+    property with no new test surface).
+
+- 2026-07-03 — **Phase 3.2c (Sonnet): multi-select table sync, rotate.**
+  PHASE3_UI_PLAN §6.4/§6.5, closing out Phase 3. Decisions at the seams:
+  - The zone table is now `selection="multiple"`: its checkbox column
+    syncs to/from `ctrl.selection` via `on_table_select` (built from
+    `e.selection`'s full row list each time, so it's idempotent rather than
+    delta-based). Scoped to one sensor per §6.1 — checking a row from a
+    different sensor than the current pick keeps only that row's sensor
+    (mirroring how switching sensors already clears the selection). Plain
+    **row click** still selects just that one row (a small, deliberate
+    `drawing.py`-side asymmetry: it collapses to a single pick the way a
+    canvas click does, distinct from the checkbox column's additive
+    multi-select) and double-click still opens Properties for that row
+    regardless of the current multi-selection.
+  - Bulk edit stays out of v1 (§8.2): the floor is `properties_btn.set_enabled
+    (len(selection) <= 1)`, refreshed alongside the selection count, plus a
+    guard in `zone_properties()` for the `p`/Enter/context-bar paths (a
+    table double-click still bypasses it — that's an explicit "just this
+    row" request, not "operate on the current selection").
+  - Rotate is a new `DrawingController.rotate_selection(angle, pivot)` +
+    `selection_centroid()` pair (`gui/drawing.py`, since it needs the
+    controller's private undo stack — the same reasoning that put
+    `dragging` there in 3.2b) plus `Viewer`-level click/drag state
+    (`rotate_armed`/`rotate_pivot`/`rotate_ray`/`rotate_angle`) mirroring
+    how Template's ref-then-aim flow already lives at that layer. Read
+    the plan's "two-click workflow, default pivot = centroid" as: the
+    Rotate button arms the tool with a *visible* centroid-seeded pivot
+    marker; click 1 drops the real pivot (usually near that seed, but
+    anywhere); the first mouse-move after that freezes the reference ray
+    for `rotation_angle_deg`; click 2 commits. A zero-angle commit (two
+    clicks with no mouse movement between) is treated as a no-op — no undo
+    entry, nothing to detach — rather than recording a null rotation.
+  - Attachment interaction (§6.4): `rotate_selection` returns the rotated
+    elements; the GUI pops each one out of every `CenterlineController
+    .attached` dict by `id(zone)` and reports a count in the toast. Ignore
+    zones/Lineals are never attached, so the pop is a harmless no-op for
+    those kinds — no kind check needed.
+  - Verified with a scripted Playwright/Chromium session against
+    `sites/Banks/banks.iprj`: checkbox multi-select (additive, matches the
+    selection-count label), row-click collapse back to one, Properties
+    disabling/re-enabling across that transition, and the full rotate
+    arm → pivot click → live preview (pivot cross + dashed rotated outline
+    + live angle readout) → commit → "rotated N zone(s)" toast cycle — no
+    browser console errors. Suite: 280 tests pass (6 new in
+    `test_drawing.py` covering `selection_centroid`/`rotate_selection`,
+    including the batch-undo and zero-angle-noop cases).
+
 ## Appendix — example template (acceptance case for Session 6)
 
 45 mph approach, lanes `12' L | 12' T | 12' T | 12' R`, count loops, starting

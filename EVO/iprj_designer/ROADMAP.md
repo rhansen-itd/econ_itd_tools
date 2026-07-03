@@ -100,16 +100,16 @@ order.
 #### Phase 3.2a — Controller & model (Target: Fable)
 
 Scope (plan §4, §6, §7 — pure-python, pytest-covered, no GUI imports):
-- [ ] `DrawKind` draw-target descriptor + generalize
+- [x] `DrawKind` draw-target descriptor + generalize
       `DrawingController._commit_zone`; add the 2-click `segment` draw path;
       retarget the controller between element lists (event zones / ignore
       zones / lineals).
-- [ ] Multi-select state (`selection` list + `anchor`), a marquee hit helper in
+- [x] Multi-select state (`selection` list + `anchor`), a marquee hit helper in
       `model/geometry.py`, and group move/delete/nudge as `("batch", …)` undo
       ops (reusing the existing batch entry).
-- [ ] `load_lineals`/`save_lineals` for non-chain stray Lineals, with the
+- [x] `load_lineals`/`save_lineals` for non-chain stray Lineals, with the
       endpoint-coincidence guard (plan §4.3).
-- [ ] Accelerator fixes at the seam (plan §2.1): drop `d` from `_key_draw`'s
+- [x] Accelerator fixes at the seam (plan §2.1): drop `d` from `_key_draw`'s
       dimension trigger (digits still start it); remove the `l`/`e` set-mode
       shortcuts from `DrawingController.key`.
 
@@ -123,12 +123,12 @@ Suggested prompt:
 #### Phase 3.2b — Toolbar & draw kinds (Target: Sonnet)
 
 Scope (plan §3, §4, §5):
-- [ ] Two-tier toolbar: persistent chrome row + per-tool context bar via
+- [x] Two-tier toolbar: persistent chrome row + per-tool context bar via
       `set_visibility` toggles; File menu; Draw/Measure sub-type toggles;
       accelerators per plan §2.1.
-- [ ] Drop Pan; default to Select; space/middle-drag pan; marquee on
+- [x] Drop Pan; default to Select; space/middle-drag pan; marquee on
       empty-canvas left-drag.
-- [ ] Wire the three draw kinds (Loop / Ignore Zone / Lineal) to the sub-type
+- [x] Wire the three draw kinds (Loop / Ignore Zone / Lineal) to the sub-type
       toggle; render generic lineals distinctly from centerlines; surface the
       10/100 cap `ValueError`s as notifications.
 
@@ -141,10 +141,10 @@ Suggested prompt:
 #### Phase 3.2c — Multi-select sync & rotation (Target: Sonnet)
 
 Scope (plan §6.4, §6.5):
-- [ ] Multi-select GUI sync: zone table `selection="multiple"`, `svg()`
+- [x] Multi-select GUI sync: zone table `selection="multiple"`, `svg()`
       highlights for every selected zone, marquee rectangle + rotation-pivot
       preview.
-- [ ] Wire the 2-click rotate workflow to `geometry.rotate_points` /
+- [x] Wire the 2-click rotate workflow to `geometry.rotate_points` /
       `rotation_angle_deg`; rotating an attached zone detaches it (plan §6.4).
 
 Suggested prompt:

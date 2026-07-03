@@ -223,3 +223,51 @@ def test_rotation_angle_feeds_rotate_points():
     ang = geometry.rotation_angle_deg(pivot, frm, to)
     moved = geometry.rotate_points([frm], ang, pivot=pivot)[0]
     assert moved == pytest.approx((3.0, -2.0))
+
+
+# -- marquee hit test (Phase 3.2a) ---------------------------------------------
+
+def test_segments_intersect_crossing_and_disjoint():
+    assert geometry.segments_intersect((0, 0), (10, 10), (0, 10), (10, 0))
+    assert not geometry.segments_intersect((0, 0), (10, 0), (0, 5), (10, 5))
+
+
+def test_segments_intersect_touching_and_collinear():
+    assert geometry.segments_intersect((0, 0), (10, 0), (10, 0), (10, 10))
+    assert geometry.segments_intersect((0, 0), (10, 0), (5, 0), (15, 0))
+    assert not geometry.segments_intersect((0, 0), (10, 0), (11, 0), (20, 0))
+
+
+BIG_SQUARE = [(0, 0), (40, 0), (40, 40), (0, 40)]
+
+
+def test_marquee_vertex_inside_rect():
+    assert geometry.polygon_intersects_rect(BIG_SQUARE, (-5, -5), (5, 5))
+
+
+def test_marquee_corners_may_come_in_any_order():
+    assert geometry.polygon_intersects_rect(BIG_SQUARE, (5, 5), (-5, -5))
+
+
+def test_marquee_edge_crossing_without_vertex_inside():
+    # thin rect slicing through the square's middle: no vertex containment
+    assert geometry.polygon_intersects_rect(BIG_SQUARE, (-10, 15), (50, 25))
+
+
+def test_marquee_rect_entirely_inside_polygon():
+    assert geometry.polygon_intersects_rect(BIG_SQUARE, (10, 10), (30, 30))
+
+
+def test_marquee_disjoint():
+    assert not geometry.polygon_intersects_rect(BIG_SQUARE, (100, 100), (150, 150))
+
+
+def test_marquee_touching_edge_counts():
+    assert geometry.polygon_intersects_rect(BIG_SQUARE, (40, 10), (60, 30))
+
+
+def test_marquee_two_point_segment():
+    seg = [(0, 0), (100, 100)]
+    assert geometry.polygon_intersects_rect(seg, (40, 20), (60, 80))
+    assert not geometry.polygon_intersects_rect(seg, (60, 0), (100, 30))
+    assert not geometry.polygon_intersects_rect([], (0, 0), (10, 10))
