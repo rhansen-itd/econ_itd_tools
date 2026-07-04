@@ -1017,6 +1017,186 @@ Suggested prompt:
     `test_drawing.py` covering `selection_centroid`/`rotate_selection`,
     including the batch-undo and zero-angle-noop cases).
 
+- 2026-07-04 — **ROADMAP Phase 4.1 done (advanced template engine — math &
+  schema; Fable).** `model/templates.py` rebuilt around "math seeds flexible
+  defaults", run schema-first then seeding per the ROADMAP notes. Decisions:
+  - **Schema v2: explicit `TemplateDetector` rows** (kind, `spanning_lanes`,
+    length, setback, `output_offset`, phase role) are the editable source of
+    truth for expansion. `seed_detectors` fills them from the kinematics;
+    expansion only ever reads stored values, so a Phase 4.2 override fully
+    replaces the computed one (pinned by
+    `test_seeded_rows_are_defaults_not_constraints`). An empty `detectors`
+    list means "expand seeded defaults", which is also how v1 templates
+    behave after upgrade. `spanning_lanes` are contiguous ascending 0-based
+    lane indices; width = sum of spanned lane widths at expansion.
+  - **Continuous-coverage advance chain.** A call gaps out when the clear
+    gap between successive detectors exceeds what the detection-channel
+    extension carries at design speed, so `advance_setbacks_ft` chains
+    advance detectors downstream from the SSD at a pitch of
+    `length + v·t_ext` until the extension bridges the remaining gap to the
+    dilemma detector's upstream edge (`gap_max = v·t_ext`). Assumed
+    extension: `DEFAULT_EXTENSION_TIME_S = 1.0 s`, a per-template field
+    (`extension_time_s`) like the Session 6.2 PRT/decel constants are
+    module-level. At 45 mph/1.0 s that's two rows (283.8, 207.8 ft); 30 mph
+    or a 2.0 s extension needs one — the acceptance case is now 13
+    detectors, outputs 33–45.
+  - **Placeholders vs. literals.** `direction`/`thru_phase`/`lt_phase`/
+    `base_output` are Optional: a present value is a baked literal that
+    placement never overrides; None means "prompt at placement", filled from
+    a new `PlacementContext` (`expand_*` all take an optional `context`).
+    `missing_placeholders()` is usage-aware (lt_phase only required if some
+    row carries the "lt" role) — the seam for the 4.3 placement prompt. New
+    `ApproachTemplate()` defaults all four to placeholder.
+  - **Base + Offset numbering** (output-only, per the 2026-07-03 entry):
+    rows store `output_offset`, assigned output = `base_output + offset`.
+    v1's `starting_output` maps onto the Base Output literal in
+    `template_from_dict` (offsets seed 0,1,2,…, so the numbers come out
+    identical); v1 files load unchanged and upgrade to v2 on save.
+  - **Anchor (Station 0) lane line.** Lateral offsets now originate at the
+    anchor lane line — default: right side of the *leading block* of
+    movement-"L" lanes (`default_anchor_lane_line`; 0 = leftmost lane's left
+    edge when there is none; a shared LT lane is not exclusive, and an L
+    lane after a non-L lane doesn't count), overridable per template via
+    `anchor_lane_line` (a lane-line index 0..n). Lanes left of the anchor
+    get negative offsets; the placement click is now the anchor point, and
+    the appendix acceptance case re-pins laterals to −12/0/12/24. GUI status
+    strings updated to say "anchor point (stop bar at the LT/thru lane
+    line)".
+  - **Compat wiring kept minimal:** `place_template` in `gui/app.py` now
+    catches the unresolved-placeholder `ValueError` and notifies (real
+    prompt is 4.3); `templates_ui.py` renamed to "Base output #", gained an
+    extension-time field, and saves blank direction/phase/output fields as
+    placeholders (it still doesn't edit detector rows — that's the 4.2 grid
+    editor). New `templates/example_45mph_generic.json` is the all-
+    placeholder companion to the v1-format `example_45mph_north.json`
+    (kept as the legacy-load fixture). Suite: 304 tests pass (24 net new).
+
+- 2026-07-04 — **ROADMAP Phase 4.2 done (grid editor UI; Sonnet).**
+  `gui/templates_ui.py` gained a Detectors section below Lanes: one flat CSS
+  Grid container whose columns are the template's physical lanes (column 1 a
+  fixed-width row header, column width weighted by `lane.width_ft` so wider
+  lanes get wider columns) and whose rows are `TemplateDetector` entries,
+  each placed by explicit `grid-column`/`grid-row` rather than nested
+  per-row grids. Decisions:
+  - **Merge = span, not a special mode.** A row's value cell (length/setback
+    editors) is positioned at `grid-column: {2 + span_from} / span {span_to
+    - span_from + 1}`; widening a row's "to lane" number simply grows that
+    span, so the cell visually stretches across the lane columns it now
+    covers — no separate "merge cells" action. Verified with a Playwright
+    session: widening a single-lane count row's span from lane 0 to 0-2
+    changed its CSS `grid-area` from `.../span 1` to `.../span 3` and the
+    saved JSON came back with `spanning_lanes: [0, 1, 2]`.
+  - **`detector_rows` is plain-dict state, not UI-element-backed.** Unlike
+    `lane_rows` (which keeps the live `ui.number`/`ui.input` handles),
+    detector rows are dicts (kind/span_from/span_to/length_ft/setback_ft/
+    output_offset/phase) rebuilt into elements on every structural change
+    (`render_detectors()` clears and redraws the whole grid). This was
+    necessary because a span edit changes *layout* (grid-column), not just a
+    value — easier to redraw the section than to reposition one cell's DOM
+    node. Non-layout field edits (length, setback, kind, phase, output
+    offset) just mutate the dict without a redraw.
+  - **"Seed from kinematics" materializes, then never re-runs.** The button
+    calls `seed_detectors()` on a throwaway `ApproachTemplate` built from the
+    current lanes/speed/extension-time fields and replaces `detector_rows`
+    wholesale (confirmation dialog if rows already exist); after that, every
+    field is a plain editable value; Save writes exactly what's in the grid.
+    This is the Phase 4.1 "seed, don't constrain" contract made concrete in
+    the UI — there's no live recompute-on-lane-change wired up, by design.
+  - **Phase field is free text, not a select.** `TemplateDetector.phase` is
+    `"thru" | "lt" | int`; a plain `ui.input` (placeholder `thru / lt / #`)
+    covers all three without a custom widget, parsed in
+    `collect_detectors()`/`_parse_phase` the same way `model/templates.py`'s
+    private `_validate_phase` does (duplicated rather than imported, since
+    that helper is intentionally private to the model module).
+  - Verified with a scripted Playwright/Chromium session: seeding on a
+    1-lane/45 mph template (5 rows) and a 3-lane/1-LT template (11 rows,
+    matching the Design History Session 6 acceptance shape), widening a
+    span and confirming the `grid-area` CSS change, editing length/setback/
+    phase/output-offset, Save As to a JSON file, then reloading that file
+    through `model/templates.py` and `expand_template` — merged span came
+    back as a 36 ft-wide "SBLT Count" detector at output 131 (base 32 +
+    offset 99), phase 4 as the literal typed. No browser console errors.
+    Suite unchanged: 304 tests pass (Phase 4.2 is GUI-only, no `model/`
+    changes).
+
+- 2026-07-04 — **ROADMAP Phase 4.3 done (canvas placement UI; Sonnet).**
+  `gui/app.py`'s Template tool now carries a `Viewer.template_context`
+  (`model.templates.PlacementContext`), threaded into every
+  `expand_and_place`/`expand_and_place_on_centerline` call — both the live
+  preview in `svg()` and the committing `place_template`. Decisions:
+  - **Prompt is scoped to what the template actually needs.**
+    `missing_placeholders(template, None)` (a fresh, all-`None` context)
+    gives the fixed set of fields *this template* requires — usage-aware,
+    so an all-thru template never asks for LT phase — independent of
+    whatever the user has already filled in; that set drives which
+    `ui.select`/`ui.number` widgets the dialog builds. A template with
+    every field baked (the Session 6.3-era `example_45mph_north.json`)
+    yields an empty set, so picking it opens no dialog at all — placement
+    behaves exactly as before 4.1.
+  - **Auto-prompt on pick, manual re-open via a context-bar button.**
+    `change_template` resets `template_context` and calls
+    `edit_placement_values(auto=True)`, which is a no-op when the field set
+    is empty; a new pencil-icon "placement values" button (visible whenever
+    a template is selected) calls the same dialog with `auto=False`, always
+    opening — including on a fully-baked template, showing a "no
+    placeholders" message — so values (most usefully Base Output) can be
+    reviewed or changed between repeated placements of one template across
+    several approaches, without re-picking it from the dropdown.
+  - **The canvas click is still the anchor point** — Phase 4.1 already
+    redefined `stop_bar_ref`/the click to mean the anchor lane line rather
+    than the leftmost lane edge, and `place_detectors`/
+    `place_detectors_on_centerline` were unchanged by 4.3, so "snap to the
+    anchor point" was a wiring consequence of passing `template_context`
+    through, not new geometry.
+  - **Placement is guarded at the click, not just at expansion.** `on_down`'s
+    Template branch checks `missing_placeholders` before doing anything
+    with the click and reopens the values dialog instead of consuming the
+    click as a reference point — so a user who dismisses the auto-prompt
+    doesn't lose their click as a wasted anchor placement.
+  - Verified with a scripted Playwright/Chromium session against a blank
+    scratch project (a plain gray PNG, calibrated by known width): picking
+    `example_45mph_generic.json` (the all-placeholder companion template)
+    auto-opened the dialog; filling direction=N/thru=4/lt=7/base=33 and
+    applying updated the status line to the anchor-click prompt; anchor +
+    aim clicks placed 13 detectors at outputs 33–45 (the Phase 4.1
+    45 mph/1.0 s acceptance shape) with a matching toast. A second run
+    confirmed `example_45mph_north.json` (fully baked) opens no dialog on
+    pick, and the manual button still opens one showing "no placeholders."
+    Zero console errors in both runs. Suite unchanged: 304 tests pass
+    (4.3 is GUI-only, no `model/` changes).
+
+- 2026-07-04 — **Template editor wired into the Template tool's context bar**
+  (owner-reported gap after Phase 4.3: `gui/templates_ui.py` had no entry
+  point from `gui/app.py` since Session 6.1, when it was built as a
+  standalone NiceGUI form). `gui/templates_ui.py` owns its own `ui.run`
+  event loop, so it can't be mounted into `gui/app.py`'s page directly — a
+  new editor button (pencil-and-square icon, next to the template picker
+  and "placement values" button, visible whenever the Template tool is
+  active) spawns it as a `subprocess.Popen` on `state["template_editor_port"]`
+  (`--port` + 1000) the first time it's clicked, polls the port (up to ~5 s)
+  until it accepts a connection, then `ui.navigate.to(..., new_tab=True)`
+  opens it in a new browser tab; a later click reuses the same subprocess
+  (checked via `proc.poll()`) rather than spawning a second one on the same
+  port. The tracking state (`template_editor_proc`) lives on `state`, not
+  `Viewer`, so it survives a New/Open project swap; the subprocess is
+  registered with `atexit.register(proc.terminate)` the same way `Viewer`'s
+  temp background-image file already is. If a template is currently picked
+  in the Template tool, its path is passed as the editor's positional
+  argument so it opens straight to that file instead of a blank form.
+  **First landed as a File menu item, then moved same-day** (owner
+  preference: it belongs with the rest of the Template tool's controls, not
+  buried in the file menu) — behavior is otherwise identical. Verified with
+  a scripted Playwright/Chromium session: the button is absent from the
+  File menu and hidden outside the Template tool, visible only once that
+  tool is active; first click spawned the subprocess and opened a new tab
+  titled "Approach Template Editor"; a second click (after closing that
+  tab) reused the running process and opened promptly with no second
+  "starting…" notification; picking `example_45mph_north.json` in the
+  Template tool first and then opening the editor (after killing the
+  previously-spawned instance so a fresh one launched) opened directly to
+  "Approach template — example_45mph_north.json". Zero console errors.
+  Suite unchanged: 304 tests pass (gui-only change).
+
 ## Appendix — example template (acceptance case for Session 6)
 
 45 mph approach, lanes `12' L | 12' T | 12' T | 12' R`, count loops, starting

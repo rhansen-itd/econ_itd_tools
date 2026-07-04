@@ -1,0 +1,35 @@
+{
+  "schema_version": 2,
+  "name": "45 mph generic approach (direction/phases/output at placement)",
+  "speed_mph": 45.0,
+  "extension_time_s": 1.0,
+  "lanes": [
+    {
+      "movement": "L",
+      "width_ft": 12.0,
+      "advance_detector": true
+    },
+    {
+      "movement": "T",
+      "width_ft": 12.0,
+      "advance_detector": true
+    },
+    {
+      "movement": "T",
+      "width_ft": 12.0,
+      "advance_detector": true
+    },
+    {
+      "movement": "R",
+      "width_ft": 12.0,
+      "advance_detector": true
+    }
+  ],
+  "count_loops": true,
+  "direction": null,
+  "thru_phase": null,
+  "lt_phase": null,
+  "base_output": null,
+  "anchor_lane_line": null,
+  "detectors": []
+}

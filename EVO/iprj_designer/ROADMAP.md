@@ -161,21 +161,21 @@ where math seeds flexible defaults.
 ### Phase 4.1 — Math & Schema (Target: Fable)
 
 Scope:
-- [ ] Update `model/templates.py` to use `extension_time` and detector length
+- [x] Update `model/templates.py` to use `extension_time` and detector length
       alongside approach speed to calculate continuous dilemma zone coverage.
       **Crucial intent:** These ITE kinematic calculations are meant to *seed*
       the default values (setback, length) for the template generation,
       creating a smart baseline that the schema/UI allows the user to
       explicitly override. Do not make the math a rigid constraint.
-- [ ] Add schema support for dynamic placeholders that get injected at
+- [x] Add schema support for dynamic placeholders that get injected at
       placement time: approach direction, relevant phases, and **Base Output**.
-- [ ] Refactor output numbering to a Base + Offset model: the template schema
+- [x] Refactor output numbering to a Base + Offset model: the template schema
       should store an `output_offset` (e.g., 0, 1, 2). At placement time, the
       user provides a `Base Output` (e.g., 32), and the assigned output is
       calculated as `Base Output + output_offset`.
-- [ ] Add schema support for lane-spanning detectors (e.g.,
+- [x] Add schema support for lane-spanning detectors (e.g.,
       `spanning_lanes: [1, 2]`).
-- [ ] Define anchor point logic (Station 0) defaulting to the lane line
+- [x] Define anchor point logic (Station 0) defaulting to the lane line
       between the exclusive left-turn lanes and the thru lanes (i.e., the
       right side of the last exclusive left-turn lane).
 
@@ -219,11 +219,11 @@ Suggested prompt:
 ### Phase 4.2 — Grid Editor UI (Target: Sonnet)
 
 Scope:
-- [ ] Build a standalone template editor using NiceGUI Flexbox/CSS Grid columns
+- [x] Build a standalone template editor using NiceGUI Flexbox/CSS Grid columns
       for physical lanes.
-- [ ] Allow merging cells across lanes (using the Phase 4.1 `spanning_lanes`
+- [x] Allow merging cells across lanes (using the Phase 4.1 `spanning_lanes`
       schema).
-- [ ] Allow user overrides of Fable's mathematically pre-populated (seeded)
+- [x] Allow user overrides of Fable's mathematically pre-populated (seeded)
       kinematic values.
 
 Suggested prompt:
@@ -234,10 +234,10 @@ Suggested prompt:
 ### Phase 4.3 — Canvas Placement UI (Target: Sonnet)
 
 Scope:
-- [ ] Wire the new template engine to the canvas.
-- [ ] Prompt the user for the dynamic placeholders (phase, direction, and Base
+- [x] Wire the new template engine to the canvas.
+- [x] Prompt the user for the dynamic placeholders (phase, direction, and Base
       Output) at placement time.
-- [ ] Snap the template to the defined anchor point on the canvas.
+- [x] Snap the template to the defined anchor point on the canvas.
 
 Suggested prompt:
 > [Sonnet] In EVO/iprj_designer, do Phase 4.3 of ROADMAP.md: wire the advanced

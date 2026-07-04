@@ -650,7 +650,8 @@ def placed_zones_on_bent_centerline():
     from model.templates import ApproachTemplate, Lane, expand_and_place_on_centerline
     cl_pts = [(0.0, 0.0), (0.0, -800.0), (-600.0, -1400.0)]
     t = ApproachTemplate(lanes=[Lane("L"), Lane("T"), Lane("T"), Lane("R")],
-                         speed_mph=45.0)
+                         speed_mph=45.0, direction="N", thru_phase=4,
+                         lt_phase=7, base_output=1)
     placed = expand_and_place_on_centerline(t, cl_pts, (2.0, 1.0), 4.0)
     zones = [EventZone(enable=1, zone_name=d.spec.name,
                        points=[(round(x, 2), round(y, 2)) for x, y in d.points])
@@ -662,7 +663,7 @@ def test_derive_attachments_recognizes_engine_placed_zones():
     cl_pts, zones = placed_zones_on_bent_centerline()
     ctrl = make_cl()
     ctrl.points = list(cl_pts)
-    assert derive_attachments([ctrl], [zones]) == len(zones) == 11
+    assert derive_attachments([ctrl], [zones]) == len(zones) == 13
     # and the derived attachment actually re-stations: stretch the far leg
     before = [list(z.points) for z in zones]
     ctrl.selected = 2
@@ -680,14 +681,15 @@ def test_derive_attachments_recognizes_zone_straddling_a_bend():
     from model.templates import ApproachTemplate, Lane, expand_and_place_on_centerline
     cl_pts = [(400.0, 500.0), (400.0, 420.0), (250.0, 150.0)]  # bend at 160 ft
     t = ApproachTemplate(lanes=[Lane("L"), Lane("T"), Lane("T"), Lane("R")],
-                         speed_mph=45.0)  # dilemma 160..180 ft straddles it
+                         speed_mph=45.0, direction="N", thru_phase=4,
+                         lt_phase=7, base_output=1)  # dilemma 165..185 straddles it
     placed = expand_and_place_on_centerline(t, cl_pts, (395.0, 505.0), 0.5)
     zones = [EventZone(enable=1, zone_name=d.spec.name,
                        points=[(round(x, 2), round(y, 2)) for x, y in d.points])
              for d in placed]
     ctrl = make_cl()
     ctrl.points = list(cl_pts)
-    assert derive_attachments([ctrl], [zones]) == len(zones) == 11
+    assert derive_attachments([ctrl], [zones]) == len(zones) == 13
 
 
 def test_derive_attachments_rejects_hand_drawn_shapes():

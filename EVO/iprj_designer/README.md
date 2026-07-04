@@ -89,12 +89,17 @@ snap switch, layer-visibility menu), a synced zone table panel (row
 click/double-click selects/edits), arrow-key nudging, `f` fit-view, and
 `Ctrl-S` save — all keyboard accelerators from earlier sessions still work.
 
-Session 6.1 complete (2026-07-02): approach-template schema
-(`model/templates.py`) — lane configuration (movement + width + per-lane
-advance-detector toggle), design speed, a template-wide count-loops
-toggle, starting output number, approach direction, thru/LT phase —
-with JSON load/save, and a standalone form (`python gui/templates_ui.py`)
-to create/edit template files under `templates/`.
+Approach-template schema (`model/templates.py`, Phase 4.1): lane
+configuration (movement + width + per-lane advance-detector toggle),
+design speed and extension time, and editable per-detector rows
+(spanned lanes, length, setback, output offset, phase role) that ITE
+kinematic math *seeds* with defaults — including an advance-detector
+chain sized for continuous dilemma-zone coverage. Approach direction,
+thru/LT phase, and Base Output may each be baked into the template or
+left as placeholders prompted at placement (output = Base Output +
+per-detector offset). JSON load/save (v1 files upgrade transparently),
+and a standalone form (`python gui/templates_ui.py`) to create/edit
+template files under `templates/`.
 
 The Phase 1 MVP (data model, drawing core, attributes, templates,
 centerline placement, and the ROADMAP Phase 1 UX/file-management pass) is

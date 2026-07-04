@@ -44,6 +44,24 @@ row's sensor), and the Select context bar's new Rotate button drives a
 centerline (§6.4). Properties is disabled for a multi-selection — bulk
 edit is a later add (§8.2) — so Delete/Move/Rotate are the group tools.
 
+Phase 4.3 wires the Phase 4.1 advanced template engine
+(`model/templates.py`'s `expand_template`/`PlacementContext`) into the
+Template tool: picking a template that leaves any of direction/thru
+phase/LT phase/Base Output as a placeholder (`None`) opens a "placement
+values" dialog for just those fields; the resulting `PlacementContext`
+flows into every preview and placement call. A template with everything
+baked in (the Session 6.3-era templates) places exactly as before, with no
+dialog. The context-bar "placement values" button (pencil icon) reopens the
+dialog to change values — e.g. a new Base Output — between placements of
+the same template on different approaches.
+
+The Template context bar's editor button (pencil-and-square icon) opens the
+Phase 4.2 grid editor (`gui/templates_ui.py`) in a new browser tab. That
+editor owns its own NiceGUI event loop, so it can't be built into this page
+directly — the button spawns it as a subprocess on `--port` + 1000 the
+first time it's used (reused after) and opens straight to whatever template
+is currently picked in the Template tool, if any.
+
 Usage:
     python gui/app.py [site.iprj | background.png] [--port 8080]
 
@@ -82,16 +100,19 @@ then enter the known distance), or Marker (click to drop a marker). "Clear
 markers & ruler" in the context bar clears both; Esc cancels a ruler
 measurement in progress.
 
-Template tool: pick a template from the context bar dropdown and click the
-stop-bar reference point (where the stop bar meets the left edge of the
-leftmost lane). With a centerline drawn, that one click places the whole
-detector set along the nearest centerline (live preview under the cursor);
-with no centerline, click again to aim upstream and place along that
-straight line. Centerline-placed zones stay attached: reshaping the
-centerline re-stations them. The .iprj cannot store the attachment itself,
-so reopening a project re-derives it — zones that are still exact
-station/offset rectangles on a centerline re-attach automatically (a
-notification reports how many).
+Template tool: pick a template from the context bar dropdown; if it leaves
+any placement value unresolved, a dialog prompts for direction/thru
+phase/LT phase/Base Output before you can place it (reopen it any time via
+the "placement values" button). Then click the anchor reference point
+(where the stop bar crosses the template's anchor lane line — by default
+the line between the exclusive left-turn lanes and the thru lanes). With a
+centerline drawn, that one click places the whole detector set along the
+nearest centerline (live preview under the cursor); with no centerline,
+click again to aim upstream and place along that straight line.
+Centerline-placed zones stay attached: reshaping the centerline re-stations
+them. The .iprj cannot store the attachment itself, so reopening a project
+re-derives it — zones that are still exact station/offset rectangles on a
+centerline re-attach automatically (a notification reports how many).
 
 Centerline tool: pick the active centerline from its selector (or add a new
 one for another approach), then click along it starting at the stop bar
@@ -104,11 +125,14 @@ once; only the active one is editable.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import atexit
 import base64
 import io
 import math
 import os
+import socket
+import subprocess
 import sys
 import tempfile
 import time
@@ -131,8 +155,9 @@ from model.centerline import (load_centerlines, load_lineals,
                               save_centerlines, save_lineals)
 from model.iprj_io import (Background, Condition, EventZone, Project, Sensor,
                            load_iprj, save_iprj)
-from model.templates import (expand_and_place, expand_and_place_on_centerline,
-                             load_template)
+from model.templates import (DIRECTIONS, PlacementContext, expand_and_place,
+                             expand_and_place_on_centerline, load_template,
+                             missing_placeholders)
 
 REPO = Path(__file__).resolve().parents[3]
 TEMPLATES_DIR = Path(__file__).resolve().parents[1] / "templates"
@@ -264,6 +289,11 @@ class Viewer:
         self.template = None  # ApproachTemplate | None
         self.template_ref: tuple[float, float] | None = None  # world px
         self.template_cursor: tuple[float, float] | None = None  # world px
+        # Phase 4.3: placement-time values for the template's placeholder
+        # fields (direction/thru_phase/lt_phase/base_output — see
+        # model.templates.PlacementContext). Reset whenever the template
+        # selection changes; edited via the "placement values" dialog.
+        self.template_context = PlacementContext()
         # approach centerlines (Session 7.2 draw/edit, Session 7.4
         # persistence): one CenterlineController per centerline found in the
         # project's Lineals, plus a fresh empty one ready to draw if there
@@ -403,13 +433,18 @@ class Viewer:
     def template_status(self) -> str:
         if self.template is None:
             return "mode: template | pick a template above"
+        missing = missing_placeholders(self.template, self.template_context)
+        if missing:
+            return (f"mode: template | {self.template.name} | fill in "
+                     f"placement values ({', '.join(missing)}) above before "
+                     "placing")
         if any(cl.current() is not None for cl in self.centerlines):
             return (f"mode: template | {self.template.name} | click the "
-                    "stop-bar reference point (left edge of the leftmost "
-                    "lane) — detectors follow the nearest centerline")
+                    "anchor point (stop bar at the LT/thru lane line) — "
+                    "detectors follow the nearest centerline")
         if self.template_ref is None:
             return (f"mode: template | {self.template.name} | click the "
-                    "stop-bar reference point (left edge of the leftmost lane)")
+                    "anchor point (stop bar at the LT/thru lane line)")
         return (f"mode: template | {self.template.name} | aim upstream, "
                 "click to place  [Esc cancels]")
 
@@ -597,7 +632,8 @@ class Viewer:
                 if fpp is not None:
                     try:
                         placed = expand_and_place_on_centerline(
-                            self.template, cl_ctrl.points, cursor, 1.0 / fpp)
+                            self.template, cl_ctrl.points, cursor, 1.0 / fpp,
+                            self.template_context)
                     except ValueError:
                         placed = []
             elif self.template_ref is not None:
@@ -613,7 +649,8 @@ class Viewer:
                     if fpp is not None and math.hypot(*upstream) > 1e-6:
                         try:
                             placed = expand_and_place(self.template, self.template_ref,
-                                                      upstream, 1.0 / fpp)
+                                                      upstream, 1.0 / fpp,
+                                                      self.template_context)
                         except ValueError:
                             placed = []
             for det in placed:
@@ -913,6 +950,64 @@ def build_ui(viewer: Viewer, state: dict) -> None:
 
     # -- template placement ------------------------------------------------------
 
+    def template_prompt_fields(template) -> list[str]:
+        """Which of PLACEHOLDER_FIELDS this template needs a placement value
+        for, regardless of what's already in v.template_context — the set
+        the "placement values" dialog should show (usage-aware: e.g.
+        lt_phase only if some row carries the "lt" role)."""
+        return missing_placeholders(template, None)
+
+    def edit_placement_values(auto: bool):
+        """Prompt for the template's placeholder fields (direction/thru
+        phase/lt phase/Base Output) into v.template_context. `auto` marks
+        the just-picked-a-template call (silently skipped when the template
+        is fully baked) vs. the manual "placement values" button (always
+        opens, so values can be reviewed/changed between placements)."""
+        fields = template_prompt_fields(v.template)
+        if not fields and auto:
+            return
+        ctx = v.template_context
+        with ui.dialog() as dialog, ui.card():
+            ui.label(f"Placement values — {v.template.name}").classes("text-lg")
+            if not fields:
+                ui.label("This template has no placeholders — every value "
+                         "is baked in.").classes("text-sm text-gray-500")
+            widgets = {}
+            if "direction" in fields:
+                widgets["direction"] = ui.select(
+                    list(DIRECTIONS), label="Approach direction",
+                    value=ctx.direction).classes("w-48")
+            if "thru_phase" in fields:
+                widgets["thru_phase"] = ui.number(
+                    "Thru phase", min=1, precision=0, value=ctx.thru_phase)
+            if "lt_phase" in fields:
+                widgets["lt_phase"] = ui.number(
+                    "LT phase", min=1, precision=0, value=ctx.lt_phase)
+            if "base_output" in fields:
+                widgets["base_output"] = ui.number(
+                    "Base Output", min=0, precision=0, value=ctx.base_output)
+
+            def as_int(name: str):
+                w = widgets.get(name)
+                return int(w.value) if w is not None and w.value not in (None, "") \
+                    else None
+
+            def apply():
+                v.template_context = PlacementContext(
+                    direction=widgets["direction"].value
+                    if "direction" in widgets and widgets["direction"].value else None,
+                    thru_phase=as_int("thru_phase"),
+                    lt_phase=as_int("lt_phase"),
+                    base_output=as_int("base_output"))
+                dialog.close()
+                refresh_overlay()
+                refresh_status()
+
+            with ui.row():
+                ui.button("Apply", on_click=apply)
+                ui.button("Cancel", on_click=dialog.close)
+        dialog.open()
+
     def change_template(e):
         if not e.value:
             v.template = None
@@ -924,8 +1019,12 @@ def build_ui(viewer: Viewer, state: dict) -> None:
                 v.template = None
         v.template_ref = None
         v.template_cursor = None
+        v.template_context = PlacementContext()
+        update_context_bar()
         refresh_overlay()
         refresh_status()
+        if v.template is not None:
+            edit_placement_values(auto=True)
 
     def place_template(pw):
         fpp = v.ft_per_px()
@@ -937,19 +1036,26 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             refresh_status()
             return
         cl_ctrl = v.centerline_for(pw)
-        if cl_ctrl is not None:
-            # curvilinear (Session 7.5): the click is the stop-bar reference;
-            # direction and curvature come from the nearest centerline
-            placed = expand_and_place_on_centerline(v.template, cl_ctrl.points,
-                                                    pw, 1.0 / fpp)
-        else:
-            upstream = (pw[0] - v.template_ref[0], pw[1] - v.template_ref[1])
-            if math.hypot(*upstream) < 1e-6:
-                ui.notify("click a point away from the reference to aim",
-                          type="warning")
-                return
-            placed = expand_and_place(v.template, v.template_ref, upstream,
-                                      1.0 / fpp)
+        try:
+            if cl_ctrl is not None:
+                # curvilinear (Session 7.5): the click is the anchor reference;
+                # direction and curvature come from the nearest centerline
+                placed = expand_and_place_on_centerline(v.template, cl_ctrl.points,
+                                                        pw, 1.0 / fpp,
+                                                        v.template_context)
+            else:
+                upstream = (pw[0] - v.template_ref[0], pw[1] - v.template_ref[1])
+                if math.hypot(*upstream) < 1e-6:
+                    ui.notify("click a point away from the reference to aim",
+                              type="warning")
+                    return
+                placed = expand_and_place(v.template, v.template_ref, upstream,
+                                          1.0 / fpp, v.template_context)
+        except ValueError as exc:
+            # unresolved placeholder fields shouldn't reach here (the click
+            # handler prompts first), but guard the model's contract anyway
+            ui.notify(f"cannot place template: {exc}", type="warning")
+            return
         zones = [EventZone(
             enable=1, zone_name=det.spec.name,
             zone_type=int(domain.ZoneType.PRESENCE if det.spec.kind == "stop_bar"
@@ -1084,6 +1190,42 @@ def build_ui(viewer: Viewer, state: dict) -> None:
                 ui.button("Open", on_click=apply)
                 ui.button("Cancel", on_click=dialog.close)
         dialog.open()
+
+    # -- template editor (standalone NiceGUI app, spawned on demand) -----------
+    # gui/templates_ui.py owns its own event loop/port (a second NiceGUI
+    # `ui.run` can't share this process's), so the Template context bar's
+    # editor button starts it as a subprocess the first time it's needed and
+    # reuses it after — tracked on `state`, not `v`, so it survives a
+    # New/Open Viewer swap.
+
+    async def open_template_editor():
+        proc = state.get("template_editor_proc")
+        port = state["template_editor_port"]
+        if proc is None or proc.poll() is not None:
+            script = Path(__file__).with_name("templates_ui.py")
+            # if a template is currently picked in the Template tool, open
+            # straight to it instead of a blank form
+            current = template_sel.value if v.mode == "Template" else None
+            cmd = [sys.executable, str(script)]
+            if current:
+                cmd.append(current)
+            cmd += ["--port", str(port)]
+            proc = subprocess.Popen(cmd)
+            state["template_editor_proc"] = proc
+            atexit.register(proc.terminate)
+            ui.notify("starting template editor…")
+            for _ in range(50):  # ~5s of polling for the port to come up
+                await asyncio.sleep(0.1)
+                try:
+                    with socket.create_connection(("localhost", port), timeout=0.2):
+                        break
+                except OSError:
+                    continue
+            else:
+                ui.notify("template editor is slow to start — try again "
+                          "in a moment", type="warning")
+                return
+        ui.navigate.to(f"http://localhost:{port}/", new_tab=True)
 
     # -- mouse handling (offsetX/Y == image px: element kept at natural size)
 
@@ -1345,6 +1487,10 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             if v.template is None:
                 ui.notify("pick a template first", type="warning")
                 return
+            if missing_placeholders(v.template, v.template_context):
+                ui.notify("fill in the placement values first", type="warning")
+                edit_placement_values(auto=False)
+                return
             pw = units.image_to_world(v.bg, p)
             if v.centerline_for(pw) is not None:
                 place_template(pw)  # curvilinear: one click, no aim needed
@@ -1583,6 +1729,9 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         calibrate_size_btn.set_visibility(
             v.mode == "Measure" and v.measure_kind == "Calibrate")
         template_sel.set_visibility(v.mode == "Template")
+        template_values_btn.set_visibility(
+            v.mode == "Template" and v.template is not None)
+        template_editor_btn.set_visibility(v.mode == "Template")
         centerline_sel.set_visibility(v.mode == "Centerline")
         add_centerline_btn.set_visibility(v.mode == "Centerline")
 
@@ -1701,9 +1850,20 @@ def build_ui(viewer: Viewer, state: dict) -> None:
                                  on_change=change_template) \
             .classes("w-48").props("dense clearable")
         with template_sel:
-            ui.tooltip("approach template to place (click the stop-bar "
-                       "reference point — follows the nearest centerline, "
-                       "or a second aim click without one)")
+            ui.tooltip("approach template to place (click the anchor point "
+                       "— stop bar at the LT/thru lane line — follows the "
+                       "nearest centerline, or a second aim click without "
+                       "one)")
+        template_values_btn = ui.button(
+            icon="edit_note", on_click=lambda: edit_placement_values(auto=False)) \
+            .props("flat dense")
+        with template_values_btn:
+            ui.tooltip("placement values — direction, thru/LT phase, "
+                       "Base Output")
+        template_editor_btn = ui.button(
+            icon="edit_square", on_click=open_template_editor).props("flat dense")
+        with template_editor_btn:
+            ui.tooltip("open the template editor (new tab)")
 
         centerline_sel = ui.select(
             {i: f"C{i + 1}" for i in range(len(v.centerlines))},
@@ -1789,7 +1949,15 @@ def main():
     # load rather than captured once, so New/Open (Phase 1) can swap in a
     # different Viewer and reload the client to pick it up — no server
     # restart required.
-    state = {"viewer": Viewer(open_project(args.path), args.path)}
+    state = {
+        "viewer": Viewer(open_project(args.path), args.path),
+        # The Template context bar's editor button spawns gui/templates_ui.py
+        # as a subprocess on its own port (a second NiceGUI app can't share
+        # this process's event loop) the first time it's opened, and reuses
+        # it after.
+        "template_editor_proc": None,
+        "template_editor_port": args.port + 1000,
+    }
     ui.run(lambda: build_ui(state["viewer"], state), port=args.port,
            title="iprj Designer", reload=False, show=False, dark=True)
 
