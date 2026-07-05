@@ -1675,6 +1675,49 @@ Suggested prompt:
     toggle+dropdown combinations against `sites/Banks/banks.iprj`, the page
     builds and serves (HTTP 200, no errors), full pytest suite green (373).
 
+- 2026-07-05 — **ROADMAP Item 16 done (Opus, one session) — side-by-side
+  detector table (adjacency rows).** Replaced the template editor's
+  row-per-detector grid with the owner's original vision: one row per
+  **adjacency group**, detectors laid out side by side across lane columns.
+  - **New pure model — `model/detector_layout.py` (headless, tested).**
+    `group_adjacent_detectors(dets)` groups detector indices into table rows
+    as **connected components** under longitudinal-extent overlap
+    (`setback_ft`..`setback_ft+length_ft`, touching counts), so same-station
+    detectors (the count loops, the stop-bar zones, the two advance loops)
+    share a row while the two non-overlapping decision detectors stay separate.
+    Groups are ordered by ascending min-setback, **input order preserved within
+    a group** — so flattening a freshly seeded list reproduces it exactly and
+    output numbering never shifts. `assign_tracks(lane_spans)` greedily colors
+    laterally-colliding detectors in one group onto separate sub-rows (only
+    matters for hand-built rows; seeded rows are one-per-lane, single track).
+    The seeded acceptance case (L|T|T|R) collapses **12 detectors → 5 rows**:
+    `[count, stop_bar, decision, decision, advance]`.
+  - **GUI — `gui/templates_ui.py`.** Editor state moved from a flat
+    `detector_rows` to `groups: list[list[dict]]` (explicit display bands built
+    once on seed/load via `group_adjacent_detectors`, **not** recomputed on
+    every keystroke so cards don't jump rows while a setback is typed). Each
+    band is a CSS-grid row (plus tracks); each detector is one card at
+    `grid-column: span_from+2 / span count` **merging** the former header
+    fields (kind/lanes/phase/output-offset) with the value fields
+    (length/setback). A slim col-1 header carries `Row N` + delete-row.
+  - **Manual build flow.** **Add row** appends an empty band showing a `+` in
+    every lane column; a band with detectors shows a `+` only in its
+    *uncovered* columns. Clicking `+` adds a detector in that lane — a sibling
+    in a non-empty band **inherits the station** (setback/length) and
+    kind/phase from the band's first detector, its own output offset. Per the
+    owner's call this session, `+` **always adds a sibling**; spanning multiple
+    lanes is done by editing a cell's lane range (no auto-stretch/merge
+    heuristic). `collect_detectors` flattens `groups` back to the flat detector
+    list — **grouping is display-only, the template JSON / iprj format is
+    unchanged** (IPRJ_FORMAT.md untouched).
+  - **Verification.** New `tests/test_detector_layout.py` (13 tests: overlap/
+    touch/gap boundaries, transitive chain, group ordering + within-group order
+    preservation, seeded-acceptance 5-row grouping, track collision). Full
+    suite green (386). Headless Playwright smoke against an L|T|T|R template:
+    Seed → 5 `Row N` headers and 12 side-by-side cards, `+` present exactly in
+    the decisions'/advance's open lanes 0 & 3; Add row → 4 more `+`; clicking
+    `+` adds a card; no page errors.
+
 ## Appendix — example template (acceptance case, revised for Items 15/17/18)
 
 45 mph approach, lanes `12' L | 12' T | 12' T | 12' R`, count loops, starting

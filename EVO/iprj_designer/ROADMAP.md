@@ -43,10 +43,12 @@ Nine items grouped into four clusters. Numbers **12–20** are new stable IDs
 priority order; the clusters as a whole sit **ahead of Item 10** (webserver
 deployment) — reorder if that's wrong, the numbers don't move.
 
-Cross-item note: Item 15 (keep detector rows in order) is a bug fix on the
-*current* row-per-detector table; Item 16 (side-by-side layout) would
-replace that table. If 16 lands first, 15 folds into it — do 15 as the
-standalone quick fix only while the current table is still in use.
+Cross-item note (resolved 2026-07-05): Item 15 (keep detector rows in order)
+was a bug fix on the *former* row-per-detector table; Item 16 (side-by-side
+layout) has since replaced that table. Both landed — 15 first (folded into
+the Item 17 seeder restructure), then 16's grouped table on top. The seeder's
+ascending-setback order carries through to the grouped rows, so 15's ordering
+still holds under 16.
 
 ---
 
@@ -177,9 +179,19 @@ Vision:
   multiple columns when applicable.
 
 Scope:
-- [ ] Plan the adjacency-grouping + side-by-side table (decision doc first).
-- [ ] Implement the grouped table and manual add-detector-per-cell flow.
-- [ ] Tests for the adjacency grouping logic (pure model, headless).
+- [x] Plan the adjacency-grouping + side-by-side table (decision doc first).
+      *(Done — pure `model/detector_layout.py` grouping = connected components
+      over longitudinal overlap; groups are explicit display bands built on
+      seed/load, not persisted. See the 2026-07-05 decisions-log entry.)*
+- [x] Implement the grouped table and manual add-detector-per-cell flow.
+      *(`gui/templates_ui.py`: one row per adjacency group, merged cells across
+      lane columns; Add row / `+`-per-uncovered-lane, siblings inherit the
+      band's station. `+` always adds a sibling — spanning is via editing a
+      cell's lane range, per the owner's call this session.)*
+- [x] Tests for the adjacency grouping logic (pure model, headless).
+      *(`tests/test_detector_layout.py`, 13 tests; overlap/touch/gap, transitive
+      chain, ordering + within-group order, seeded 12→5 grouping, track
+      collision.)*
 
 Suggested prompt:
 > [Opus] Plan then implement Item 16 of EVO/iprj_designer/ROADMAP.md: the
