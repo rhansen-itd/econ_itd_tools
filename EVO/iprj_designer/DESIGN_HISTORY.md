@@ -1521,6 +1521,29 @@ Suggested prompt:
   label visibly moved on the canvas), then confirmed the toolbar Undo
   restored it to 54.5 ft exactly.
 
+- 2026-07-04 — **ROADMAP Item 3 closed — not a bug** (zone duplication
+  across sensors on load). Reported on the Perimeter site as one sensor's
+  zones appearing duplicated onto both sensors. Investigated and closed: the
+  load path in `model/iprj_io.py` is sound — the duplication is a property
+  of the source files themselves, not the sensor/zone association logic. The
+  loader faithfully represents what the file contains, so no parser change
+  and no regression test were warranted. Item 9's split/merge round-trip
+  tests still exercise the zone↔sensor association as a standing safety net,
+  so a real loader regression here would surface there.
+
+- 2026-07-05 — **Model-routing change (CLAUDE.md).** Fable is now billed on
+  usage credits, so it's demoted from routine implementer to a *debugging
+  escalation* — used only after Opus/Sonnet fail a specific bug over a few
+  passes. Default is now **Opus running whole items end-to-end in one
+  session** (plan + model + GUI + tests + docs), retiring the old
+  Fable/Opus-plan → Sonnet-implement hand-off: the owner isn't
+  usage-constrained on Opus, Opus is at least as strong as Sonnet on every
+  task shape here, so each cross-model hand-off was paying for a second
+  session to re-ingest context and buying nothing. Sonnet stays as an option
+  for a *whole* small mechanical item only (never as the back half of an
+  Opus-planned one). ROADMAP.md trimmed at the same time — completed Items
+  1–9 and 11 removed (archived here), leaving only Item 10 (webserver).
+
 ## Appendix — example template (acceptance case for Session 6)
 
 45 mph approach, lanes `12' L | 12' T | 12' T | 12' R`, count loops, starting

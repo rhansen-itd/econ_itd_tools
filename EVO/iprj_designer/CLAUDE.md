@@ -46,64 +46,49 @@ entry.
 
 ## Model routing / division of labor
 
-The project owner runs sessions across three Claude models and routes work
-by task shape, not strictly by directory. Fable is billed on usage credits,
-so its sessions are scoped to **core implementation only** — a separate
-model always runs the finishing pass. See "Core vs. finishing work" below
-before writing a Suggested prompt for a Fable session.
+**Default to Opus, run whole items end-to-end in one session** —
+architectural decision, model-layer implementation, GUI wiring, tests, and
+the doc/checkbox finishing pass all together. The owner is not
+usage-constrained on Opus, and Opus is at least as strong as Sonnet on
+every task shape here (including NiceGUI wiring), so the old
+plan-then-implement hand-off *across* models is no longer worth its cost:
+each hand-off pays for a second session to re-ingest the diff and
+re-establish what's untested, buying nothing when the same model could just
+have continued.
 
-- **Fable** — pure-Python algorithmic/mathematical work: geometry,
-  ITE kinematic placement math, template expansion. Fable delivers the
-  function/method/schema change itself and nothing past that — see below
-  for what it must *not* be asked to do in the same session. This is
-  `model/` by default, but also covers any future pure-python interaction
-  controller that happens to live under `gui/` (e.g. `gui/drawing.py` — no
-  NiceGUI imports, same testability bar as `model/`). Fable has a tighter
-  context/token budget than the other two, so scope its sessions to one
-  module or one well-bounded algorithm at a time; hand it finished
-  model-layer code as read-only context rather than the whole app.
-- **Sonnet** — `gui/` framework wiring: NiceGUI layout, event handlers,
-  dialogs, toolbar/table/canvas plumbing, once the underlying pure-python
-  piece it wires into already exists. Sonnet also runs the **finishing
-  pass** for whatever Fable produced this round (see below) — including
-  for Fable-only items that have no GUI counterpart at all; a finishing
-  pass doesn't need a UI task attached to justify the session.
-- **Opus** — architectural planning: decisions that touch multiple modules
-  or change an established seam (e.g. multi-session state for the webserver
-  upgrade, or how a new datum/geometry concept interacts with the existing
-  undo model). Opus's output is a plan/decision, not the implementation —
-  Sonnet or Fable does the actual coding session that follows, and Sonnet
-  still owns the finishing pass afterward unless the finishing work itself
-  is an architectural call (e.g. deciding what a new invariant should
-  assert) — that's the one case it goes back to Opus.
+- **Fable** — held in reserve as a **debugging escalation**, not a routine
+  implementer (it's now billed on usage credits). Bring Fable in only when
+  Opus or Sonnet has failed to fix a *specific* bug after a few honest
+  passes; hand it the narrowed-down problem, not a fresh feature. A Fable
+  session stays scoped to the fix — whoever escalated to it records the
+  outcome.
+- **Sonnet** — use only for a *whole* small, mechanical, low-ambiguity item
+  (a pure rename, boilerplate wiring over a piece that already exists) when
+  you'd rather not spend an Opus session on it. Assign it the entire item,
+  finishing pass included; **never** split one item across Opus-plan +
+  Sonnet-implement — that reintroduces the hand-off tax this section exists
+  to avoid. Sonnet buys speed/cost here, not a better result, so reach for
+  it only when the task is genuinely a toss-up on quality.
+- **Opus** — everything else, which is most things: anything with design
+  ambiguity, cross-module reach, or a new seam, plus routine feature work
+  where a single capable session end-to-end beats a hand-off.
 
-The `model/`-is-pure-python rule above is the load-bearing constraint that
-makes this split work; don't treat the folder name as the routing rule by
-itself. See DESIGN_HISTORY.md's Sessions 6–8 (and the later
-"ROADMAP Phase ..." decisions-log entries) for the sub-session breakdown
-this produces in practice.
+The `model/`-is-pure-python rule (see Architecture above) is the
+load-bearing constraint regardless of who implements — keep it; don't let a
+single-session flow blur `model/` and `gui/`.
 
-### Core vs. finishing work
+### Finishing work is part of the same session
 
-"Core" = the implementation Fable is scoped for: the algorithm, the
-method, the schema/data-shape change. "Finishing" = everything that
-certifies and records that change, and it is **never Fable's job**:
+Every item is *certified and recorded*, not just coded. Whichever model runs
+it owns all of the following in the **same** session — this is no longer a
+separate hand-off pass:
 
-- pytest coverage for the code Fable just wrote (new tests, or updating
-  existing ones the change touches),
+- pytest coverage for new/changed model code,
 - the DESIGN_HISTORY.md entry for the session,
 - checking off the item's boxes in ROADMAP.md,
-- an IPRJ_FORMAT.md update, if the change touched the file-format
-  contract (e.g. Item 11's origin-normalization).
+- an IPRJ_FORMAT.md update, if the change touched the file-format contract.
 
-A Fable Suggested prompt must say so explicitly — e.g. "implementation
-only; skip pytest coverage and doc updates" — so Fable doesn't spend
-budget on a finishing pass. The next prompt in the sequence (Sonnet,
-usually — see above) picks up that finishing work explicitly, alongside
-whatever GUI wiring it's already doing. Hand that session Fable's diff
-plus a one-line note of what's untested/undocumented, so it isn't starting
-cold on what needs finishing.
-
-This split is why some ROADMAP items read "Target: Fable then Sonnet" even
-when there's barely any GUI surface to wire — the "then Sonnet" half may
-be mostly a finishing pass.
+(Historical note: earlier rounds split "core" vs. "finishing" across
+Fable→Sonnet hand-offs — see DESIGN_HISTORY.md's Sessions 6–8 and the
+"ROADMAP Item …" decisions-log entries. That routing predates this change;
+don't reintroduce it.)
