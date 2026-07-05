@@ -1,0 +1,91 @@
+{
+  "schema_version": 2,
+  "name": "Off ramp L L R",
+  "speed_mph": 45.0,
+  "extension_time_s": 3.0,
+  "lanes": [
+    {
+      "movement": "L",
+      "width_ft": 12.0,
+      "advance_detector": true
+    },
+    {
+      "movement": "L",
+      "width_ft": 12.0,
+      "advance_detector": true
+    },
+    {
+      "movement": "R",
+      "width_ft": 12.0,
+      "advance_detector": true
+    }
+  ],
+  "count_loops": true,
+  "direction": null,
+  "thru_phase": null,
+  "lt_phase": null,
+  "base_output": null,
+  "anchor_lane_line": null,
+  "detectors": [
+    {
+      "kind": "count",
+      "spanning_lanes": [
+        0
+      ],
+      "length_ft": 5.0,
+      "setback_ft": -15.0,
+      "output_offset": 0,
+      "phase": "lt"
+    },
+    {
+      "kind": "count",
+      "spanning_lanes": [
+        1
+      ],
+      "length_ft": 5.0,
+      "setback_ft": -15.0,
+      "output_offset": 1,
+      "phase": "lt"
+    },
+    {
+      "kind": "count",
+      "spanning_lanes": [
+        2
+      ],
+      "length_ft": 5.0,
+      "setback_ft": -15.0,
+      "output_offset": 2,
+      "phase": "thru"
+    },
+    {
+      "kind": "stop_bar",
+      "spanning_lanes": [
+        0
+      ],
+      "length_ft": 30.0,
+      "setback_ft": -5.0,
+      "output_offset": 3,
+      "phase": "lt"
+    },
+    {
+      "kind": "stop_bar",
+      "spanning_lanes": [
+        1
+      ],
+      "length_ft": 30.0,
+      "setback_ft": -5.0,
+      "output_offset": 4,
+      "phase": "lt"
+    },
+    {
+      "kind": "stop_bar",
+      "spanning_lanes": [
+        2
+      ],
+      "length_ft": 30.0,
+      "setback_ft": -5.0,
+      "output_offset": 5,
+      "phase": "thru"
+    }
+  ]
+}

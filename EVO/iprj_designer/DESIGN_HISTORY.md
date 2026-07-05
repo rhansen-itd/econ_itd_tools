@@ -3,7 +3,12 @@
 This file archives the build history and design decisions from the Phase 1
 MVP (Sessions 1–7): the pure-Python iprj data model, the NiceGUI drawing/edit
 core, zone attributes and iprj write-out, approach templates, and centerline
-datum placement. See ROADMAP.md for the current Phase 2 execution plan.
+datum placement — plus every round of work since (quick wins/file
+management, domain accuracy, the toolbar/multi-select overhaul, and the
+advanced template engine, all logged in the decisions log below as they
+landed). See ROADMAP.md for what's currently planned; as of 2026-07-04 it
+organizes work as named, numbered (stable-ID, not sequential) items ordered
+by priority rather than sequential phases — see its intro for why.
 
 Work was originally broken into sessions sized for one focused Claude Code
 sitting. Each session ended with something runnable/testable and a short
@@ -1196,6 +1201,325 @@ Suggested prompt:
   previously-spawned instance so a fresh one launched) opened directly to
   "Approach template — example_45mph_north.json". Zero console errors.
   Suite unchanged: 304 tests pass (gui-only change).
+
+- 2026-07-04 — **ROADMAP Item 1: Background tool rework + Ruler as an
+  independent overlay** (Measure renamed, in-place background upload,
+  Ruler relocated, Marker deleted). The one real design decision: how
+  "move Ruler to the persistent chrome row — general-purpose, not tied to
+  any workflow" should actually behave. Two readings were possible — just
+  relocate its button while keeping it a mode you switch into via the tool
+  toggle, or make it a true overlay that works simultaneously with
+  whatever tool is active. Asked the owner; **chose the overlay**: `Viewer`
+  drops `measure_kind`/`markers` entirely and gains `ruler_active` (a bool,
+  not a mode), checked in `on_down`/`on_move`/`on_up`/`refresh_status`
+  ahead of the `v.mode` dispatch chain — same priority tier as the
+  existing `space_pan` gesture, so a ruler measurement can be taken
+  mid-Draw or mid-Select without losing that tool's state (verified: the
+  Select context bar and its selection stayed intact through a full
+  ruler measurement in the Playwright run below). The persistent chrome
+  row gained the ruler toggle (`straighten` icon) and "clear ruler"
+  (`wrong_location`) next to the tool toggle; the `r` key now toggles
+  ruler instead of switching to the old Measure tool. `b` was **not**
+  reused as Background's accelerator despite being the obvious mnemonic —
+  `gui/drawing.py`'s edit-mode already binds `n`/`b` to cycle-selection, so
+  Background is toggle-toggle-only (click the tool bar), no key.
+  Background (renamed from Measure) keeps 2-point and known-width/height
+  calibration unchanged, and gains an upload button (image icon) that
+  replaces `project.background`'s image in place via
+  `units.decode_background_image` + the same temp-PNG-file serving
+  `Viewer.__init__` already does, then `ui.navigate.reload()` — zones,
+  sensors, and centerlines are untouched since only `bg.image_base64`/
+  `image_w`/`image_h`/`image_file` change; existing calibration values are
+  left as-is (not reset) since they're a separate concern the user
+  re-runs if the new image is at a different scale. The known-width/height
+  calibration button switched from `straighten` (now Ruler's) to
+  `aspect_ratio`.
+  Verified with a scripted Playwright/Chromium session against
+  `sites/Banks/banks.iprj`: the tool toggle reads Select/Draw/Template/
+  Centerline/Sensor/**Background** (zero "Measure"/"Ruler"-as-toggle/
+  "Marker" text remaining); toggling Ruler on while the Select tool was
+  active, taking a full click-drag-click measurement (314.0 ft), and
+  toggling it off left the Select tool's own status/context bar untouched
+  throughout; the upload dialog opened from the Background context bar and
+  a real 400×300 PNG uploaded through it replaced the visible background
+  while all 18 zones across S1/S2 stayed listed in the zone table
+  afterward, with zero console errors.
+- 2026-07-04 — **ROADMAP Item 2: per-zone-type condition field filtering**
+  (Sonnet). `gui/app.py` gains a `_COND_FIELD_SPECS` table (label/widget-kind/
+  unit-conversion per `Condition` field) keyed by the same field names
+  `domain.CONDITION_FIELDS` already used; `zone_properties()`'s
+  `add_cond_row` now only builds widgets for `domain.condition_fields(
+  zone.zone_type)`, and "Add condition" is disabled when
+  `domain.conditions_allowed(zone.zone_type)` is false (Sidewalk). `class`/
+  `direction` got real `ui.select` dropdowns (using `VEHICLE_CLASS_NAMES`/
+  `DIRECTION_NAMES`, previously not editable at all) rather than raw
+  numbers, matching how `class` was already a name-backed field elsewhere;
+  `queuelength_min/max` convert m↔ft and `velocity_min/max` convert km/h↔mph
+  at the widget boundary like the rest of the dialog.
+  **Decision on stale saved values** (the scope's open question): a zone
+  type's hidden fields are **not rendered and not cleared** — `apply()`
+  only writes back the fields in the current `condition_fields()` set, so a
+  Presence zone's stray pre-fix velocity value (if any exists in a real
+  file) is left exactly as loaded rather than silently zeroed. Chose this
+  over active-clearing because opening/editing a zone's *other* fields
+  (name, phase, an unrelated condition's output) shouldn't have the side
+  effect of discarding data nobody asked to touch; a future explicit
+  "clean stale fields" action can be its own opt-in tool if the stray
+  values turn out to matter in practice.
+  Also not done: the field set is fixed to `zone.zone_type` at dialog-open
+  time, not reactive to the Type `ui.select` in the same dialog — changing
+  Type and clicking Apply changes `zone.zone_type` correctly, but the
+  Conditions section won't re-filter until the dialog is reopened. Out of
+  this item's scope; flagged here in case it surprises someone later.
+  Verified with a real headless Chromium session (Playwright) against
+  `sites/Banks/Banks_EVO.iprj`: a Presence zone ("SB Stop Bar") shows only
+  output/delay/extend/queue min-max/ped-cars-truck min-max, no velocity/
+  class/direction; a Motion zone ("SB Mid") shows output/class/direction/
+  delay/extend/v min-max/eta min-max, no queue/vehicle-count fields, with
+  `class`/`direction` rendering as dropdowns ("All"/"Both directions"); and
+  a Sidewalk zone (`sites/Banks/sh-55 & banks_evo.iprj`, "EZ 1: PH 2
+  StopBar") shows "Add condition" disabled (`aria-disabled: true`). Zero
+  console errors in all three. `pytest` (304 tests) unaffected.
+- 2026-07-04 — **ROADMAP Item 4 done** (sensor management: nudge, delete,
+  status fix). Arrow-key nudge on the active sensor while the Sensor tool is
+  active reuses `NUDGE_FT`/`v.ft_per_px()` the same way `DrawingController.
+  _nudge` does, but moves `position_x`/`position_y` directly — no undo entry,
+  matching the existing drag-to-move behavior (which also isn't undoable).
+  Delete sensor (context-bar trash icon + `x`/Del) blocks removing the last
+  remaining sensor; otherwise a dialog offers **reassign** (move the
+  sensor's non-placeholder event/ignore zones onto another sensor via the
+  existing `insert_zone` placeholder-slot logic, so conditions travel with
+  the zone object) or **delete zones too** (drop them with the sensor,
+  consistent with `DrawingController.delete_selected` also not scrubbing
+  stale `CenterlineController.attached` entries on delete). Reassign target
+  defaults to the lowest-numbered other sensor. Fixed `add_sensor()` calling
+  `refresh_status()` (it called `update_sensor_options()` but not
+  `refresh_status()`, so the footer kept showing the old active sensor).
+  Verified with a headless Chromium (Playwright) session against
+  `sites/Banks/banks.iprj`: adding S3 immediately showed "S3 active" in the
+  footer; 6 ArrowRight presses moved S3's on-screen marker right (bbox x
+  532.1→535.3px, y unchanged); `x` on the empty new S3 opened a "No zones on
+  this sensor" one-button Delete dialog; `x` on S2 (15 zones) opened the
+  reassign/delete-children dialog defaulting to S1, and "Reassign & Delete"
+  moved all 15 rows onto S1 in the zone table, collapsed the sensor
+  dropdown to just S1, and left the status line reading "S1 active". Zero
+  console errors throughout; `pytest` (304 tests) unaffected.
+
+- 2026-07-04 — **ROADMAP Item 5, model half** (insert-vertex; Fable).
+  `model/geometry.py` gains `nearest_edge_insertion(pt, poly) ->
+  (insert_index, point)`: clamped projection of *pt* onto the nearest
+  polygon edge, edges wrapping (last→first) for 3+ points so a closing-edge
+  hit appends, with a 2-point open polyline treated as its single segment
+  (same open-shape convention as `polygon_intersects_rect`). A projection
+  clamping to a shared vertex ties between the two adjacent edges and
+  resolves to the lower edge index — where the vertex lands in the list is
+  cosmetic in that case. Chose nearest-edge-to-cursor over the scope's
+  "midpoint if simpler" fallback; the projection is the same ~10 lines.
+  `DrawingController.insert_vertex(p=None)` (Edit mode, exactly one
+  selected element) inserts at the nearest edge to *p*, defaulting to the
+  live cursor — the shape the `v`-key wiring needs. One `("points", …)`
+  undo op, and it resets `_nudging` so an arrow-nudge burst doesn't
+  coalesce across the insertion (it bypasses `key()`, which normally does
+  that reset). Lineals are refused — they store exactly two endpoint
+  fields, no vertex list to grow. Like any manual vertex edit, the GUI
+  must `reproject` a centerline-attached zone afterward (existing
+  drag-vertex convention; `reproject`'s length check already handles the
+  corner-count change). Not done here (Sonnet half): the Select→Edit
+  rename, dropping the `v` tool alias, and wiring `v` to this method.
+  12 new tests; full suite 316 passing.
+
+- 2026-07-04 — **ROADMAP Item 5, Sonnet half** (Select→Edit rename,
+  insert-vertex key wiring; Sonnet). Renamed the "Select" tool to "Edit"
+  everywhere it's user-facing in `gui/app.py`: the tool-toggle option/
+  default value, `Viewer.mode`'s default and every comparison against it,
+  status/notify strings, tooltips, and the module docstring's usage guide
+  (including the accelerator line and the Edit-tool paragraph); mirrored
+  in two stale "Select tool" mentions in `gui/drawing.py` docstrings.
+  Dropped `v` from `TOOL_KEYS` (was aliased to Select alongside `e`), so
+  `e` is now the only tool accelerator and a bare `v` falls through
+  `on_key`'s existing `v.ctrl.key(name, ...)` dispatch into
+  `DrawingController._key_edit`, where a new `name == "v"` branch calls
+  `self.insert_vertex()` (always returns `True` so the status line/warning
+  surface either way, matching the existing `delete_selected` pattern —
+  no new app.py wiring needed since `reproject_attachments()` already runs
+  after any successful `ctrl.key()`). Full suite 316 passing; server boot
+  smoke-tested (`gui/app.py --port`), no console/startup errors.
+
+- 2026-07-04 — **ROADMAP Item 6** (Loop → Event Zone terminology; Sonnet).
+  Renamed the "Loop" draw sub-type/kind label to "Event Zone" throughout
+  `gui/app.py`: `DRAW_KINDS`/`DRAW_SUBTYPE_KEYS` keys, `draw_kind_name`'s
+  default and every comparison against it, the sub-type toggle's options/
+  default value, the zone-properties notify message, tooltips, and the
+  module docstring's usage guide. Mechanical rename only — `gui/drawing.py`'s
+  `LOOP_KIND.name = "loop"` internal field was left alone since it never
+  actually surfaces in the UI (it's read only for `shape == "segment"`
+  kinds in `DrawingController.status()`, and Loop's `make()` always sets
+  `zone_name` so its `_commit_element` fallback never triggers either);
+  changing it would've been scope creep with no visible effect.
+  `gui/templates_ui.py` still says "Loop" (count-loops checkbox/field),
+  per the roadmap's carve-out — untouched. Full suite 316 passing; server
+  boot smoke-tested, no console/startup errors.
+
+- 2026-07-04 — **ROADMAP Item 7, controller half** (free polygons past 4
+  points; Fable). `DrawingController.mouse_down` no longer auto-commits a
+  polygon draw at 4 points — only `shape == "segment"` kinds keep a fixed
+  count (2 clicks). Free polygons accept corners indefinitely and commit
+  via the new `finish_polygon()`: Enter routes to it from `_key_draw`
+  (only at `DIM_OFF`, so dimension entry's Enter-commit is untouched —
+  and `gui/app.py`'s existing `on_key` fall-through to `ctrl.key()`
+  means Enter-to-finish already works in the app with zero GUI changes),
+  and the GUI's dblclick handler will call it directly (Sonnet half).
+  Two decisions worth recording: (1) `finish_polygon` folds *trailing*
+  points coincident with their predecessor within `handle_radius / 2`
+  (zoom-rescaled like the hit tests) before committing, because the
+  double-click gesture's own two mousedowns land as pending points before
+  the browser's dblclick event arrives — folding only trailing points
+  leaves deliberately tight mid-shape geometry alone; (2) finishing with
+  fewer than 3 surviving corners is handled-with-feedback (returns True,
+  sets `message`, keeps `pending`) rather than discarding the draw.
+  Dimensioned rectangles (`_commit_dimension`) are structurally unchanged;
+  `preview_polygon` rubber-bands past 4 points; the status line's
+  "corner n/4" became "corner n" with an "[Enter/double-click finishes]"
+  hint from the 3rd corner on. Test helper `draw_square` now ends with
+  `finish_polygon()`. Not done here (Sonnet half): wiring dblclick during
+  a pending free-draw to `finish_polygon()` in `gui/app.py` — note the
+  existing Edit-mode dblclick → `zone_properties()` handler is
+  mode-guarded, so Draw-mode dblclick is currently free. 6 new tests
+  (+1 renamed from the old 4-click auto-commit test); full suite 322
+  passing.
+
+- 2026-07-04 — **ROADMAP Item 7, Sonnet half** (wire double-click-to-finish;
+  Sonnet). `on_dblclick` in `gui/app.py` gained a `v.mode == "Draw"` branch
+  alongside the existing Edit-mode one: it calls `v.ctrl.finish_polygon()`
+  and, if that handled the gesture (pending free-draw polygon), runs the
+  same `notify_ctrl_warning()` / `refresh_overlay()` / `refresh_status()`
+  triad every other Draw-mode mutation already does — no new event
+  binding needed since `ii.on("dblclick", on_dblclick, ...)` was already
+  wired for the Edit-mode zone-properties shortcut. `finish_polygon()`'s
+  own no-ops (segment kinds, dimension entry, nothing pending) return
+  `False`, so a stray double-click elsewhere in Draw mode is inert.
+  Updated the module docstring's key/usage summary to mention that
+  free-draw polygons take unlimited corners and finish with Enter or
+  double-click. Full suite still 322 passing (no controller-side test
+  changes needed — the Fable half already covers `finish_polygon()`
+  directly); server boot smoke-tested (`gui/app.py --port`), no
+  console/startup errors. Item 7 complete.
+
+- 2026-07-04 — **ROADMAP Item 11 done** (canonical coordinate origin;
+  Fable). New `model/coords.py::normalize_origin(project)`: translates
+  every coordinate field by `(-Background_PosX, -Background_PosY)` —
+  background pos + `MeterReference0/1_X/Y`, sensor positions, event/ignore
+  zone points, ETA points, lineal endpoints, text-label positions,
+  including disabled vendor placeholder entries (the whole file moves as
+  one rigid frame, not just enabled objects). `None` fields (converter-form
+  files omit keys) stay `None` so save doesn't invent attributes.
+  Calibration (`MeterPerPixel`/`ReferenceLength`, translation-invariant)
+  is deliberately untouched — `test_calibration_untouched` asserts
+  `effective_meter_per_pixel` is unchanged. Wired into `load_iprj` at the
+  end of parsing (`model/iprj_io.py`), so every load path (File > Open,
+  scripts, tests) picks it up automatically; `save_iprj` needed no change
+  since it just serializes whatever the in-memory `Project` holds — it
+  naturally writes `Background_PosX = Background_PosY = 0`.
+  **This deliberately breaks vendor byte-fidelity on save** — rewrote
+  `tests/test_roundtrip.py::test_attribute_roundtrip` to assert the new
+  contract instead (every coordinate key shifted by the source file's own
+  `(-PosX, -PosY)`, everything else value-equal, `Background_PosX/Y == 0`
+  after save) rather than exact string/numeric equality across the board.
+  New `tests/test_coords.py` (7 tests) covers the shift itself, calibration
+  invariance, idempotency, zero/missing-pos no-ops, `None`-field
+  preservation, and one-axis-missing files. Documented the new save
+  contract in IPRJ_FORMAT.md (new paragraph after the dialect section).
+  Full suite 329 passing. This is a prerequisite for Item 9 (see
+  ITEM9_SPLIT_PLAN.md §3a) — a matched two-file pair now coregisters
+  automatically via the shared image-origin frame instead of a cross-file
+  delta computation.
+
+- 2026-07-04 — **ROADMAP Item 9 done** (multi-sensor 2-file split;
+  Fable + Sonnet, per ITEM9_SPLIT_PLAN.md). Fable half: new
+  `model/multifile.py` — `pair_paths`/`is_valid_pair`/`pair_role` on the
+  `<base>_1_2`/`<base>_3_4` filename convention (handles a base that
+  itself ends in digits, e.g. `route_12`, without mis-stripping);
+  `check_background_match` (two-tier: image dimensions/position/scale/
+  rotation/effective-m-per-px hard-fail, pixel-hash soft-warn, degrading
+  gracefully when calibration or the image is missing on one or both
+  sides); `split_project`/`merge_pair` (primary owns every project-wide
+  field — background, lineals, text labels, extra — the secondary gets
+  only a deep-copied background plus its sensors; no sensor-index or
+  `OutputNumber` renumbering — `save_iprj`'s enumeration gives the `_3_4`
+  file `Radarsensor_0/1` for free). Per the plan's §5, pytest coverage
+  was in-scope for this Fable session (an explicit exception to the usual
+  Fable-skips-tests rule, since the plan makes a green suite the
+  Sonnet-handoff gate): 28 new tests in `tests/test_multifile.py`,
+  including a synthetic split→save→load→merge round-trip and a real-
+  fixture acceptance test against the Franklin_KCID site's actual
+  two-file pair. Full suite 357 passing after the Fable half.
+
+  Sonnet half: `Viewer` gained `self.pair: tuple[Path, Path] | None`
+  (`gui/app.py`); `add_sensor` caps at `multifile.MAX_SENSORS` (4) with a
+  notify. New File-menu action "Open second sensor-pair file (overlay)…"
+  loads a second file, resolves primary/secondary via `pair_role` when
+  the filenames follow the convention (else a two-button "which is 1-2"
+  dialog), runs `check_background_match`, blocks on a hard mismatch,
+  confirms on a soft one, then `merge_pair`s and swaps in a new `Viewer`
+  with `pair` set. `do_save`/`save`/`save_as` grew the two-file branch
+  exactly as the plan specified: plain Save only when `v.pair` is a valid
+  naming pair, otherwise redirected to Save-As; Save-As shows a live
+  preview of the derived `_1_2`/`_3_4` names as the user types. Title bar
+  shows both filenames for a paired project.
+
+  Verified end-to-end in a live browser session (Playwright against the
+  running NiceGUI app, not just pytest) using the real
+  `Franklin_KCID/Phase 2 & 6 sensor 1 and 2.iprj` +
+  `Phase 4 & 8 sensor 3 and 4 with speed.iprj` pair — neither filename
+  follows the `_1_2`/`_3_4` convention, so this also exercised the
+  orientation-picker dialog: merge succeeded with no background-mismatch
+  warning, the sensor selector showed S1-S4, a 5th `add_sensor` was
+  correctly blocked, and Save (forced to Save-As, since the merged
+  project's `pair` isn't a valid naming pair) wrote a working `_1_2`/
+  `_3_4` file pair that reloads and re-merges losslessly (all
+  `OutputNumber`s intact). Documented the pairing convention and
+  primary-owns-extras rule in IPRJ_FORMAT.md's Container section.
+
+- 2026-07-04 — **ROADMAP Item 8 done** (move an Event Zone along its
+  centerline; Fable then Sonnet). Fable half: `CenterlineController` gained
+  `zone_station(zone)` (the attached zone's downstream/setback edge —
+  `min(s for s, _ in corners)`, the same edge `DetectorSpec.setback_ft`
+  measures to) and `move_attached(zone, *, station=None, delta=None)`
+  (`gui/drawing.py`) — shifts every stored `(station, offset)` corner by
+  the same station delta (offsets unchanged, so the zone keeps its shape
+  and follows bends), re-derives `zone.points` via `Centerline.point_at`,
+  and returns the zone's prior points (or `None` if unattached / no valid
+  datum) so the caller can build an undo entry. Units are world px
+  throughout, matching the stored attachment corners.
+
+  Sonnet half: a small dialog on the toolbar (new "timeline"-icon button
+  next to Properties/Rotate, `move_along_centerline()` in `gui/app.py`) —
+  enabled only in the Edit tool with exactly one Event Zone selected that
+  `attached_centerline_for()` finds on some centerline. Shows the current
+  station in feet (converted via `ft_per_px()`, blocked with a notify if
+  uncalibrated, matching `place_template`'s existing guard), and offers
+  either an absolute-station "Set" or a relative "Move by" (+ = upstream).
+  `DrawingController` gained a small public `record_points_undo(zone,
+  old_points)` so the dialog can push a `("points", zone, ...)` undo entry
+  in the same shape `_nudge` already writes — `undo()` restores a
+  station-move exactly like a drag, no new undo-op type needed.
+
+  Finishing pass: 8 new tests in `tests/test_drawing.py` covering
+  `zone_station`/`move_attached` — the downstream-edge convention,
+  relative delta, absolute station, a move that straddles a centerline
+  bend (shape preserved via the same per-corner station/offset math
+  `restation` uses), the `ValueError` on ambiguous/missing args, `None`
+  returns for an unattached zone or a sub-2-point datum, and an undo
+  round-trip through `DrawingController.record_points_undo` +`.undo()`.
+  Full suite 366 passing. Verified end-to-end in a live browser session
+  (Playwright against the running NiceGUI app on `sites/Banks/banks.iprj`):
+  drew a centerline, placed the `example_45mph_generic` template along it
+  (auto-attaching 13 detectors), confirmed the move button stays disabled
+  until a centerline-attached zone is selected (a pre-existing unattached
+  zone correctly left it disabled), opened the dialog on "SBT Count 1"
+  (current station 54.5 ft), set it to station 50.0 ft (notified, zone
+  label visibly moved on the canvas), then confirmed the toolbar Undo
+  restored it to 54.5 ft exactly.
 
 ## Appendix — example template (acceptance case for Session 6)
 

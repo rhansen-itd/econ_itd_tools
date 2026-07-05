@@ -3,10 +3,15 @@
 The dataclasses mirror the file's own coordinate system: world pixels, y-down.
 Unit conversion to feet/meters lives in model/units.py; nothing here converts.
 
-Round-trip contract: load_iprj -> save_iprj preserves every attribute
-key/value pair (numeric formatting may be normalized, element order follows
-the vendor's canonical order). Unrecognized keys are kept verbatim in the
-owning object's `extra` dict, so files written by other tools survive intact.
+Round-trip contract: load_iprj normalizes the origin (coords.normalize_origin)
+so the background image's top-left is world (0,0) — every coordinate value is
+translated by (-Background_PosX, -Background_PosY); this deliberately departs
+from vendor byte-fidelity (ROADMAP Item 11). load_iprj -> save_iprj then
+preserves every attribute key, all non-coordinate values, and all geometry
+relative to the image; Background_PosX/PosY save as 0. Numeric formatting may
+be normalized and element order follows the vendor's canonical order.
+Unrecognized keys are kept verbatim in the owning object's `extra` dict, so
+files written by other tools survive intact.
 """
 
 from __future__ import annotations
@@ -17,6 +22,8 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
 from xml.sax.saxutils import quoteattr
+
+from .coords import normalize_origin
 
 Point = tuple[float, float]
 
@@ -427,7 +434,7 @@ def load_iprj(path: str | Path) -> Project:
         label.extra = raw
         project.text_labels.append(label)
 
-    return project
+    return normalize_origin(project)
 
 
 # ---------------------------------------------------------------------------

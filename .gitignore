@@ -15,3 +15,6 @@ sites/Banks/sensors3_4.txt
 # Exceptions: keep two small EVO captures as tracked samples.
 !sites/86_US95&SH8/10_37_2_86_EVO_1770311735.txt
 !sites/201_SH55&BanksLowmanRd/10_37_23_201_EVO_1770686257.txt
+
+# iprj Designer generated test output (overlay PNGs, generated .iprj files)
+EVO/iprj_designer/tests/out/

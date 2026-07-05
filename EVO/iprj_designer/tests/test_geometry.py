@@ -271,3 +271,38 @@ def test_marquee_two_point_segment():
     assert geometry.polygon_intersects_rect(seg, (40, 20), (60, 80))
     assert not geometry.polygon_intersects_rect(seg, (60, 0), (100, 30))
     assert not geometry.polygon_intersects_rect([], (0, 0), (10, 10))
+
+
+# -- vertex insertion (ROADMAP Item 5) -------------------------------------------
+
+def test_nearest_edge_insertion_projects_onto_nearest_edge():
+    # outside the bottom edge (y-down: the (0,0)->(10,0) side)
+    assert geometry.nearest_edge_insertion((5.0, -3.0), SQUARE) == (1, (5.0, 0.0))
+    # from inside, nearest the right edge
+    assert geometry.nearest_edge_insertion((9.0, 5.0), SQUARE) == (2, (10.0, 5.0))
+
+
+def test_nearest_edge_insertion_closing_edge_appends():
+    # nearest the wrap-around edge (0,10)->(0,0): insert index is len(poly)
+    assert geometry.nearest_edge_insertion((-3.0, 5.0), SQUARE) == (4, (0.0, 5.0))
+
+
+def test_nearest_edge_insertion_clamps_to_vertex_lower_edge_wins():
+    # beyond the (10,0) corner both adjacent edges clamp to that vertex;
+    # the tie resolves to the lower edge index
+    assert geometry.nearest_edge_insertion((13.0, -2.0), SQUARE) == (1, (10.0, 0.0))
+
+
+def test_nearest_edge_insertion_two_point_open_segment():
+    seg = [(0.0, 0.0), (10.0, 0.0)]
+    assert geometry.nearest_edge_insertion((4.0, 3.0), seg) == (1, (4.0, 0.0))
+    # no closing edge on a 2-point polyline: beyond the start still inserts at 1
+    assert geometry.nearest_edge_insertion((-5.0, 0.0), seg) == (1, (0.0, 0.0))
+
+
+def test_nearest_edge_insertion_degenerate():
+    # coincident points: distance ties at the shared vertex, index 1 wins
+    assert geometry.nearest_edge_insertion(
+        (5.0, 5.0), [(2.0, 2.0), (2.0, 2.0), (2.0, 2.0)]) == (1, (2.0, 2.0))
+    with pytest.raises(ValueError):
+        geometry.nearest_edge_insertion((0.0, 0.0), [(1.0, 1.0)])

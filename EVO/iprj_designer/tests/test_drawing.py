@@ -25,10 +25,12 @@ def square(x=0.0, y=0.0, size=40.0, name="Z"):
 
 # -- free draw ---------------------------------------------------------------
 
-def test_free_draw_four_clicks_commits_loop():
+def test_free_draw_commits_on_explicit_finish():
     ctrl = make_ctrl()
     for p in [(0, 0), (40, 0), (40, 40), (0, 40)]:
         ctrl.mouse_down(p)
+    assert ctrl.zones == []                  # no auto-commit at 4 points
+    assert ctrl.finish_polygon()
     assert len(ctrl.zones) == 1
     assert ctrl.zones[0].points == [(0, 0), (40, 0), (40, 40), (0, 40)]
     assert ctrl.zones[0].enable == 1
@@ -49,8 +51,75 @@ def test_shape_level_undo_after_commit():
     ctrl = make_ctrl()
     for p in [(0, 0), (40, 0), (40, 40), (0, 40)]:
         ctrl.mouse_down(p)
+    ctrl.finish_polygon()
     ctrl.undo()
     assert ctrl.zones == []
+
+
+def test_free_draw_continues_past_four_points():
+    ctrl = make_ctrl()
+    pts = [(0, 0), (40, 0), (60, 20), (40, 40), (0, 40), (-20, 20)]
+    for p in pts:
+        ctrl.mouse_down(p)
+    assert ctrl.zones == [] and ctrl.pending == pts
+    assert ctrl.finish_polygon()
+    assert ctrl.zones[0].points == pts
+    ctrl.undo()                              # whole shape, one step
+    assert ctrl.zones == []
+
+
+def test_enter_key_finishes_free_draw():
+    ctrl = make_ctrl()
+    for p in [(0, 0), (40, 0), (40, 40), (0, 40), (-10, 20)]:
+        ctrl.mouse_down(p)
+    assert ctrl.key("Enter")
+    assert len(ctrl.zones) == 1 and len(ctrl.zones[0].points) == 5
+
+
+def test_finish_needs_three_corners_and_keeps_pending():
+    ctrl = make_ctrl()
+    ctrl.mouse_down((0, 0))
+    ctrl.mouse_down((40, 0))
+    assert ctrl.finish_polygon()             # handled: feedback, no commit
+    assert ctrl.zones == [] and ctrl.pending == [(0, 0), (40, 0)]
+    assert "3 corners" in ctrl.message
+    ctrl.mouse_down((40, 40))
+    assert ctrl.finish_polygon()
+    assert ctrl.zones[0].points == [(0, 0), (40, 0), (40, 40)]
+
+
+def test_finish_folds_double_click_duplicate_points():
+    # the double-click gesture's own two clicks land as pending points
+    # before the GUI's dblclick handler calls finish_polygon()
+    ctrl = make_ctrl()
+    for p in [(0, 0), (40, 0), (40, 40), (0, 40), (0.5, 40.5)]:
+        ctrl.mouse_down(p)
+    assert ctrl.finish_polygon()
+    assert ctrl.zones[0].points == [(0, 0), (40, 0), (40, 40), (0, 40)]
+
+
+def test_finish_is_a_noop_outside_free_polygon_draw():
+    ctrl = make_ctrl([square(0, 0)])
+    assert not ctrl.finish_polygon()         # nothing pending
+    ctrl.set_mode("edit")
+    assert not ctrl.finish_polygon()         # edit mode
+    ctrl.set_mode("draw")
+    ctrl.mouse_down((0, 200))
+    ctrl.mouse_move((100, 200))
+    ctrl.key("1")                            # dimension entry owns Enter
+    assert not ctrl.finish_polygon()
+    seg = make_kind_ctrl(LINEAL_KIND)
+    seg.mouse_down((0, 0))
+    assert not seg.finish_polygon()          # segment kind
+
+
+def test_preview_follows_cursor_past_four_points():
+    ctrl = make_ctrl()
+    for p in [(0, 0), (40, 0), (40, 40), (0, 40)]:
+        ctrl.mouse_down(p)
+    ctrl.mouse_move((-20, 20))
+    assert ctrl.preview_polygon() == [(0, 0), (40, 0), (40, 40), (0, 40),
+                                      (-20, 20)]
 
 
 def test_escape_clears_pending():
@@ -254,6 +323,7 @@ def test_delete_and_undo_restore():
 def draw_square(ctrl, x=0, y=0, size=40):
     for p in [(x, y), (x + size, y), (x + size, y + size), (x, y + size)]:
         ctrl.mouse_down(p)
+    ctrl.finish_polygon()
 
 
 def test_output_autoincrements_on_draw():
@@ -462,6 +532,89 @@ def test_rotate_selection_without_selection_is_a_noop():
     assert ctrl.rotate_selection(90, (20, 20)) == []
 
 
+# -- insert vertex (ROADMAP Item 5) ----------------------------------------------
+
+def test_insert_vertex_on_nearest_edge():
+    ctrl = make_ctrl([square(0, 0, size=40)])
+    ctrl.set_mode("edit")
+    ctrl.selected = 0
+    assert ctrl.insert_vertex((20, -5))     # nearest the (0,0)->(40,0) edge
+    assert ctrl.zones[0].points == [
+        (0, 0), (20.0, 0.0), (40, 0), (40, 40), (0, 40)]
+    assert "added vertex" in ctrl.message
+
+
+def test_insert_vertex_closing_edge_appends():
+    ctrl = make_ctrl([square(0, 0, size=40)])
+    ctrl.set_mode("edit")
+    ctrl.selected = 0
+    assert ctrl.insert_vertex((-5, 20))     # (0,40)->(0,0) wrap-around edge
+    assert ctrl.zones[0].points == [
+        (0, 0), (40, 0), (40, 40), (0, 40), (0.0, 20.0)]
+
+
+def test_insert_vertex_defaults_to_cursor():
+    ctrl = make_ctrl([square(0, 0, size=40)])
+    ctrl.set_mode("edit")
+    ctrl.selected = 0
+    ctrl.mouse_move((20, -5))
+    assert ctrl.insert_vertex()
+    assert len(ctrl.zones[0].points) == 5
+    # no cursor yet and no explicit point: refused
+    ctrl2 = make_ctrl([square(0, 0)])
+    ctrl2.set_mode("edit")
+    ctrl2.selected = 0
+    assert not ctrl2.insert_vertex()
+    assert len(ctrl2.zones[0].points) == 4
+
+
+def test_insert_vertex_is_one_undo_step():
+    ctrl = make_ctrl([square(0, 0, size=40)])
+    ctrl.set_mode("edit")
+    ctrl.selected = 0
+    orig = list(ctrl.zones[0].points)
+    ctrl.insert_vertex((20, -5))
+    ctrl.undo()
+    assert ctrl.zones[0].points == orig
+
+
+def test_insert_vertex_requires_single_selection_in_edit_mode():
+    ctrl = make_ctrl([square(0, 0), square(100, 0)])
+    assert not ctrl.insert_vertex((20, -5))      # draw mode
+    ctrl.set_mode("edit")
+    ctrl.selected = -1
+    assert not ctrl.insert_vertex((20, -5))      # nothing selected
+    ctrl.select_many([0, 1])
+    assert not ctrl.insert_vertex((20, -5))      # multi-select
+    assert all(len(z.points) == 4 for z in ctrl.zones)
+
+
+def test_insert_vertex_refuses_lineals():
+    lineals = [domain.new_lineal((0, 0), (100, 0))]
+    ctrl = make_kind_ctrl(LINEAL_KIND, lineals)
+    ctrl.set_mode("edit")
+    ctrl.selected = 0
+    assert not ctrl.insert_vertex((50, 5))
+    assert lineals[0].point_0 == (0.0, 0.0)
+    assert lineals[0].point_1 == (100.0, 0.0)
+    assert "lineal" in ctrl.message
+
+
+def test_insert_vertex_breaks_nudge_coalescing():
+    ctrl = make_ctrl([square(0, 0, size=40)])
+    ctrl.set_mode("edit")
+    ctrl.selected = 0
+    ctrl.key("ArrowRight")
+    ctrl.insert_vertex((20, -5))
+    ctrl.key("ArrowRight")                       # must not merge into the first nudge
+    ctrl.undo()                                  # second nudge only
+    assert len(ctrl.zones[0].points) == 5
+    ctrl.undo()                                  # the inserted vertex
+    assert len(ctrl.zones[0].points) == 4
+    ctrl.undo()                                  # first nudge
+    assert ctrl.zones[0].points == [(0, 0), (40, 0), (40, 40), (0, 40)]
+
+
 def test_status_line_reports_state():
     ctrl = make_ctrl()
     assert "draw" in ctrl.status()
@@ -641,6 +794,88 @@ def test_restation_noop_without_a_datum():
     assert zone.points == [(1, 1)]
 
 
+# -- move along centerline (Item 8) --------------------------------------------
+
+def test_zone_station_is_the_downstream_edge():
+    ctrl, zone = cl_with_zone()  # stations 20..30
+    assert ctrl.zone_station(zone) == 20.0
+
+
+def test_zone_station_unattached_zone_is_none():
+    ctrl = make_cl()
+    ctrl.mouse_down((0, 0))
+    ctrl.mouse_down((100, 0))
+    zone = EventZone(enable=1, points=[(1, 1), (2, 1), (2, 2), (1, 2)])
+    assert ctrl.zone_station(zone) is None
+
+
+def test_move_attached_by_relative_delta():
+    ctrl, zone = cl_with_zone()  # corners at stations 20..30, offset 0..-10
+    old = ctrl.move_attached(zone, delta=40.0)
+    assert old == [(20, 0), (20, -10), (30, -10), (30, 0)]
+    assert ctrl.zone_station(zone) == 60.0
+    assert zone.points == [(60, 0), (60, -10), (70, -10), (70, 0)]
+
+
+def test_move_attached_to_absolute_station():
+    ctrl, zone = cl_with_zone()
+    ctrl.move_attached(zone, station=100.0)
+    assert ctrl.zone_station(zone) == 100.0
+    assert zone.points == [(100, 0), (100, -10), (110, -10), (110, 0)]
+
+
+def test_move_attached_preserves_shape_through_a_bend():
+    ctrl, zone = cl_with_zone()
+    ctrl.mouse_down((100, 0))
+    ctrl.mouse_move((100, 100), dragging=True)
+    ctrl.mouse_up((100, 100))  # bend at station 100
+    ctrl.move_attached(zone, station=90.0)  # straddles the bend
+    datum = geometry.Centerline(ctrl.points)
+    expected = [datum.point_at(s, off)
+                for s, off in [(90, 0), (90, -10), (100, -10), (100, 0)]]
+    for (x, y), (ex, ey) in zip(zone.points, expected):
+        assert x == pytest.approx(ex)
+        assert y == pytest.approx(ey)
+
+
+def test_move_attached_rejects_ambiguous_or_missing_args():
+    ctrl, zone = cl_with_zone()
+    with pytest.raises(ValueError):
+        ctrl.move_attached(zone)
+    with pytest.raises(ValueError):
+        ctrl.move_attached(zone, station=1.0, delta=1.0)
+
+
+def test_move_attached_unattached_zone_returns_none():
+    ctrl = make_cl()
+    ctrl.mouse_down((0, 0))
+    ctrl.mouse_down((100, 0))
+    zone = EventZone(enable=1, points=[(1, 1), (2, 1), (2, 2), (1, 2)])
+    assert ctrl.move_attached(zone, delta=10.0) is None
+
+
+def test_move_attached_without_a_datum_returns_none():
+    ctrl = make_cl()
+    ctrl.mouse_down((0, 0))
+    zone = EventZone(enable=1, points=[(1, 1)])
+    ctrl.attach(zone, [(0.0, 0.0)])
+    assert ctrl.move_attached(zone, delta=10.0) is None
+
+
+def test_move_attached_undo_restores_via_record_points_undo():
+    """Mirrors how the GUI drives this: DrawingController.record_points_undo
+    captures the pre-move points, and its own undo() restores them."""
+    zones = []
+    ctrl, zone = cl_with_zone()
+    zones.append(zone)
+    dctrl = make_ctrl(zones)
+    old = ctrl.move_attached(zone, delta=40.0)
+    dctrl.record_points_undo(zone, old)
+    assert zone.points == [(60, 0), (60, -10), (70, -10), (70, 0)]
+    dctrl.undo()
+    assert zone.points == [(20, 0), (20, -10), (30, -10), (30, 0)]
+
+
 # -- deriving attachments on open (Session 7.5 addendum) -----------------------
 
 def placed_zones_on_bent_centerline():
@@ -742,6 +977,7 @@ def test_ignore_kind_draws_into_ignore_list():
     ctrl = make_kind_ctrl(IGNORE_KIND, ignores)
     for p in [(0, 0), (40, 0), (40, 40), (0, 40)]:
         ctrl.mouse_down(p)
+    ctrl.finish_polygon()
     assert len(ignores) == 1
     assert isinstance(ignores[0], IgnoreZone)
     assert ignores[0].enable == 1

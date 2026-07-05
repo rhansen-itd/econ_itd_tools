@@ -30,6 +30,37 @@ def point_segment_distance(pt: Point, a: Point, b: Point) -> float:
     return dist(pt, (ax + t * dx, ay + t * dy))
 
 
+def nearest_edge_insertion(pt: Point, poly: Sequence[Point]) -> tuple[int, Point]:
+    """Where a new vertex lands when added to *poly* at the edge nearest
+    *pt*: (insertion index into the point list, the clamped projection of
+    *pt* onto that edge).
+
+    Edges wrap (last→first) for 3+ points, so a hit on the closing edge
+    inserts at the end of the list; a 2-point open polyline has just the
+    one segment between its endpoints. A projection that clamps to a
+    shared vertex is equidistant from both edges and resolves to the
+    lower edge index.
+    """
+    pts = list(poly)
+    n = len(pts)
+    if n < 2:
+        raise ValueError("nearest_edge_insertion needs at least two points")
+    best = (1, pts[0])
+    best_d = math.inf
+    for i in range(n if n >= 3 else 1):
+        a, b = pts[i], pts[(i + 1) % n]
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        seg2 = dx * dx + dy * dy
+        t = 0.0 if seg2 == 0 else max(
+            0.0, min(1.0, ((pt[0] - a[0]) * dx + (pt[1] - a[1]) * dy) / seg2))
+        foot = (a[0] + t * dx, a[1] + t * dy)
+        d = dist(pt, foot)
+        if d < best_d:
+            best_d = d
+            best = (i + 1, foot)
+    return best
+
+
 def point_in_polygon(pt: Point, poly: Sequence[Point]) -> bool:
     """Ray-casting test; points exactly on an edge may fall either way."""
     x, y = pt

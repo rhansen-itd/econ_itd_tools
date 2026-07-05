@@ -11,3 +11,5 @@ urllib3
 websockets
 ezdxf
 opencv-python
+pytest
+nicegui

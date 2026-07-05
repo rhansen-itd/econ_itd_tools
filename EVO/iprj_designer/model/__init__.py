@@ -6,6 +6,7 @@ from .centerline import (
     load_centerlines,
     save_centerlines,
 )
+from .coords import normalize_origin
 from .iprj_io import (
     Background,
     Condition,
@@ -17,6 +18,17 @@ from .iprj_io import (
     TextLabel,
     load_iprj,
     save_iprj,
+)
+from .multifile import (
+    BackgroundMatch,
+    BackgroundMismatch,
+    check_background_match,
+    is_multifile,
+    is_valid_pair,
+    merge_pair,
+    pair_paths,
+    pair_role,
+    split_project,
 )
 from .templates import (
     ApproachTemplate,
@@ -40,7 +52,17 @@ __all__ = [
     "Sensor",
     "TextLabel",
     "load_iprj",
+    "normalize_origin",
     "save_iprj",
+    "BackgroundMatch",
+    "BackgroundMismatch",
+    "check_background_match",
+    "is_multifile",
+    "is_valid_pair",
+    "merge_pair",
+    "pair_paths",
+    "pair_role",
+    "split_project",
     "centerline_to_lineals",
     "lineals_to_centerlines",
     "load_centerlines",

@@ -28,7 +28,7 @@ directly onto the iprj format's own `MeterPerPixel` / `ReferenceLength` /
 
 - **Browser-ready from day one.** A future goal is running this as a web
   server. The GUI framework is chosen so no rewrite is needed (see
-  ROADMAP.md Session 2 — leading candidate is NiceGUI, with the geometry/model
+  DESIGN_HISTORY.md's Session 2 entry — NiceGUI, with the geometry/model
   layer kept framework-agnostic either way).
 - **Model/GUI separation.** All iprj parsing/serialization, unit conversion,
   and geometry lives in pure-Python modules with no GUI imports, testable
@@ -36,8 +36,8 @@ directly onto the iprj format's own `MeterPerPixel` / `ReferenceLength` /
 
 ## Documents
 
-- [ROADMAP.md](ROADMAP.md) — the session-by-session build plan, with suggested
-  prompts for each work session.
+- [ROADMAP.md](ROADMAP.md) — currently planned work, as named/numbered items
+  ordered by priority, with suggested prompts for each.
 - [IPRJ_FORMAT.md](IPRJ_FORMAT.md) — reverse-engineered notes on the `.iprj`
   file structure and coordinate system.
 - [CLAUDE.md](CLAUDE.md) — working conventions for Claude Code sessions in
@@ -101,10 +101,11 @@ per-detector offset). JSON load/save (v1 files upgrade transparently),
 and a standalone form (`python gui/templates_ui.py`) to create/edit
 template files under `templates/`.
 
-The Phase 1 MVP (data model, drawing core, attributes, templates,
-centerline placement, and the ROADMAP Phase 1 UX/file-management pass) is
-complete — see [DESIGN_HISTORY.md](DESIGN_HISTORY.md) for the full
-session-by-session build log and decisions. Current work is tracked in
+The Phase 1 MVP (data model, drawing core, attributes, templates, centerline
+placement) is complete, and so is everything since — a UX/file-management
+pass, domain-accuracy fixes, the toolbar/multi-select overhaul, and the
+advanced template engine — see [DESIGN_HISTORY.md](DESIGN_HISTORY.md) for
+the full build log and decisions. Current work is tracked in
 [ROADMAP.md](ROADMAP.md).
 
 Run tests with `pytest` from this directory (uses the repo-root `.venv`).

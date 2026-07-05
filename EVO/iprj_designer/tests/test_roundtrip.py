@@ -1,12 +1,19 @@
 """Round-trip every real .iprj under sites/ through load_iprj/save_iprj.
 
-Fidelity contract: the saved file must contain exactly the same attribute
-keys with equal values — string-equal, or numerically equal where the model
-normalized formatting (e.g. "100" -> "100.00"). Element order and container
-form are allowed to differ (we always write the vendor form).
+Fidelity contract (revised for ROADMAP Item 11): load_iprj normalizes the
+origin so the background image's top-left is world (0,0), so the saved file
+is deliberately NOT byte-identical to the vendor's. It must instead contain
+exactly the same attribute keys where every coordinate value is shifted by
+(-Background_PosX, -Background_PosY) of the source file (Background_PosX/Y
+themselves become 0) and every non-coordinate value is equal — string-equal,
+or numerically equal where the model normalized formatting (e.g. "100" ->
+"100.00"). Element order and container form are allowed to differ (we always
+write the vendor form).
 """
 
 import dataclasses
+import math
+import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -42,6 +49,39 @@ def values_equal(a: str, b: str) -> bool:
         return False
 
 
+# Every attribute key that carries a world coordinate, per axis (see
+# IPRJ_FORMAT.md §"Coordinate system"). Everything else must round-trip
+# value-equal; these must round-trip shifted by the source file's
+# (-Background_PosX, -Background_PosY).
+_COORD_KEY = {
+    "x": re.compile(
+        r"^(Background_PosX"
+        r"|MeterReference[01]_X"
+        r"|Radarsensor_\d+_Position_X"
+        r"|Radarsensor_\d+_(EventZone|IgnoreZone)_\d+_ZonePoint_\d+_X"
+        r"|Radarsensor_\d+_EventZone_\d+_EtaPoint_X"
+        r"|Lineals_\d+_Point_\d+_X"
+        r"|Textlabel_\d+_Position_X)$"),
+    "y": re.compile(
+        r"^(Background_PosY"
+        r"|MeterReference[01]_Y"
+        r"|Radarsensor_\d+_Position_Y"
+        r"|Radarsensor_\d+_(EventZone|IgnoreZone)_\d+_ZonePoint_\d+_Y"
+        r"|Radarsensor_\d+_EventZone_\d+_EtaPoint_Y"
+        r"|Lineals_\d+_Point_\d+_Y"
+        r"|Textlabel_\d+_Position_Y)$"),
+}
+
+
+def coord_shift(key: str, dx: float, dy: float) -> float | None:
+    """The expected translation for this key, or None if it's not a coordinate."""
+    if _COORD_KEY["x"].match(key):
+        return dx
+    if _COORD_KEY["y"].match(key):
+        return dy
+    return None
+
+
 def test_fixture_files_exist():
     assert len(IPRJ_FILES) >= 20, f"expected the sites/ fixtures, found {len(IPRJ_FILES)}"
 
@@ -60,10 +100,28 @@ def test_attribute_roundtrip(path, tmp_path):
     assert not missing, f"keys lost on save: {missing[:10]}"
     assert not added, f"keys invented on save: {added[:10]}"
 
-    bad = [(k, orig[k], new[k]) for k in orig
-           if not values_equal(orig[k], new[k]) and k != "BackgroundImage"]
+    # The whole file is translated by the source's (-PosX, -PosY) …
+    dx = float(orig.get("Background_PosX", 0.0))
+    dy = float(orig.get("Background_PosY", 0.0))
+    bad = []
+    for k in orig:
+        if k == "BackgroundImage":
+            continue
+        shift = coord_shift(k, dx, dy)
+        if shift is None:
+            ok = values_equal(orig[k], new[k])
+        else:
+            ok = math.isclose(float(new[k]), float(orig[k]) - shift, abs_tol=1e-9)
+        if not ok:
+            bad.append((k, orig[k], new[k]))
     assert not bad, f"values changed: {bad[:10]}"
     assert orig.get("BackgroundImage") == new.get("BackgroundImage")
+
+    # … which lands the background's top-left exactly on the origin.
+    if "Background_PosX" in new:
+        assert float(new["Background_PosX"]) == 0.0
+    if "Background_PosY" in new:
+        assert float(new["Background_PosY"]) == 0.0
 
 
 @pytest.mark.parametrize("path", IPRJ_FILES, ids=lambda p: str(p.relative_to(SITES)))

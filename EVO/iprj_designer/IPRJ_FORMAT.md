@@ -40,11 +40,56 @@ Values are strings; the vendor formats every float to exactly 2 decimals and
 writes ints bare. Converter-form files carry arbitrary precision (e.g.
 `MeterPerPixel="0.0762"`).
 
+**Canonical origin (ROADMAP Item 11, `model/coords.normalize_origin`):**
+`load_iprj` translates every coordinate in the project by
+`(-Background_PosX, -Background_PosY)` so the background image's top-left
+becomes world `(0,0)` — `Background_PosX/Y`, `MeterReference0/1_X/Y`, sensor
+positions, event/ignore-zone points, ETA points, lineal endpoints, and
+text-label positions all shift together as one rigid frame. This is a
+**deliberate departure from vendor byte-fidelity**: `save_iprj` then writes
+`Background_PosX = Background_PosY = 0` and every other coordinate shifted
+accordingly, not the vendor's original arbitrary values. Distances and
+calibration (`MeterPerPixel`/`ReferenceLength`, translation-invariant) are
+unaffected — only the load→save round-trip contract for absolute position
+changes. See `tests/test_coords.py` and `tests/test_roundtrip.py`
+(`test_attribute_roundtrip` asserts the shifted-not-identical contract).
+
 **Placeholder arrays:** the vendor always writes fixed-size arrays with
 disabled entries — per sensor 64 EventZones × 10 Conditions each and 10
 IgnoreZones, plus 100 Lineals and 100 Textlabels — with `Enable="0"` and
 zeroed fields. Indices are 0-based and contiguous in every surveyed file.
 Converter-form files write only the entries they use.
+
+**Multi-sensor 2-file split (ROADMAP Item 9, `model/multifile.py`):** the
+vendor caps a single file at 2 sensors, so a 3-4 sensor project is written
+as a **pair of files** — `<base>_1_2.iprj` (sensors 1-2) and
+`<base>_3_4.iprj` (sensors 3-4, serialized as `Radarsensor_0/1` in that
+file — the sensor *index* restarts, but `OutputNumber` is preserved
+byte-for-byte; those are project-wide detector-rack channels, not a
+per-file concept). Both files are otherwise **100% vendor-clean single
+.iprj files** — there is no in-file marker connecting them, only the
+filename convention, so either one opens standalone in the vendor
+software without choking on an unrecognized attribute.
+
+Ownership on the split: the `_1_2` file carries every project-wide field
+— background, `Lineals_*`, `Textlabel_*`, and `project.extra` — while the
+`_3_4` file gets only a **deep copy of the background** (so it still
+renders standalone) plus its two sensors. Consequence: opening the `_3_4`
+file alone in the vendor viewer shows its zones but not the project-wide
+annotations/centerline guides. Accepted for v1 since zone geometry is
+already baked into world coordinates; see ITEM9_SPLIT_PLAN.md §8 for the
+per-sensor-lineal-range idea if that's ever revisited.
+
+Pairing relies on Item 11's origin normalization above: because both
+files share the same background image and both are independently
+normalized to `Background_PosX/Y = (0,0)`, "relative to top-left" is a
+common frame and the merge is a plain sensor-list append — no cross-file
+coordinate delta is ever computed. `check_background_match` verifies this
+premise on the overlay-open path (where a user picks two arbitrary
+files): image dimensions, post-normalization position, scale, rotation,
+and effective meters-per-pixel must all agree (hard fail if not); a
+pixel-content hash mismatch on otherwise-matching geometry is a soft
+warning the GUI confirms rather than blocks.
 
 ## Attribute namespace (flat, underscore-indexed)
 

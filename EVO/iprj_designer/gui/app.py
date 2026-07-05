@@ -27,18 +27,16 @@ Phase 3.2b reorganizes the toolbar into two tiers per PHASE3_UI_PLAN.md
 §3/§4/§5: a persistent chrome row (file menu, the 6-tool toggle, snap,
 undo, layers, fit, zoom, zone-panel toggle) and a per-tool context row
 whose contents are swapped by visibility toggling. **Pan is gone** as a
-mode — Select is the default tool, and panning is now an implicit gesture
+mode — Edit is the default tool, and panning is now an implicit gesture
 (middle-button drag, or hold Space and drag) available under every tool;
-an empty-canvas left-drag in Select is a marquee multi-select instead.
-Draw gained a Loop/Ignore Zone/Lineal sub-type toggle wired to the
-`DrawKind` descriptors 3.2a built (gui/drawing.py); Measure folds the old
-Ruler/Calibrate 2-pt/Marker top-level modes into one tool with the same
-sub-type pattern.
+an empty-canvas left-drag in Edit is a marquee multi-select instead.
+Draw gained an Event Zone/Ignore Zone/Lineal sub-type toggle wired to the
+`DrawKind` descriptors 3.2a built (gui/drawing.py).
 
 Phase 3.2c (PHASE3_UI_PLAN.md §6) finishes multi-select: the zone table's
 checkbox column now syncs a *set* of rows both ways with `ctrl.selection`
 (scoped to one sensor, per §6.1 — a cross-sensor pick collapses to the last
-row's sensor), and the Select context bar's new Rotate button drives a
+row's sensor), and the Edit context bar's new Rotate button drives a
 2-click pivot → commit workflow over `model/geometry.py`'s rotation math
 (`ctrl.rotate_selection`); rotating an attached zone detaches it from its
 centerline (§6.4). Properties is disabled for a multi-selection — bulk
@@ -62,43 +60,63 @@ directly — the button spawns it as a subprocess on `--port` + 1000 the
 first time it's used (reused after) and opens straight to whatever template
 is currently picked in the Template tool, if any.
 
+ROADMAP Item 1 reworks the old Measure tool: renamed to Background (2-point
+and known-width/height calibration unchanged), plus an in-place
+background-image upload for an already-open project (zones/sensors/
+centerlines kept). Ruler moves out of Background's old sub-type toggle and
+onto the persistent chrome row as an independent overlay (`ruler_active`)
+that captures clicks over whatever tool is active, rather than a mode you
+switch into — mirrors how space_pan already works in every tool. Marker
+(`Viewer.markers`) is removed entirely.
+
 Usage:
     python gui/app.py [site.iprj | background.png] [--port 8080]
 
 Defaults to sites/Banks/banks.iprj. Open http://localhost:<port> in a
 browser. Mouse wheel zooms at the cursor; drag pans with the middle
-button, or hold Space and drag, in any tool. Use New/Open/Upload BG in the
-File menu to switch projects without restarting the app.
+button, or hold Space and drag, in any tool. Use New/Open in the File menu
+to switch projects without restarting the app, or the Background tool's
+upload button to replace the current project's image in place.
 
-Keys: d Draw · v/e Select · t Template · c Centerline · s Sensor ·
-r Measure · (within Draw) z Loop · l Lineal · i Ignore Zone · g snap ·
-u / Ctrl-Z undo · Esc cancel · digits + Enter dimension entry (Loop/Ignore) ·
-n/b cycle selection · arrows nudge · x/Del delete · Shift-click toggles a
-zone in/out of the selection · Ctrl-drag copies the selected zone ·
-p / double-click zone properties · f fit view · Ctrl-S save.
+Keys: d Draw · e Edit · t Template · c Centerline · s Sensor ·
+r ruler (toggle, any tool) · (within Draw) z Event Zone · l Lineal ·
+i Ignore Zone · g snap · u / Ctrl-Z undo · Esc cancel · digits + Enter
+dimension entry (Event Zone/Ignore) · n/b cycle selection · arrows nudge ·
+x/Del delete · Shift-click toggles a zone in/out of the selection ·
+Ctrl-drag copies the selected zone · p / double-click zone properties ·
+v insert vertex (single selection, Edit tool) · f fit view · Ctrl-S save.
+Free-draw Event Zone/Ignore polygons take any number of corners; finish
+with Enter or a double-click (ROADMAP Item 7).
 
-Select tool: click a zone to select it; Shift-click toggles membership in a
+Edit tool: click a zone to select it; Shift-click toggles membership in a
 multi-selection; drag a body/corner to move; an empty-canvas drag marquees
 every zone it touches. Arrows nudge and x/Del deletes the whole selection
 as one undo step. The zone table's checkbox column mirrors the canvas
-selection both ways (Loop kind only). Rotate (context bar) arms a 2-click
+selection both ways (Event Zone kind only). Rotate (context bar) arms a 2-click
 workflow: click to place the pivot, move to aim (live preview + angle
 readout), click again to commit — Esc cancels. Rotating a zone that was
 attached to a centerline detaches it. Properties opens only for a single
-selection; use Delete/Move/Rotate for group edits.
+selection; use Delete/Move/Rotate for group edits. `v` inserts a vertex
+into the single selected element, on the edge nearest the cursor.
 
 Draw tool: the sub-type toggle (context bar) picks what a click places —
-Loop (event zone), Ignore Zone, or Lineal (generic 2-point reference line).
-Loop and Ignore Zone are 4-click/dimensioned polygons; Lineal is a 2-click
-segment. The sub-type also retargets Select — pick Ignore Zone or Lineal in
+Event Zone, Ignore Zone, or Lineal (generic 2-point reference line). Event
+Zone and Ignore Zone are 4-click/dimensioned polygons; Lineal is a 2-click
+segment. The sub-type also retargets Edit — pick Ignore Zone or Lineal in
 Draw to then select/edit that kind's elements.
 
-Measure tool: the sub-type toggle picks Ruler (click to set the first
-point, move to see the live distance in feet, click again — or release a
-drag — to set the second), Calibrate 2-pt (click two reference points,
-then enter the known distance), or Marker (click to drop a marker). "Clear
-markers & ruler" in the context bar clears both; Esc cancels a ruler
-measurement in progress.
+Background tool: click two reference points then enter the known distance
+between them (2-point calibration), or use the context bar's calibrate
+button to enter a known image width/height instead. The context bar's
+upload button replaces the open project's background image in place —
+zones, sensors, and centerlines are kept; recalibrate afterward if the new
+image is at a different scale.
+
+Ruler: a persistent chrome-row toggle (r), not a tool — click to set the
+first point, move to see the live distance in feet, click again (or
+release a drag) to set the second, while whatever tool you're already in
+(Draw, Edit, …) stays active underneath. "Clear ruler" next to it clears
+the measurement; Esc cancels one in progress.
 
 Template tool: pick a template from the context bar dropdown; if it leaves
 any placement value unresolved, a dialog prompts for direction/thru
@@ -145,8 +163,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from nicegui import ui
 
-from gui.drawing import (DIM_OFF, IGNORE_KIND, LINEAL_KIND, LOOP_KIND,
-                         CenterlineController, DrawingController,
+from gui.drawing import (ARROWS, DIM_OFF, IGNORE_KIND, LINEAL_KIND, LOOP_KIND,
+                         NUDGE_FT, CenterlineController, DrawingController,
                          derive_attachments, element_points, insert_zone,
                          is_placeholder, next_output_number)
 from gui.viewport import Viewport
@@ -155,6 +173,10 @@ from model.centerline import (load_centerlines, load_lineals,
                               save_centerlines, save_lineals)
 from model.iprj_io import (Background, Condition, EventZone, Project, Sensor,
                            load_iprj, save_iprj)
+from model.multifile import (MAX_SENSORS, BackgroundMismatch,
+                             check_background_match, is_multifile,
+                             is_valid_pair, merge_pair, pair_paths,
+                             pair_role, split_project)
 from model.templates import (DIRECTIONS, PlacementContext, expand_and_place,
                              expand_and_place_on_centerline, load_template,
                              missing_placeholders)
@@ -166,7 +188,7 @@ PHASE_COLORS = ["#d62728", "#1f77b4", "#2ca02c", "#ff7f0e", "#9467bd",
                 "#8c564b", "#e377c2", "#bcbd22", "#17becf"]
 
 # Draw sub-types (PHASE3_UI_PLAN §4.1) shown in the Draw tool's context bar.
-DRAW_KINDS = {"Loop": LOOP_KIND, "Ignore Zone": IGNORE_KIND, "Lineal": LINEAL_KIND}
+DRAW_KINDS = {"Event Zone": LOOP_KIND, "Ignore Zone": IGNORE_KIND, "Lineal": LINEAL_KIND}
 
 # Vendor-confirmed ZoneType names (see model/domain.py): 0 Motion,
 # 1 Presence, 2 Sidewalk.
@@ -175,6 +197,41 @@ ZONE_TYPE_NAMES = {int(t): f"{int(t)} — {name}"
 
 # Vendor-default condition factory moved to the model layer in Phase 2.
 new_condition = domain.default_condition
+
+# int-keyed copies of the enum-name maps (mirrors ZONE_TYPE_NAMES above) —
+# plain-int keys serialize cleanly as ui.select options.
+_VEHICLE_CLASS_OPTS = {int(k): v for k, v in domain.VEHICLE_CLASS_NAMES.items()}
+_DIRECTION_OPTS = {int(k): v for k, v in domain.DIRECTION_NAMES.items()}
+
+# Per-Condition-field widget specs, keyed by the domain.CONDITION_FIELDS names
+# (Item 2 of ROADMAP.md) — which fields render in a condition row is decided
+# by domain.condition_fields(zone.zone_type), not this dict; this only says
+# *how* to render a field once it's selected.
+_COND_FIELD_SPECS: dict[str, dict] = {
+    "output_number": dict(label="output", kind="int"),
+    "condition_class": dict(label="class", kind="select", options=_VEHICLE_CLASS_OPTS),
+    "direction": dict(label="direction", kind="select", options=_DIRECTION_OPTS),
+    "event_message_delay": dict(label="delay", kind="int"),
+    "event_message_extend": dict(label="extend", kind="int"),
+    "velocity_min": dict(label="v min (mph)", kind="float",
+                         to_ui=units.kmh_to_mph, to_model=units.mph_to_kmh),
+    "velocity_max": dict(label="v max (mph)", kind="float",
+                         to_ui=units.kmh_to_mph, to_model=units.mph_to_kmh),
+    "queuelength_min": dict(label="queue min (ft)", kind="float",
+                            to_ui=units.m_to_ft, to_model=units.ft_to_m),
+    "queuelength_max": dict(label="queue max (ft)", kind="float",
+                            to_ui=units.m_to_ft, to_model=units.ft_to_m),
+    "eta_min": dict(label="eta min (s)", kind="float"),
+    "eta_max": dict(label="eta max (s)", kind="float"),
+    "nr_pedest_min": dict(label="ped min", kind="int"),
+    "nr_pedest_max": dict(label="ped max", kind="int"),
+    "nr_cars_min": dict(label="cars min", kind="int"),
+    "nr_cars_max": dict(label="cars max", kind="int"),
+    "nr_small_trucks_min": dict(label="sm truck min", kind="int"),
+    "nr_small_trucks_max": dict(label="sm truck max", kind="int"),
+    "nr_big_trucks_min": dict(label="big truck min", kind="int"),
+    "nr_big_trucks_max": dict(label="big truck max", kind="int"),
+}
 
 
 def open_project(path: Path) -> Project:
@@ -217,9 +274,13 @@ def _cross(x: float, y: float, size: float, color: str, width: float) -> str:
 
 
 class Viewer:
-    def __init__(self, project: Project, source: Path):
+    def __init__(self, project: Project, source: Path, pair: tuple[Path, Path] | None = None):
         self.project = project
         self.source = source
+        # Item 9: (_1_2 path, _3_4 path) when this project spans two files —
+        # either opened via overlay-merge or already saved as a pair. None
+        # for an ordinary <=2-sensor single-file project.
+        self.pair = pair
         self.bg = project.background
         # Serve the background as a PNG *file*, never a PIL object: NiceGUI
         # retains per-client state around PIL-sourced images (~2x the decoded
@@ -240,18 +301,18 @@ class Viewer:
         self.image_file = Path(name)
         atexit.register(lambda p=self.image_file: p.unlink(missing_ok=True))
         self.viewport = Viewport()
-        # Phase 3.2b: 6 primary tools (Select/Draw/Template/Centerline/
-        # Sensor/Measure) replace the old 9-entry flat toggle; Pan is gone
-        # (PHASE3_UI_PLAN §5) — Select is the default and panning is an
+        # Phase 3.2b: 6 primary tools (Edit/Draw/Template/Centerline/
+        # Sensor/Background) replace the old 9-entry flat toggle; Pan is gone
+        # (PHASE3_UI_PLAN §5) — Edit is the default and panning is an
         # implicit gesture (space_pan / middle-drag) available everywhere.
-        self.mode = "Select"
+        self.mode = "Edit"
         self.space_pan = False       # True while the space bar is held
-        # Draw sub-type (Loop/Ignore Zone/Lineal, §4) also selects what
-        # Select operates on — the two tools share one DrawingController
+        # Draw sub-type (Event Zone/Ignore Zone/Lineal, §4) also selects what
+        # Edit operates on — the two tools share one DrawingController
         # pointed at one element list/kind at a time.
-        self.draw_kind_name = "Loop"
+        self.draw_kind_name = "Event Zone"
         # Marquee multi-select (§6.2): set while an empty-canvas drag is
-        # rubber-banding a selection rectangle in the Select tool.
+        # rubber-banding a selection rectangle in the Edit tool.
         self.marquee_anchor: tuple[float, float] | None = None  # world px
         self.marquee_cursor: tuple[float, float] | None = None  # world px
         self.marquee_additive = False
@@ -264,18 +325,18 @@ class Viewer:
         self.rotate_pivot: tuple[float, float] | None = None  # world px
         self.rotate_ray: tuple[float, float] | None = None    # world px
         self.rotate_angle = 0.0  # degrees, model.geometry convention
-        # Measure sub-type (Ruler/Calibrate/Marker, §2) folds the old
-        # top-level Ruler/Calibrate 2-pt/Marker modes into one tool.
-        self.measure_kind = "Ruler"
         self.show_zones = True     # layer toggles (background is CSS-only)
         self.show_labels = True
         self.show_sensors = True
-        self.markers: list[tuple[float, float]] = []  # world px
         self.cal_points: list[tuple[float, float]] = []  # world px, pending 2-pt
         self.drag_anchor: tuple[float, float] | None = None
         self.sensor_drag: dict | None = None  # in-flight sensor move
-        # 2-point ruler (Phase 1): click to start, click again (or a real
-        # drag-release) to end; ruler_pending is true between the two.
+        # Ruler (Item 1): an independent overlay toggle rather than a mode —
+        # like space_pan, it captures canvas clicks over whatever tool is
+        # active instead of living in the tool toggle/Background sub-type.
+        # 2-point: click to start, click again (or a real drag-release) to
+        # end; ruler_pending is true between the two.
+        self.ruler_active = False
         self.ruler_start: tuple[float, float] | None = None  # world px
         self.ruler_end: tuple[float, float] | None = None    # world px
         self.ruler_pending = False
@@ -312,7 +373,7 @@ class Viewer:
         self.active_si = 0
         self.ctrl = DrawingController(self.draw_zones(),
                                       self.ft_per_px, self.next_output)
-        # self.mode defaults to "Select" (edit); a ui.toggle's on_change
+        # self.mode defaults to "Edit" (ctrl.mode "edit"); a ui.toggle's on_change
         # fires only on a user-driven change, never for its initial value,
         # so the controller needs this nudge to start in step with the tool.
         self.ctrl.set_mode("edit")
@@ -329,10 +390,10 @@ class Viewer:
         return self.project.sensors[self.active_si].event_zones
 
     def draw_zones(self) -> list:
-        """The element list the active draw kind/Select targets: the active
+        """The element list the active draw kind/Edit targets: the active
         sensor's event zones or ignore zones, or the project-wide lineal
         pool (PHASE3_UI_PLAN §4.1, §6.1 — one kind/list at a time)."""
-        if self.draw_kind_name == "Loop":
+        if self.draw_kind_name == "Event Zone":
             return self.active_zones()
         if self.draw_kind_name == "Ignore Zone":
             return self.project.sensors[self.active_si].ignore_zones
@@ -343,7 +404,7 @@ class Viewer:
         self.ctrl.retarget(self.draw_zones())
 
     def set_draw_kind(self, name: str) -> None:
-        """Switch the Draw sub-type (and what Select operates on);
+        """Switch the Draw sub-type (and what Edit operates on);
         retargeting clears the selection (§6.1)."""
         self.draw_kind_name = name
         self.ctrl.retarget(self.draw_zones(), DRAW_KINDS[name])
@@ -409,10 +470,9 @@ class Viewer:
             reading = self.centerline_ctrl.station_readout((wx, wy))
             if reading:
                 return f"{base}   |   {reading}"
-        if self.mode == "Measure" and self.measure_kind == "Ruler" \
-                and self.ruler_start is not None and self.ruler_pending:
+        if self.ruler_active and self.ruler_start is not None and self.ruler_pending:
             return f"{base}   |   distance: {self._ruler_reading(self.ruler_start, (wx, wy))}"
-        if self.mode == "Select" and self.rotate_armed and self.rotate_pivot is not None:
+        if self.mode == "Edit" and self.rotate_armed and self.rotate_pivot is not None:
             return f"{base}   |   angle: {self.rotate_angle:+.1f}°"
         return base
 
@@ -548,9 +608,6 @@ class Viewer:
                          f'stroke-dasharray="{2 * lw} {2 * lw}"/>')
             for p in (p0, p1):
                 parts.append(_cross(p[0], p[1], 5 * lw, "red", lw))
-        for wp in self.markers:
-            x, y = w2i(wp)
-            parts.append(_cross(x, y, 5 * lw, "#00e5ff", lw))
         for wp in self.cal_points:
             x, y = w2i(wp)
             parts.append(_cross(x, y, 6 * lw, "magenta", lw))
@@ -578,7 +635,7 @@ class Viewer:
         # rotate (§6.4): pivot cross (seeded at the selection centroid before
         # click 1 places it explicitly) plus a live rotated-outline preview
         # of every selected element once the user is aiming past the pivot.
-        if self.mode == "Select" and self.rotate_armed:
+        if self.mode == "Edit" and self.rotate_armed:
             pivot = self.rotate_pivot or self.ctrl.selection_centroid()
             if pivot is not None:
                 px, py = w2i(pivot)
@@ -754,8 +811,8 @@ def build_ui(viewer: Viewer, state: dict) -> None:
 
     def zone_properties(si: int | None = None, zi: int | None = None):
         if si is None:  # toolbar/keyboard path: current canvas selection
-            if v.mode != "Select" or v.draw_kind_name != "Loop":
-                ui.notify("select a loop in the Select tool first", type="warning")
+            if v.mode != "Edit" or v.draw_kind_name != "Event Zone":
+                ui.notify("select an event zone in the Edit tool first", type="warning")
                 return
             if len(v.ctrl.selection) > 1:
                 # bulk edit is a v1 follow-up (PHASE3_UI_PLAN §8.2) — the
@@ -795,23 +852,32 @@ def build_ui(viewer: Viewer, state: dict) -> None:
 
             ui.separator()
             cond_rows: list[dict] = []
+            # Which Condition fields this zone's type exposes (Item 2 of
+            # ROADMAP.md) — fixed to the zone's saved type when the dialog
+            # opens, not reactive to the Type select above (see
+            # DESIGN_HISTORY.md for why: this dialog's Type field changes
+            # zone.zone_type on Apply, not live).
+            cond_fields = domain.condition_fields(zone.zone_type)
 
             def add_cond_row(cond: Condition):
-                with conds_col, ui.row().classes("items-center gap-2") as row_el:
-                    entry = {
-                        "cond": cond,
-                        "en": ui.checkbox(value=bool(cond.enable)),
-                        "out": ui.number("output", value=cond.output_number or 0,
-                                         min=0, precision=0).classes("w-20"),
-                        "cls": ui.number("class", value=cond.condition_class or 0,
-                                         min=0, precision=0).classes("w-16"),
-                        "vmin": ui.number("v min (mph)", precision=1,
-                                          value=round(units.kmh_to_mph(
-                                              cond.velocity_min or 0.0), 1)).classes("w-28"),
-                        "vmax": ui.number("v max (mph)", precision=1,
-                                          value=round(units.kmh_to_mph(
-                                              cond.velocity_max or 0.0), 1)).classes("w-28"),
-                    }
+                with conds_col, ui.row().classes("items-center gap-2 flex-wrap") as row_el:
+                    entry = {"cond": cond, "en": ui.checkbox(value=bool(cond.enable))}
+                    for fname in cond_fields:
+                        spec = _COND_FIELD_SPECS[fname]
+                        raw = getattr(cond, fname) or 0
+                        if spec["kind"] == "select":
+                            entry[fname] = ui.select(
+                                spec["options"], value=int(raw),
+                                label=spec["label"]).classes("w-36")
+                        elif spec["kind"] == "float":
+                            entry[fname] = ui.number(
+                                spec["label"], precision=1,
+                                value=round(spec["to_ui"](raw), 1)
+                                if "to_ui" in spec else raw).classes("w-28")
+                        else:  # int
+                            entry[fname] = ui.number(
+                                spec["label"], value=int(raw),
+                                min=0, precision=0).classes("w-20")
                     ui.button(icon="delete",
                               on_click=lambda e=entry, r=row_el:
                               (cond_rows.remove(e), conds_col.remove(r))) \
@@ -820,9 +886,12 @@ def build_ui(viewer: Viewer, state: dict) -> None:
 
             with ui.row().classes("w-full items-center"):
                 ui.label("Conditions").classes("text-base")
-                ui.button("Add condition",
-                          on_click=lambda: add_cond_row(
-                              new_condition(int(output.value or 0))))
+                add_cond_btn = ui.button(
+                    "Add condition",
+                    on_click=lambda: add_cond_row(
+                        new_condition(int(output.value or 0))))
+                if not domain.conditions_allowed(zone.zone_type):
+                    add_cond_btn.props("disable")
             conds_col = ui.column().classes("w-full max-h-72 overflow-y-auto")
             for c in zone.conditions:
                 add_cond_row(c)
@@ -839,10 +908,19 @@ def build_ui(viewer: Viewer, state: dict) -> None:
                 for r in cond_rows:
                     c = r["cond"]
                     c.enable = int(r["en"].value)
-                    c.output_number = int(r["out"].value or 0)
-                    c.condition_class = int(r["cls"].value or 0)
-                    c.velocity_min = units.mph_to_kmh(float(r["vmin"].value or 0.0))
-                    c.velocity_max = units.mph_to_kmh(float(r["vmax"].value or 0.0))
+                    # Only fields rendered for this zone type are written
+                    # back — a hidden field (e.g. a Presence zone's stray
+                    # velocity from before this fix) keeps whatever value it
+                    # already had rather than being silently zeroed.
+                    for fname in cond_fields:
+                        spec = _COND_FIELD_SPECS[fname]
+                        w = r[fname]
+                        if spec["kind"] == "float":
+                            val = float(w.value or 0.0)
+                            setattr(c, fname,
+                                    spec["to_model"](val) if "to_model" in spec else val)
+                        else:
+                            setattr(c, fname, int(w.value or 0))
                     conds.append(c)
                 zone.conditions = conds
                 if sensor_to.value != si:
@@ -864,6 +942,70 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             with ui.row():
                 ui.button("Apply", on_click=apply)
                 ui.button("Cancel", on_click=dialog.close)
+        dialog.open()
+
+    # -- move along centerline (Item 8) -----------------------------------------
+
+    def attached_centerline_for(zone) -> CenterlineController | None:
+        """The centerline *zone* is registered on, or None if it isn't
+        attached to any of them."""
+        for cl in v.centerlines:
+            if id(zone) in cl.attached:
+                return cl
+        return None
+
+    def move_along_centerline():
+        if v.mode != "Edit" or v.draw_kind_name != "Event Zone":
+            ui.notify("select an event zone in the Edit tool first", type="warning")
+            return
+        if len(v.ctrl.selection) != 1:
+            ui.notify("select exactly one zone", type="warning")
+            return
+        zi = v.ctrl.selected
+        zone = v.active_zones()[zi]
+        cl = attached_centerline_for(zone)
+        if cl is None:
+            ui.notify("this zone isn't attached to a centerline", type="warning")
+            return
+        fpp = v.ft_per_px()
+        if fpp is None:
+            ui.notify("calibrate the background before moving by station",
+                      type="warning")
+            return
+        cur_station_ft = cl.zone_station(zone) * fpp
+
+        with ui.dialog() as dialog, ui.card():
+            ui.label(f"Move {zone.zone_name or 'zone'} along centerline") \
+                .classes("text-lg")
+            ui.label(f"current station: {cur_station_ft:.1f} ft")
+            with ui.row().classes("items-center"):
+                station = ui.number("Absolute station (ft)",
+                                    value=round(cur_station_ft, 1),
+                                    precision=1).classes("w-40")
+                ui.button("Set", on_click=lambda: apply_move(
+                    station=float(station.value or 0.0) / fpp))
+            with ui.row().classes("items-center"):
+                delta = ui.number("Move by (ft, + upstream)", value=0.0,
+                                  precision=1).classes("w-40")
+                ui.button("Move", on_click=lambda: apply_move(
+                    delta=float(delta.value or 0.0) / fpp))
+
+            def apply_move(*, station: float | None = None,
+                           delta: float | None = None):
+                old = cl.move_attached(zone, station=station, delta=delta)
+                if old is None:
+                    ui.notify("move failed — zone no longer attached",
+                              type="warning")
+                    dialog.close()
+                    return
+                v.ctrl.record_points_undo(zone, old)
+                new_station_ft = cl.zone_station(zone) * fpp
+                dialog.close()
+                refresh_overlay()
+                refresh_status()
+                ui.notify(f"moved to station {new_station_ft:.1f} ft")
+
+            ui.button("Cancel", on_click=dialog.close)
         dialog.open()
 
     # -- sensors ---------------------------------------------------------------
@@ -916,6 +1058,9 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         refresh_status()
 
     def add_sensor():
+        if len(v.project.sensors) >= MAX_SENSORS:
+            ui.notify(f"max {MAX_SENSORS} sensors (two-file limit)", type="warning")
+            return
         s = Sensor()
         s.position_x, s.position_y = units.image_to_world(
             v.bg, (v.image_w / 2, v.image_h / 2))
@@ -924,7 +1069,69 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         update_sensor_options()
         tool.value = "Sensor"
         refresh_overlay()
+        refresh_status()
         ui.notify(f"S{len(v.project.sensors)} placed at image center — drag to position")
+
+    def nudge_sensor(ux: float, uy: float):
+        s = v.project.sensors[v.active_si]
+        if s.position_x is None or s.position_y is None:
+            return
+        fpp = v.ft_per_px()
+        step = NUDGE_FT / fpp if fpp else 2.0
+        s.position_x += ux * step
+        s.position_y += uy * step
+        refresh_overlay()
+
+    def delete_sensor():
+        if len(v.project.sensors) <= 1:
+            ui.notify("can't delete the only sensor", type="warning")
+            return
+        si = v.active_si
+        s = v.project.sensors[si]
+        real_zones = [z for z in s.event_zones if not is_placeholder(z)]
+        real_ignores = [z for z in s.ignore_zones if not is_placeholder(z)]
+        other_opts = {i: f"S{i + 1}" for i in range(len(v.project.sensors)) if i != si}
+
+        def finish(reassign_to: int | None):
+            if reassign_to is not None:
+                tgt = v.project.sensors[reassign_to]
+                for z in real_zones:
+                    insert_zone(tgt.event_zones, z)
+                for z in real_ignores:
+                    insert_zone(tgt.ignore_zones, z)
+            v.project.sensors.pop(si)
+            v.set_active_sensor(min(si, len(v.project.sensors) - 1))
+            update_sensor_options()
+            dialog.close()
+            refresh_overlay()
+            refresh_status()
+            msg = f"deleted S{si + 1}"
+            if reassign_to is not None:
+                msg += f", reassigned its zones to S{reassign_to + 1}"
+            ui.notify(msg)
+
+        with ui.dialog() as dialog, ui.card():
+            ui.label(f"Delete S{si + 1}?").classes("text-lg")
+            zone_count = len(real_zones) + len(real_ignores)
+            if zone_count:
+                ui.label(f"{zone_count} zone(s) are on this sensor — reassign "
+                         "them to another sensor, or delete them with it.")
+                reassign_sel = ui.select(
+                    other_opts, value=next(iter(other_opts)),
+                    label="Reassign to").classes("w-32")
+                with ui.row():
+                    ui.button("Reassign & Delete",
+                             on_click=lambda: finish(reassign_sel.value))
+                    ui.button("Delete Zones Too",
+                             on_click=lambda: finish(None)).props("color=negative")
+                    ui.button("Cancel", on_click=dialog.close)
+            else:
+                ui.label("No zones on this sensor.")
+                with ui.row():
+                    ui.button("Delete", on_click=lambda: finish(None)) \
+                        .props("color=negative")
+                    ui.button("Cancel", on_click=dialog.close)
+        dialog.open()
 
     # -- centerlines ---------------------------------------------------------
 
@@ -1082,6 +1289,8 @@ def build_ui(viewer: Viewer, state: dict) -> None:
     # -- save --------------------------------------------------------------------
 
     def do_save(path: Path):
+        """path is always the _1_2 target for a multi-file (3-4 sensor)
+        project — the single-file path otherwise (Item 9 §6)."""
         v.project.date = time.strftime("%Y_%m_%d_%H:%M:%S")
         save_centerlines(v.project, [cl.points for cl in v.centerlines])
         # after save_centerlines, so the endpoint-coincidence guard sees the
@@ -1090,22 +1299,51 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         if skipped:
             ui.notify(f"{len(skipped)} lineal(s) not saved — they touch a "
                       "centerline or another lineal's endpoint", type="warning")
-        save_iprj(v.project, path)
-        v.source = path
-        title_label.set_text(f"iprj Designer — {path.name}")
-        ui.notify(f"saved {path}")
+        if not is_multifile(v.project):
+            save_iprj(v.project, path)
+            v.source = path
+            v.pair = None
+            title_label.set_text(f"iprj Designer — {path.name}")
+            ui.notify(f"saved {path}")
+            return
+        primary, secondary = split_project(v.project)
+        p12, p34 = pair_paths(path)
+        save_iprj(primary, p12)
+        save_iprj(secondary, p34)
+        v.pair = (p12, p34)
+        v.source = p12
+        title_label.set_text(f"iprj Designer — {p12.name} + {p34.name}")
+        ui.notify(f"saved {p12.name} + {p34.name}")
 
     def save():
-        if v.source.suffix.lower() == ".iprj":
-            do_save(v.source)
+        if not is_multifile(v.project):
+            if v.source.suffix.lower() == ".iprj":
+                do_save(v.source)
+            else:
+                save_as()
+        elif v.pair and is_valid_pair(*v.pair):
+            do_save(v.pair[0])  # writes both files of the pair
         else:
-            save_as()
+            save_as()  # no legal pair name yet — force the user to choose one
 
     def save_as():
+        multi = is_multifile(v.project)
         with ui.dialog() as dialog, ui.card():
             ui.label("Save project as:")
-            path_in = ui.input("path", value=str(v.source.with_suffix(".iprj"))) \
-                .style("min-width: 420px")
+            default = str((v.pair[0] if v.pair else v.source).with_suffix(".iprj"))
+
+            def update_preview(value: str):
+                p = Path(value or default).expanduser()
+                p12, p34 = pair_paths(p if p.suffix else p.with_suffix(".iprj"))
+                preview.set_text(f"3-4 sensors → writes {p12.name} + {p34.name}")
+
+            path_in = ui.input(
+                "path", value=default,
+                on_change=(lambda e: update_preview(e.value)) if multi else None,
+            ).style("min-width: 420px")
+            preview = ui.label().classes("text-xs text-gray-500")
+            if multi:
+                update_preview(default)
 
             def apply():
                 p = Path(path_in.value).expanduser()
@@ -1191,6 +1429,143 @@ def build_ui(viewer: Viewer, state: dict) -> None:
                 ui.button("Cancel", on_click=dialog.close)
         dialog.open()
 
+    def open_second_pair_file():
+        """Item 9: merge a second sensor-pair (_3_4, usually) file's sensors
+        into the currently open project, up to the 4-sensor two-file cap."""
+        with ui.dialog() as dialog, ui.card().style("min-width: 480px"):
+            ui.label("Open second sensor-pair file (overlay)").classes("text-lg")
+            ui.label("Merges another file's sensors into this project. This "
+                     "project's background, lineals, and text labels are "
+                     "kept; the other file contributes only its sensors.") \
+                .classes("text-xs text-gray-500")
+            found = iprj_files()
+            if found:
+                ui.select(found, label="known sites",
+                          on_change=lambda e: path_in.set_value(e.value)) \
+                    .classes("w-full").props("dense clearable")
+            path_in = ui.input("path to second .iprj").classes("w-full")
+
+            def apply():
+                p = Path(path_in.value).expanduser()
+                if not p.is_file():
+                    ui.notify(f"not found: {p}", type="negative")
+                    return
+                try:
+                    other = load_iprj(p)
+                except Exception as exc:  # noqa: BLE001 — surface any parse error
+                    ui.notify(f"failed to load {p}: {exc}", type="negative")
+                    return
+                dialog.close()
+                _resolve_pair_orientation(v.source, v.project, p, other)
+
+            with ui.row():
+                ui.button("Open", on_click=apply)
+                ui.button("Cancel", on_click=dialog.close)
+        dialog.open()
+
+    def _resolve_pair_orientation(cur_path, cur_proj, other_path, other_proj):
+        """Which of the two open files is the _1_2 (primary)? Filenames
+        decide when they follow the naming convention; otherwise ask."""
+        cur_role, other_role = pair_role(cur_path), pair_role(other_path)
+        if cur_role == "1_2" and other_role == "3_4":
+            _confirm_and_merge(cur_path, cur_proj, other_path, other_proj)
+            return
+        if cur_role == "3_4" and other_role == "1_2":
+            _confirm_and_merge(other_path, other_proj, cur_path, cur_proj)
+            return
+
+        with ui.dialog() as dialog, ui.card():
+            ui.label("Which file is the 1-2 (primary) file?").classes("text-lg")
+            ui.label("Neither filename follows the _1_2/_3_4 convention — "
+                     "pick which one holds sensors 1-2.") \
+                .classes("text-xs text-gray-500")
+
+            def pick(cur_is_primary: bool):
+                dialog.close()
+                if cur_is_primary:
+                    _confirm_and_merge(cur_path, cur_proj, other_path, other_proj)
+                else:
+                    _confirm_and_merge(other_path, other_proj, cur_path, cur_proj)
+
+            with ui.column().classes("gap-1"):
+                ui.button(f"{cur_path.name} = 1-2", on_click=lambda: pick(True))
+                ui.button(f"{other_path.name} = 1-2", on_click=lambda: pick(False))
+            ui.button("Cancel", on_click=dialog.close)
+        dialog.open()
+
+    def _confirm_and_merge(primary_path, primary_proj, secondary_path, secondary_proj):
+        match = check_background_match(primary_proj.background, secondary_proj.background)
+        if not match.ok:
+            ui.notify(match.reason, type="negative")
+            return
+
+        def do_merge(allow_soft: bool):
+            try:
+                merged = merge_pair(primary_proj, secondary_proj, allow_soft=allow_soft)
+            except (BackgroundMismatch, ValueError) as exc:
+                ui.notify(str(exc), type="negative")
+                return
+            swap_viewer(Viewer(merged, primary_path, pair=(primary_path, secondary_path)))
+
+        if match.warn:
+            with ui.dialog() as confirm, ui.card():
+                ui.label("Background mismatch").classes("text-lg")
+                ui.label(match.reason).classes("text-xs text-gray-500")
+
+                def merge_anyway():
+                    confirm.close()
+                    do_merge(True)
+
+                with ui.row():
+                    ui.button("Merge anyway", on_click=merge_anyway)
+                    ui.button("Cancel", on_click=confirm.close)
+            confirm.open()
+        else:
+            do_merge(False)
+
+    async def upload_background(e):
+        """Replace the open project's background image in place (Item 1) —
+        zones, sensors, and centerlines are untouched; only image_base64 and
+        the derived image_w/image_h change. Reuses the decode/embed and
+        served-PNG-file logic new_project's upload path and Viewer.__init__
+        already have."""
+        try:
+            img = Image.open(io.BytesIO(await e.file.read()))
+            buf = io.BytesIO()
+            img.convert("RGB").save(buf, format="PNG")
+        except Exception as exc:  # noqa: BLE001 — surface any decode error
+            ui.notify(f"couldn't read image: {exc}", type="negative")
+            return
+        v.bg.image_base64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        png = units.decode_background_image(v.bg)
+        with Image.open(io.BytesIO(png)) as im:  # header only, lazy
+            v.image_w, v.image_h = im.size
+        old_file = v.image_file
+        fd, name = tempfile.mkstemp(prefix="iprj_bg_", suffix=".png")
+        with os.fdopen(fd, "wb") as f:
+            f.write(png)
+        v.image_file = Path(name)
+        atexit.register(lambda p=v.image_file: p.unlink(missing_ok=True))
+        old_file.unlink(missing_ok=True)
+        ui.notify(f"background image replaced ({v.image_w}x{v.image_h})")
+        ui.navigate.reload()  # picks up the new image_file/image_w/image_h
+
+    def upload_background_dialog():
+        with ui.dialog() as dialog, ui.card():
+            ui.label("Replace background image").classes("text-lg")
+            ui.label("Zones, sensors, and centerlines are kept — only the "
+                     "image changes. Recalibrate afterward if needed.") \
+                .classes("text-xs text-gray-500")
+
+            async def do_upload(e):
+                dialog.close()
+                await upload_background(e)
+
+            ui.upload(auto_upload=True, on_upload=do_upload) \
+                .props('accept=".png,.jpg,.jpeg,.bmp"').classes("w-full")
+            ui.button("Cancel", on_click=dialog.close)
+        dialog.open()
+
     # -- template editor (standalone NiceGUI app, spawned on demand) -----------
     # gui/templates_ui.py owns its own event loop/port (a second NiceGUI
     # `ui.run` can't share this process's), so the Template context bar's
@@ -1236,9 +1611,13 @@ def build_ui(viewer: Viewer, state: dict) -> None:
                 "move to aim, click to commit  [Esc cancels]")
 
     def refresh_status():
-        if v.mode == "Select" and v.rotate_armed:
+        if v.ruler_active:
+            # overlay: takes over the status line (and clicks) regardless of
+            # whatever tool is underneath — same priority as rotate_armed.
+            status_label.set_text(v.ruler_status())
+        elif v.mode == "Edit" and v.rotate_armed:
             status_label.set_text(rotate_status())
-        elif v.mode in ("Draw", "Select"):
+        elif v.mode in ("Draw", "Edit"):
             status_label.set_text(v.ctrl.status())
         elif v.mode == "Sensor":
             status_label.set_text(
@@ -1249,22 +1628,23 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         elif v.mode == "Centerline":
             status_label.set_text(f"C{v.active_cli + 1}/{len(v.centerlines)} | "
                                   f"{v.centerline_ctrl.status()}")
-        elif v.mode == "Measure" and v.measure_kind == "Ruler":
-            status_label.set_text(v.ruler_status())
-        elif v.mode == "Measure" and v.measure_kind == "Calibrate":
+        elif v.mode == "Background":
             status_label.set_text(
                 "mode: calibrate 2-pt | click two reference points, "
                 "then enter the known distance")
-        elif v.mode == "Measure":  # Marker
-            status_label.set_text("mode: marker | click to drop a marker")
         else:
             status_label.set_text(f"mode: {v.mode.lower()}")
         snap_switch.set_value(v.ctrl.snap_enabled)  # no-op when already equal
         select_count_label.set_text(
-            f"{len(v.ctrl.selection)} selected" if v.mode == "Select" else "")
+            f"{len(v.ctrl.selection)} selected" if v.mode == "Edit" else "")
         # bulk edit is out of scope for v1 (PHASE3_UI_PLAN §8.2) — the floor
         # is disabling single-zone Properties once more than one is selected
         properties_btn.set_enabled(len(v.ctrl.selection) <= 1)
+        zones = v.active_zones()
+        move_station_btn.set_enabled(
+            v.mode == "Edit" and v.draw_kind_name == "Event Zone"
+            and len(v.ctrl.selection) == 1 and 0 <= v.ctrl.selected < len(zones)
+            and attached_centerline_for(zones[v.ctrl.selected]) is not None)
         refresh_zone_table()
 
     # -- zone table panel (synced with canvas selection) -----------------------
@@ -1287,7 +1667,7 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         rows = zone_rows()
         zone_table.rows = rows
         sel_keys = set()
-        if v.mode == "Select" and v.draw_kind_name == "Loop":
+        if v.mode == "Edit" and v.draw_kind_name == "Event Zone":
             n = len(v.active_zones())
             sel_keys = {f"{v.active_si}:{zi}" for zi in v.ctrl.selection if zi < n}
         zone_table.selected = [r for r in rows if r["key"] in sel_keys]
@@ -1297,12 +1677,12 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         """Plain row click: select just this one zone (mirrors a plain
         canvas click), overriding whatever the checkbox column had set."""
         si, zi = (int(x) for x in key.split(":"))
-        if v.draw_kind_name != "Loop":
-            draw_kind_toggle.set_value("Loop")  # on_change retargets to Loop
+        if v.draw_kind_name != "Event Zone":
+            draw_kind_toggle.set_value("Event Zone")  # on_change retargets to Event Zone
         if si != v.active_si:
             sensor_sel.set_value(si)  # on_change retargets the controller
-        if v.mode != "Select":
-            tool.value = "Select"     # on_change syncs the controller mode
+        if v.mode != "Edit":
+            tool.value = "Edit"     # on_change syncs the controller mode
         v.ctrl.selected = zi
         refresh_overlay()
         refresh_status()
@@ -1315,19 +1695,19 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         plain click elsewhere already collapses to a single list."""
         keys = [r["key"] for r in e.selection]
         if not keys:
-            if v.mode == "Select" and v.ctrl.selection:
+            if v.mode == "Edit" and v.ctrl.selection:
                 v.ctrl.select_many([])
                 refresh_overlay()
                 refresh_status()
             return
         si = int(keys[-1].split(":")[0])
         zis = [int(k.split(":")[1]) for k in keys if int(k.split(":")[0]) == si]
-        if v.draw_kind_name != "Loop":
-            draw_kind_toggle.set_value("Loop")
+        if v.draw_kind_name != "Event Zone":
+            draw_kind_toggle.set_value("Event Zone")
         if si != v.active_si:
             sensor_sel.set_value(si)
-        if v.mode != "Select":
-            tool.value = "Select"
+        if v.mode != "Edit":
+            tool.value = "Edit"
         v.ctrl.select_many(zis)
         refresh_overlay()
         refresh_status()
@@ -1357,15 +1737,15 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         refresh_status()
 
     def do_delete():
-        if v.mode != "Select":
-            ui.notify("switch to the Select tool to delete", type="warning")
+        if v.mode != "Edit":
+            ui.notify("switch to the Edit tool to delete", type="warning")
             return
         v.ctrl.delete_selected()
         refresh_overlay()
         refresh_status()
 
     def start_rotate():
-        if v.mode != "Select" or not v.ctrl.selection:
+        if v.mode != "Edit" or not v.ctrl.selection:
             ui.notify("select one or more zones first", type="warning")
             return
         v.rotate_armed = True
@@ -1422,8 +1802,7 @@ def build_ui(viewer: Viewer, state: dict) -> None:
     def toggle_zone_panel():
         zone_panel.set_visibility(not zone_panel.visible)
 
-    def clear_markers_and_ruler():
-        v.markers.clear()
+    def clear_ruler():
         v.ruler_start = None
         v.ruler_end = None
         v.ruler_pending = False
@@ -1435,11 +1814,20 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         button = e.args.get("button", 0)
         if button == 1 or (button == 0 and v.space_pan):
             v.drag_anchor = p
-        elif button == 0 and v.mode == "Measure" and v.measure_kind == "Marker":
-            v.markers.append(units.image_to_world(v.bg, p))
+        elif button == 0 and v.ruler_active:
+            # overlay tool (Item 1): captures the click regardless of the
+            # active main tool, same as pan above.
+            pw = units.image_to_world(v.bg, p)
+            if v.ruler_start is None or not v.ruler_pending:
+                v.ruler_start = pw
+                v.ruler_end = pw
+                v.ruler_pending = True
+            else:
+                v.ruler_end = pw
+                v.ruler_pending = False
             refresh_overlay()
-            ui.notify(f"marker at {v.describe(p)}")
-        elif button == 0 and v.mode == "Measure" and v.measure_kind == "Calibrate":
+            refresh_status()
+        elif button == 0 and v.mode == "Background":
             v.cal_points.append(units.image_to_world(v.bg, p))
             refresh_overlay()
             if len(v.cal_points) == 2:
@@ -1459,7 +1847,7 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             notify_ctrl_warning()
             refresh_overlay()
             refresh_status()
-        elif button == 0 and v.mode == "Select" and v.rotate_armed:
+        elif button == 0 and v.mode == "Edit" and v.rotate_armed:
             pw = units.image_to_world(v.bg, p)
             if v.rotate_pivot is None:
                 v.rotate_pivot = pw  # click 1: place the pivot
@@ -1467,7 +1855,7 @@ def build_ui(viewer: Viewer, state: dict) -> None:
                 commit_rotate(v.rotate_pivot, v.rotate_angle)  # click 2
             refresh_overlay()
             refresh_status()
-        elif button == 0 and v.mode == "Select":
+        elif button == 0 and v.mode == "Edit":
             pw = units.image_to_world(v.bg, p)
             shift = bool(e.args.get("shiftKey"))
             sel_before, anchor_before = list(v.ctrl.selection), v.ctrl.anchor
@@ -1504,17 +1892,6 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             v.centerline_ctrl.mouse_down(units.image_to_world(v.bg, p))
             refresh_overlay()
             refresh_status()
-        elif button == 0 and v.mode == "Measure" and v.measure_kind == "Ruler":
-            pw = units.image_to_world(v.bg, p)
-            if v.ruler_start is None or not v.ruler_pending:
-                v.ruler_start = pw
-                v.ruler_end = pw
-                v.ruler_pending = True
-            else:
-                v.ruler_end = pw
-                v.ruler_pending = False
-            refresh_overlay()
-            refresh_status()
 
     def on_move(e):
         p = (e.args["offsetX"], e.args["offsetY"])
@@ -1531,13 +1908,17 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             if math.dist(pw, d["anchor"]) > v.ctrl.handle_radius / 3:
                 d["moved"] = True
             refresh_overlay()
+        elif v.ruler_active:
+            if v.ruler_pending:
+                v.ruler_end = pw
+                refresh_overlay()
         elif v.mode == "Draw":
             dragging = bool(e.args.get("buttons", 0) & 1)
             v.ctrl.mouse_move(pw, dragging)
             # only redraw while something tracks the mouse
             if v.ctrl.pending or dragging or v.ctrl.snap_enabled:
                 refresh_overlay()
-        elif v.mode == "Select" and v.rotate_armed:
+        elif v.mode == "Edit" and v.rotate_armed:
             if v.rotate_pivot is not None:
                 if v.rotate_ray is None:
                     v.rotate_ray = pw  # freeze the angle-measure reference ray
@@ -1545,7 +1926,7 @@ def build_ui(viewer: Viewer, state: dict) -> None:
                     v.rotate_angle = geometry.rotation_angle_deg(
                         v.rotate_pivot, v.rotate_ray, pw)
             refresh_overlay()
-        elif v.mode == "Select":
+        elif v.mode == "Edit":
             dragging = bool(e.args.get("buttons", 0) & 1)
             v.ctrl.mouse_move(pw, dragging)
             if v.marquee_anchor is not None and dragging:
@@ -1562,9 +1943,6 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             v.centerline_ctrl.mouse_move(pw, dragging)
             if dragging:
                 refresh_overlay()
-        elif v.mode == "Measure" and v.measure_kind == "Ruler" and v.ruler_pending:
-            v.ruler_end = pw
-            refresh_overlay()
 
     def on_up(e):
         v.drag_anchor = None
@@ -1574,12 +1952,20 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             d, v.sensor_drag = v.sensor_drag, None
             if not d["moved"]:
                 sensor_properties(d["si"])
+        elif v.ruler_active:
+            # a real click-drag-release finishes the measurement in one
+            # gesture; a plain click leaves it pending for a second click
+            if v.ruler_pending and math.dist(pw, v.ruler_start) > v.ctrl.handle_radius / 3:
+                v.ruler_end = pw
+                v.ruler_pending = False
+                refresh_overlay()
+                refresh_status()
         elif v.mode == "Draw":
             v.ctrl.mouse_up(pw)
             v.reproject_attachments()  # a drag may have moved an attached zone
             refresh_overlay()
             refresh_status()
-        elif v.mode == "Select":
+        elif v.mode == "Edit":
             v.ctrl.mouse_up(pw)
             if v.marquee_anchor is not None:
                 v.ctrl.marquee_select(v.marquee_anchor, pw,
@@ -1593,27 +1979,27 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             v.centerline_ctrl.mouse_up(pw)
             refresh_overlay()
             refresh_status()
-        elif v.mode == "Measure" and v.measure_kind == "Ruler" and v.ruler_pending:
-            # a real click-drag-release finishes the measurement in one
-            # gesture; a plain click leaves it pending for a second click
-            if math.dist(pw, v.ruler_start) > v.ctrl.handle_radius / 3:
-                v.ruler_end = pw
-                v.ruler_pending = False
-                refresh_overlay()
-                refresh_status()
 
     def on_dblclick(e):
         # the two mousedowns already selected the zone under the cursor
-        if v.mode == "Select":
+        if v.mode == "Edit":
             zone_properties()
+        elif v.mode == "Draw" and v.ctrl.finish_polygon():
+            notify_ctrl_warning()
+            refresh_overlay()
+            refresh_status()
 
     # top-level tool + Draw sub-type accelerators (PHASE3_UI_PLAN §2.1):
     # handled here with an early return, before delegating to the
     # controller, so gui/drawing.py never sees these as mode keys.
-    TOOL_KEYS = {"d": "Draw", "v": "Select", "e": "Select",
-                "t": "Template", "c": "Centerline", "s": "Sensor",
-                "r": "Measure"}
-    DRAW_SUBTYPE_KEYS = {"z": "Loop", "l": "Lineal", "i": "Ignore Zone"}
+    # No accelerator for Background: every unused letter that reads as a
+    # mnemonic ("b") is already `n`/`b` cycle-selection in gui/drawing.py's
+    # edit-mode keys — click the tool toggle instead. `v` is no longer a
+    # tool alias (ROADMAP Item 5) — it falls through to ctrl.key() below as
+    # the Edit-tool insert-vertex action.
+    TOOL_KEYS = {"d": "Draw", "e": "Edit",
+                "t": "Template", "c": "Centerline", "s": "Sensor"}
+    DRAW_SUBTYPE_KEYS = {"z": "Event Zone", "l": "Lineal", "i": "Ignore Zone"}
 
     async def on_key(e):
         name = e.key.name
@@ -1631,6 +2017,9 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         if name == "f":
             await fit_view()
             return
+        if name == "r":
+            toggle_ruler()
+            return
         if name in TOOL_KEYS:
             tool.value = TOOL_KEYS[name]  # on_change syncs the controller
             return
@@ -1640,7 +2029,7 @@ def build_ui(viewer: Viewer, state: dict) -> None:
                 tool.value = "Draw"
             draw_kind_toggle.set_value(DRAW_SUBTYPE_KEYS[name])
             return
-        if name in ("p", "Enter") and v.mode == "Select" \
+        if name in ("p", "Enter") and v.mode == "Edit" \
                 and v.ctrl.dim_stage == DIM_OFF:
             zone_properties()
             return
@@ -1655,15 +2044,14 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             refresh_overlay()
             refresh_status()
             return
-        if name == "Escape" and v.mode == "Measure" and v.measure_kind == "Ruler" \
-                and v.ruler_pending:
+        if name == "Escape" and v.ruler_active and v.ruler_pending:
             v.ruler_start = None
             v.ruler_end = None
             v.ruler_pending = False
             refresh_overlay()
             refresh_status()
             return
-        if v.mode in ("Draw", "Select") and v.ctrl.key(name, e.modifiers.ctrl):
+        if v.mode in ("Draw", "Edit") and v.ctrl.key(name, e.modifiers.ctrl):
             notify_ctrl_warning()
             v.reproject_attachments()  # nudge/undo may have moved attached zones
             refresh_overlay()
@@ -1671,12 +2059,16 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         elif v.mode == "Centerline" and v.centerline_ctrl.key(name, e.modifiers.ctrl):
             refresh_overlay()
             refresh_status()
+        elif v.mode == "Sensor" and name in ARROWS:
+            nudge_sensor(*ARROWS[name])
+        elif v.mode == "Sensor" and name in ("Delete", "x"):
+            delete_sensor()
 
     def change_tool(e):
         v.mode = e.value
         if e.value == "Draw":
             v.ctrl.set_mode("draw")
-        elif e.value == "Select":
+        elif e.value == "Edit":
             v.ctrl.set_mode("edit")
         else:
             v.ctrl.set_mode("draw")  # clears any pending loop/dimension entry
@@ -1685,11 +2077,7 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             v.template_cursor = None
         if e.value != "Centerline":
             v.centerline_ctrl.end_drag()
-        if e.value != "Measure" and v.ruler_pending:
-            v.ruler_start = None
-            v.ruler_end = None
-            v.ruler_pending = False
-        if e.value != "Select":
+        if e.value != "Edit":
             cancel_rotate()
         v.marquee_anchor = None
         v.marquee_cursor = None
@@ -1703,31 +2091,34 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         refresh_overlay()
         refresh_status()
 
-    def change_measure_kind(e):
-        v.measure_kind = e.value
-        v.ruler_start = None
-        v.ruler_end = None
-        v.ruler_pending = False
-        v.cal_points.clear()
-        update_context_bar()
+    def set_ruler_active(on: bool):
+        v.ruler_active = on
+        if not on and v.ruler_pending:
+            v.ruler_start = None
+            v.ruler_end = None
+            v.ruler_pending = False
+        ruler_btn.classes(add="text-cyan-400" if on else "",
+                          remove="" if on else "text-cyan-400")
         refresh_overlay()
         refresh_status()
+
+    def toggle_ruler():
+        set_ruler_active(not v.ruler_active)
 
     def update_context_bar():
         """Row-2 context controls per tool (PHASE3_UI_PLAN §3): built once,
         shown/hidden by visibility rather than rebuilt on every switch, so
         widget state (selector values) survives a tool change."""
-        sensor_sel.set_visibility(v.mode in ("Draw", "Select", "Sensor"))
+        sensor_sel.set_visibility(v.mode in ("Draw", "Edit", "Sensor"))
         add_sensor_btn.set_visibility(v.mode == "Sensor")
+        delete_sensor_btn.set_visibility(v.mode == "Sensor")
         draw_kind_toggle.set_visibility(v.mode == "Draw")
-        select_count_label.set_visibility(v.mode == "Select")
-        properties_btn.set_visibility(v.mode == "Select")
-        rotate_btn.set_visibility(v.mode == "Select")
-        delete_btn.set_visibility(v.mode == "Select")
-        measure_kind_toggle.set_visibility(v.mode == "Measure")
-        clear_measure_btn.set_visibility(v.mode == "Measure")
-        calibrate_size_btn.set_visibility(
-            v.mode == "Measure" and v.measure_kind == "Calibrate")
+        select_count_label.set_visibility(v.mode == "Edit")
+        properties_btn.set_visibility(v.mode == "Edit")
+        rotate_btn.set_visibility(v.mode == "Edit")
+        delete_btn.set_visibility(v.mode == "Edit")
+        calibrate_size_btn.set_visibility(v.mode == "Background")
+        upload_bg_btn.set_visibility(v.mode == "Background")
         template_sel.set_visibility(v.mode == "Template")
         template_values_btn.set_visibility(
             v.mode == "Template" and v.template is not None)
@@ -1757,24 +2148,37 @@ def build_ui(viewer: Viewer, state: dict) -> None:
     # not rebuilding, so selector state survives a tool switch).
 
     with ui.row().classes("w-full items-center gap-2 px-2 no-wrap overflow-x-auto"):
-        title_label = ui.label(f"iprj Designer — {v.source.name}") \
+        _title = (f"{v.pair[0].name} + {v.pair[1].name}" if v.pair
+                  else v.source.name)
+        title_label = ui.label(f"iprj Designer — {_title}") \
             .classes("text-lg text-white whitespace-nowrap")
         with ui.button(icon="folder").props("flat dense"):
             ui.tooltip("file")
             with ui.menu():
                 ui.menu_item("New…", on_click=new_project)
                 ui.menu_item("Open…", on_click=open_existing)
+                ui.menu_item("Open second sensor-pair file (overlay)…",
+                             on_click=open_second_pair_file)
                 ui.separator()
                 ui.menu_item("Save", on_click=save)
                 ui.menu_item("Save As…", on_click=save_as)
         ui.separator().props("vertical")
-        tool = ui.toggle(["Select", "Draw", "Template", "Centerline", "Sensor",
-                          "Measure"], value="Select",
+        tool = ui.toggle(["Edit", "Draw", "Template", "Centerline", "Sensor",
+                          "Background"], value="Edit",
                          on_change=change_tool).props("dense")
         with tool:
-            ui.tooltip("accelerators: d draw · v/e select · t template · "
-                       "c centerline · s sensor · r measure · space+drag / "
+            ui.tooltip("accelerators: d draw · e edit · t template · "
+                       "c centerline · s sensor · space+drag / "
                        "middle-drag pans · Esc cancel")
+        ui.separator().props("vertical")
+        ruler_btn = ui.button(icon="straighten", on_click=toggle_ruler) \
+            .props("flat dense")
+        with ruler_btn:
+            ui.tooltip("ruler (r) — measures distance in any tool, "
+                       "independent of the active tool")
+        with ui.button(icon="wrong_location", on_click=clear_ruler) \
+                .props("flat dense"):
+            ui.tooltip("clear ruler")
         ui.space()
         snap_switch = ui.switch("snap", on_change=toggle_snap).props("dense")
         with snap_switch:
@@ -1810,13 +2214,18 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             .props("flat dense")
         with add_sensor_btn:
             ui.tooltip("add a sensor at image center")
+        delete_sensor_btn = ui.button(icon="delete", on_click=delete_sensor) \
+            .props("flat dense")
+        with delete_sensor_btn:
+            ui.tooltip("delete active sensor (x / Del) — prompts to reassign "
+                       "or delete its zones")
 
-        draw_kind_toggle = ui.toggle(["Loop", "Ignore Zone", "Lineal"],
-                                     value="Loop",
+        draw_kind_toggle = ui.toggle(["Event Zone", "Ignore Zone", "Lineal"],
+                                     value="Event Zone",
                                      on_change=change_draw_kind).props("dense")
         with draw_kind_toggle:
-            ui.tooltip("draw sub-type: z Loop · l Lineal · i Ignore Zone — "
-                       "also picks what Select operates on")
+            ui.tooltip("draw sub-type: z Event Zone · l Lineal · i Ignore Zone — "
+                       "also picks what Edit operates on")
 
         select_count_label = ui.label("").classes("text-white font-mono")
         properties_btn = ui.button(icon="tune", on_click=lambda: zone_properties()) \
@@ -1829,22 +2238,26 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         with rotate_btn:
             ui.tooltip("rotate selection: click to place the pivot, "
                        "move to aim, click again to commit (Esc cancels)")
+        move_station_btn = ui.button(icon="timeline",
+                                     on_click=move_along_centerline) \
+            .props("flat dense")
+        with move_station_btn:
+            ui.tooltip("move along centerline — set an absolute station or "
+                       "nudge by a delta (centerline-attached zones only)")
         delete_btn = ui.button(icon="delete", on_click=do_delete).props("flat dense")
         with delete_btn:
             ui.tooltip("delete selected (x / Del)")
 
-        measure_kind_toggle = ui.toggle(["Ruler", "Calibrate", "Marker"],
-                                        value="Ruler",
-                                        on_change=change_measure_kind).props("dense")
-        calibrate_size_btn = ui.button(icon="straighten", on_click=calibrate_by_size) \
+        calibrate_size_btn = ui.button(icon="aspect_ratio", on_click=calibrate_by_size) \
             .props("flat dense")
         with calibrate_size_btn:
             ui.tooltip("calibrate by known image width/height")
-        clear_measure_btn = ui.button(icon="wrong_location",
-                                      on_click=clear_markers_and_ruler) \
+        upload_bg_btn = ui.button(icon="image",
+                                  on_click=upload_background_dialog) \
             .props("flat dense")
-        with clear_measure_btn:
-            ui.tooltip("clear markers & ruler")
+        with upload_bg_btn:
+            ui.tooltip("upload a new background image (keeps zones/sensors/"
+                       "centerlines)")
 
         template_sel = ui.select(template_files(), label="template",
                                  on_change=change_template) \
@@ -1918,7 +2331,7 @@ def build_ui(viewer: Viewer, state: dict) -> None:
                 .classes("text-xs text-gray-500 px-1")
 
     with ui.row().classes("w-full justify-between px-2"):
-        status_label = ui.label("mode: select").classes("text-white font-mono")
+        status_label = ui.label("mode: edit").classes("text-white font-mono")
         pos_label = ui.label("—").classes("text-white font-mono")
         scale_label = ui.label(status_scale()).classes("text-white font-mono")
 

@@ -1,9 +1,12 @@
 """Draw/edit state machine for zone loops — pure python, no GUI imports.
 
 Ported from the interaction model of pyatspm's ``video/calibrate.py`` (free
-4-point loops, snap toggle, edit mode with drag/Ctrl-drag-copy, undo),
+polygon loops, snap toggle, edit mode with drag/Ctrl-drag-copy, undo),
 upgraded with the dimensioned-rectangle workflow: click a corner, aim with
-the mouse, type the two side lengths in feet.
+the mouse, type the two side lengths in feet. Free polygon draw takes any
+number of corners and commits on an explicit finish — Enter, or the GUI's
+double-click via `finish_polygon()` (ROADMAP Item 7); only 2-click segments
+auto-commit at a fixed count.
 
 Phase 3.2a generalizes the controller along two axes (PHASE3_UI_PLAN §4/§6):
 
@@ -22,7 +25,7 @@ Phase 3.2a generalizes the controller along two axes (PHASE3_UI_PLAN §4/§6):
 Phase 3.2c adds `selection_centroid`/`rotate_selection`: the pivot seed and
 the batch-undo commit for the GUI's 2-click rotate workflow (the click
 tracking and live preview angle live in `gui/app.py`, alongside the other
-Select-tool sub-interactions like the marquee).
+Edit-tool sub-interactions like the marquee).
 
 The controller operates entirely in world-pixel coordinates (y-down); the
 GUI converts mouse events before feeding them in and renders from the state
@@ -117,7 +120,7 @@ class DrawKind:
     which the controller surfaces via ``warning``."""
 
     name: str                                   # "loop" | "ignore" | "lineal"
-    shape: str                                  # "polygon" (4-click/dim) | "segment" (2-click)
+    shape: str                                  # "polygon" (free multi-click/dim) | "segment" (2-click)
     make: Callable[[list[Point], int], object]
     insert: Callable[[list, object], int]
     is_placeholder: Callable[[object], bool]
@@ -202,7 +205,7 @@ class DrawingController:
     @property
     def dragging(self) -> bool:
         """Whether a vertex or body drag is in progress — the GUI's signal
-        (PHASE3_UI_PLAN §5/§6.2) that a Select-tool mouse-down landed on
+        (PHASE3_UI_PLAN §5/§6.2) that an Edit-tool mouse-down landed on
         something, so an empty-canvas drag is a marquee instead."""
         return self._drag_vertex is not None or self._drag_body is not None
 
@@ -347,8 +350,9 @@ class DrawingController:
             if self.dim_stage != DIM_OFF:
                 return  # dimensions are committed with Enter, not clicks
             self.pending.append(self._snapped(p))
-            needed = 2 if self.kind.shape == "segment" else 4
-            if len(self.pending) == needed:
+            # only segments auto-commit at a fixed count; polygons keep
+            # accepting corners until finish_polygon() (Enter/double-click)
+            if self.kind.shape == "segment" and len(self.pending) == 2:
                 self._commit_element(self.pending)
                 self.pending = []
         elif self.mode == "edit":
@@ -432,9 +436,9 @@ class DrawingController:
     def key(self, name: str, ctrl: bool = False) -> bool:
         """Handle a key press; returns True if it changed anything.
 
-        Mode/tool accelerators (`d`/`l`/`e`/`v`/`z`/`i`…) are handled at the
-        app level per PHASE3_UI_PLAN §2.1 — the controller no longer owns
-        any set-mode shortcut."""
+        Mode/tool accelerators (`d`/`l`/`e`/`z`/`i`…) are handled at the app
+        level per PHASE3_UI_PLAN §2.1 — the controller no longer owns any
+        set-mode shortcut. `v` is the edit-mode insert-vertex action."""
         self.message = ""
         self.warning = ""
         if name not in ARROWS:
@@ -462,6 +466,8 @@ class DrawingController:
         starts_dim = name.isdigit() and len(name) == 1 \
             and self.kind.shape == "polygon"
         if self.dim_stage == DIM_OFF:
+            if name == "Enter":
+                return self.finish_polygon()
             if not starts_dim or len(self.pending) != 1:
                 if starts_dim and not self.pending:
                     self.message = "click the first corner before typing dimensions"
@@ -519,6 +525,9 @@ class DrawingController:
         return True
 
     def _key_edit(self, name: str) -> bool:
+        if name == "v":
+            self.insert_vertex()
+            return True
         if name in ("n", "b"):
             real = self._real_indices()
             if not real:
@@ -585,6 +594,13 @@ class DrawingController:
             real = self._real_indices()
             self.selected = real[-1] if real else -1
 
+    def record_points_undo(self, zone, old_points: list[Point]) -> None:
+        """Push a ``("points", zone, old_points)`` undo entry for an edit
+        made outside this controller (e.g. `CenterlineController.move_attached`
+        re-stationing a zone from a dialog) — same shape `_nudge`/`_undo_one`
+        already use, so `undo()` restores it exactly as it would a drag."""
+        self._undo.append(("points", zone, list(old_points)))
+
     def retarget(self, zones: list, kind: DrawKind | None = None) -> None:
         """Point the controller at another element list (active-sensor
         switch, or a draw-kind switch when *kind* is given). In-progress
@@ -600,6 +616,34 @@ class DrawingController:
         self._nudging = False
         self.snap_indicator = None
         self.selected = -1
+
+    def finish_polygon(self) -> bool:
+        """Commit the pending free-draw polygon — the explicit finish for
+        ROADMAP Item 7. Enter routes here from `_key_draw`; the GUI's
+        double-click handler calls it directly. The double-click's own two
+        clicks land as pending points before the dblclick event arrives, so
+        trailing points coincident with their predecessor (within half the
+        vertex grab radius — GUI-rescaled on zoom like the hit tests) are
+        dropped before committing. Fewer than 3 surviving corners leaves the
+        draw pending with a message. Segments (2-click auto-commit) and
+        dimension entry (Enter commits via `_commit_dimension`) never reach
+        here. Returns True if it handled the gesture."""
+        if self.mode != "draw" or self.kind.shape != "polygon" \
+                or self.dim_stage != DIM_OFF or not self.pending:
+            return False
+        self.message = ""
+        self.warning = ""
+        pts = list(self.pending)
+        tol = self.handle_radius / 2
+        while len(pts) >= 2 and geometry.dist(pts[-1], pts[-2]) <= tol:
+            pts.pop()
+        if len(pts) < 3:
+            self.message = f"a {self.kind.name} needs at least 3 corners"
+            return True
+        self._commit_element(pts)
+        self.pending = []
+        self.snap_indicator = None
+        return True
 
     def cancel(self) -> bool:
         """Escape: back out one level (dimension entry → pending → selection)."""
@@ -693,6 +737,40 @@ class DrawingController:
         self.message = f"deleted {len(sub_ops)} zones"
         self.selected = -1
 
+    def insert_vertex(self, p: Point | None = None) -> bool:
+        """Insert a vertex into the single selected element, on the edge
+        nearest *p* (default: the current cursor) — the Edit-tool `v`
+        action (ROADMAP Item 5). One undoable "points" op; like any manual
+        vertex edit, the GUI should `reproject` a centerline-attached zone
+        afterward. Lineals store exactly two endpoints and are refused.
+        Returns True if a vertex was added."""
+        self.message = ""
+        self.warning = ""
+        self._nudging = False
+        if self.mode != "edit" or len(self.selection) != 1 \
+                or self.selection[0] >= len(self.zones):
+            self.message = "select a single zone to add a vertex"
+            return False
+        zone = self.zones[self.selection[0]]
+        if isinstance(zone, Lineal):
+            self.message = "a lineal has fixed endpoints — can't add a vertex"
+            return False
+        if p is None:
+            p = self.cursor
+        if p is None:
+            self.message = "point at an edge to add a vertex"
+            return False
+        pts = list(element_points(zone))
+        if len(pts) < 2:
+            self.message = "select a single zone to add a vertex"
+            return False
+        self._undo.append(("points", zone, list(pts)))
+        idx, new_pt = geometry.nearest_edge_insertion(p, pts)
+        pts.insert(idx, new_pt)
+        set_element_points(zone, pts)
+        self.message = f"added vertex to {_element_name(zone)}"
+        return True
+
     def selection_centroid(self) -> Point | None:
         """Combined-points centroid of every selected element — the pivot
         seed shown before the user clicks to place one (PHASE3_UI_PLAN
@@ -730,9 +808,10 @@ class DrawingController:
             return None
         cursor = self.snap_indicator or self.cursor
         if self.dim_stage == DIM_OFF:
-            limit = 2 if self.kind.shape == "segment" else 4
             pts = list(self.pending)
-            if cursor is not None and len(pts) < limit:
+            # segments cap at 2 points; a free polygon rubber-bands forever
+            if cursor is not None and \
+                    (self.kind.shape != "segment" or len(pts) < 2):
                 pts.append(cursor)
             return pts
         fpp = self.ft_per_px()
@@ -781,8 +860,10 @@ class DrawingController:
                 parts.append(f"side 1 = {self.dim_length1_ft:g} ft | "
                              f"side 2 (ft): {self.dim_buffer}_  [mouse picks side, Enter]")
             elif self.pending:
-                parts.append(f"corner {len(self.pending) + 1}/4"
-                             + ("  [or type a length]" if len(self.pending) == 1 else ""))
+                n = len(self.pending)
+                hint = "  [or type a length]" if n == 1 else \
+                    "  [Enter/double-click finishes]" if n >= 3 else ""
+                parts.append(f"corner {n + 1}{hint}")
             else:
                 parts.append("click a corner (type digits after the 1st for a dimensioned rect)")
         elif len(self.selection) > 1:
@@ -977,6 +1058,46 @@ class CenterlineController:
                     for p, (s, off) in zip(zone.points, corners)):
                 continue
             self.attached[key] = (zone, [c.project(p) for p in zone.points])
+
+    def zone_station(self, zone: EventZone) -> float | None:
+        """Station (world px) of *zone*'s downstream edge — the minimum
+        corner station, i.e. the setback edge nearest the stop bar (the
+        same edge `model.templates.DetectorSpec.setback_ft` measures to).
+        None if *zone* isn't attached here."""
+        entry = self.attached.get(id(zone))
+        if entry is None:
+            return None
+        return min(s for s, _ in entry[1])
+
+    def move_attached(self, zone: EventZone, *, station: float | None = None,
+                      delta: float | None = None) -> list[Point] | None:
+        """Re-station *zone* along the centerline — the typed/precise
+        equivalent of a manual drag + `reproject`. Exactly one of *station*
+        (absolute, measured at the zone's downstream edge per
+        `zone_station`) or *delta* (relative; positive = upstream, matching
+        the station direction) must be given, both in world px — the GUI
+        converts feet via `ft_per_px` before calling.
+
+        Every stored corner shifts by the same station amount with offsets
+        unchanged, so the zone keeps its shape in station/offset space and
+        follows any bends. Returns the zone's previous points so the caller
+        can record a ``("points", zone, old)`` undo op on the
+        `DrawingController` stack; None if *zone* isn't attached or the
+        centerline has no valid datum."""
+        if (station is None) == (delta is None):
+            raise ValueError("give exactly one of station= or delta=")
+        entry = self.attached.get(id(zone))
+        c = self.current()
+        if entry is None or c is None:
+            return None
+        _, corners = entry
+        if station is not None:
+            delta = station - min(s for s, _ in corners)
+        old = list(zone.points)
+        new_corners = [(s + delta, off) for s, off in corners]
+        self.attached[id(zone)] = (zone, new_corners)
+        zone.points = [c.point_at(s, off) for s, off in new_corners]
+        return old
 
     # -- mouse -----------------------------------------------------------------
 
