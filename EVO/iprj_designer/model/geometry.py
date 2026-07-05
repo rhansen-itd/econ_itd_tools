@@ -384,3 +384,29 @@ class Centerline:
                 station = self.stations[i] + t * math.sqrt(seg_len2)
                 best = (station, d if cross >= 0 else -d)
         return best
+
+
+def nearest_centerline(
+    centerlines: Sequence["Centerline | None"],
+    pt: Point,
+    max_offset: float | None = None,
+) -> int | None:
+    """Index of the centerline whose datum passes nearest *pt* (smallest
+    ``|offset|`` from its `project`), or None when none qualifies.
+
+    ``None`` entries (controllers without a usable datum yet) are skipped.
+    When *max_offset* is given, a centerline only qualifies if *pt* lies
+    within that perpendicular distance of it — the snap threshold that keeps
+    template placement from following a centerline the click is nowhere near
+    (with *max_offset* None the nearest datum always wins, however far).
+    """
+    best_i, best_off = None, None
+    for i, c in enumerate(centerlines):
+        if c is None:
+            continue
+        off = abs(c.project(pt)[1])
+        if max_offset is not None and off > max_offset:
+            continue
+        if best_off is None or off < best_off:
+            best_i, best_off = i, off
+    return best_i

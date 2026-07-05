@@ -154,6 +154,31 @@ def test_centerline_degenerate_points():
         geometry.Centerline([(3, 3), (3, 3)])
 
 
+def test_nearest_centerline_picks_smallest_offset():
+    a = geometry.Centerline([(0, 0), (100, 0)])       # along y=0
+    b = geometry.Centerline([(0, 50), (100, 50)])     # along y=50
+    # closer to a
+    assert geometry.nearest_centerline([a, b], (40, 10)) == 0
+    # closer to b
+    assert geometry.nearest_centerline([a, b], (40, 45)) == 1
+
+
+def test_nearest_centerline_skips_none_entries():
+    b = geometry.Centerline([(0, 50), (100, 50)])
+    assert geometry.nearest_centerline([None, b, None], (40, 45)) == 1
+    assert geometry.nearest_centerline([None, None], (40, 45)) is None
+    assert geometry.nearest_centerline([], (0, 0)) is None
+
+
+def test_nearest_centerline_respects_max_offset():
+    a = geometry.Centerline([(0, 0), (100, 0)])
+    # 30 px away laterally: inside a 40 threshold, outside a 20 threshold
+    assert geometry.nearest_centerline([a], (40, 30), max_offset=40) == 0
+    assert geometry.nearest_centerline([a], (40, 30), max_offset=20) is None
+    # unbounded (None) always snaps, however far
+    assert geometry.nearest_centerline([a], (40, 9999)) == 0
+
+
 def test_offset_normal():
     assert geometry.offset_normal((1.0, 0.0)) == (0.0, 1.0)
     assert geometry.offset_normal((0.0, 1.0)) == (-1.0, 0.0)

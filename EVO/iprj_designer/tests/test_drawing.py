@@ -350,7 +350,7 @@ def test_copy_bumps_output_and_trailing_number():
 def test_bumped_name():
     assert bumped_name("SBT Count 1") == "SBT Count 2"
     assert bumped_name("Zone 9") == "Zone 10"
-    assert bumped_name("Ph 4 Dilemma") == "Ph 4 Dilemma"
+    assert bumped_name("Ph 4 Decision") == "Ph 4 Decision"
     assert bumped_name(None) == ""
 
 
@@ -898,7 +898,7 @@ def test_derive_attachments_recognizes_engine_placed_zones():
     cl_pts, zones = placed_zones_on_bent_centerline()
     ctrl = make_cl()
     ctrl.points = list(cl_pts)
-    assert derive_attachments([ctrl], [zones]) == len(zones) == 13
+    assert derive_attachments([ctrl], [zones]) == len(zones) == 12
     # and the derived attachment actually re-stations: stretch the far leg
     before = [list(z.points) for z in zones]
     ctrl.selected = 2
@@ -906,25 +906,25 @@ def test_derive_attachments_recognizes_engine_placed_zones():
     ctrl.restation()
     moved = sum(any(geometry.dist(p, q) > 1.0 for p, q in zip(a, z.points))
                 for a, z in zip(before, zones))
-    assert moved >= 2  # the past-the-bend advance loops followed
+    assert moved >= 2  # the past-the-bend advance/decision loops followed
 
 
 def test_derive_attachments_recognizes_zone_straddling_a_bend():
-    """A dilemma zone whose corners sit on both legs of a bend: the
+    """A decision zone whose corners sit on both legs of a bend: the
     concave-side corners project onto the wrong segment, so recognition
     must go through the per-segment candidate search."""
     from model.templates import ApproachTemplate, Lane, expand_and_place_on_centerline
     cl_pts = [(400.0, 500.0), (400.0, 420.0), (250.0, 150.0)]  # bend at 160 ft
     t = ApproachTemplate(lanes=[Lane("L"), Lane("T"), Lane("T"), Lane("R")],
                          speed_mph=45.0, direction="N", thru_phase=4,
-                         lt_phase=7, base_output=1)  # dilemma 165..185 straddles it
+                         lt_phase=7, base_output=1)  # decision 165..185 straddles it
     placed = expand_and_place_on_centerline(t, cl_pts, (395.0, 505.0), 0.5)
     zones = [EventZone(enable=1, zone_name=d.spec.name,
                        points=[(round(x, 2), round(y, 2)) for x, y in d.points])
              for d in placed]
     ctrl = make_cl()
     ctrl.points = list(cl_pts)
-    assert derive_attachments([ctrl], [zones]) == len(zones) == 13
+    assert derive_attachments([ctrl], [zones]) == len(zones) == 12
 
 
 def test_derive_attachments_rejects_hand_drawn_shapes():

@@ -91,10 +91,12 @@ click/double-click selects/edits), arrow-key nudging, `f` fit-view, and
 
 Approach-template schema (`model/templates.py`, Phase 4.1): lane
 configuration (movement + width + per-lane advance-detector toggle),
-design speed and extension time, and editable per-detector rows
-(spanned lanes, length, setback, output offset, phase role) that ITE
-kinematic math *seeds* with defaults — including an advance-detector
-chain sized for continuous dilemma-zone coverage. Approach direction,
+design speed, extension time, and seed lengths for the decision/advance
+detectors, and editable per-detector rows (spanned lanes, length,
+setback, output offset, phase role) that ITE kinematic math *seeds* with
+defaults — including a single advance detector plus an evenly-spaced
+decision-detector chain sized for continuous indecision-zone coverage.
+Approach direction,
 thru/LT phase, and Base Output may each be baked into the template or
 left as placeholders prompted at placement (output = Base Output +
 per-detector offset). JSON load/save (v1 files upgrade transparently),

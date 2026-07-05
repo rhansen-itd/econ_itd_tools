@@ -10,11 +10,13 @@ model:
 * The template's editable source of truth is its ``detectors`` list of
   `TemplateDetector` rows (kind, spanned lanes, length, setback, output
   offset, phase role). `seed_detectors` fills that list with ITE-kinematic
-  defaults — including a chain of advance detectors sized for *continuous
-  dilemma-zone coverage* from ``extension_time_s`` — but expansion only ever
-  reads what is stored, so a user override (Phase 4.2 grid editor, or the
-  JSON itself) fully replaces the computed value. The math is a smart
-  baseline, never a placement-time constraint.
+  defaults — including a single advance detector plus a chain of decision
+  detectors sized for *continuous coverage of the indecision zone* from
+  ``extension_time_s`` and the seeded ``decision_length_ft`` /
+  ``advance_length_ft`` — but expansion only ever reads what is stored, so a
+  user override (Phase 4.2 grid editor, or the JSON itself) fully replaces
+  the computed value. The math is a smart baseline, never a placement-time
+  constraint.
 * ``direction`` / ``thru_phase`` / ``lt_phase`` / ``base_output`` may each be
   a baked literal **or** a placeholder (``None`` = "prompt at placement",
   resolved from a `PlacementContext`). Output numbering is Base + Offset:
@@ -57,7 +59,9 @@ DIRECTIONS = ("N", "S", "E", "W")
 
 # Detector kinds the seeder generates and the auto-namer knows.
 # `TemplateDetector` accepts other kind strings; they get a generic name.
-DETECTOR_KINDS = ("count", "stop_bar", "dilemma", "advance")
+# (The old "dilemma" kind was renamed to "decision" — ROADMAP Item 17; load
+# migrates it, see template_from_dict.)
+DETECTOR_KINDS = ("count", "stop_bar", "decision", "advance")
 
 # Template fields that may be placeholders: None on the template means
 # "prompt at placement", filled from a PlacementContext; a present value is
@@ -103,7 +107,7 @@ class TemplateDetector:
     fills them with kinematic defaults, and any stored value — hand-edited
     JSON or the Phase 4.2 grid editor — fully replaces the computed one.
     """
-    kind: str  # "count" | "stop_bar" | "dilemma" | "advance" | custom
+    kind: str  # "count" | "stop_bar" | "decision" | "advance" | custom
     spanning_lanes: list[int]  # 0-based lane indices, contiguous, left→right
     length_ft: float  # along travel
     setback_ft: float  # stop bar -> downstream edge, positive upstream
@@ -124,35 +128,50 @@ class TemplateDetector:
         self.phase = _validate_phase(self.phase)
 
 
-# Continuous dilemma-zone coverage (Phase 4.1)
-# --------------------------------------------
-# Advance detection must hold the thru phase continuously from the first
-# advance detector all the way into the dilemma-zone detector: after a
-# vehicle at design speed leaves a detector, the controller carries the call
-# another ``extension_time_s`` (the detection-channel extension / passage
-# gap), during which the vehicle travels v * t_ext. Coverage is continuous
-# when the clear gap between one detector's downstream edge and the next
-# detector's upstream edge never exceeds that carry distance:
+# Continuous indecision-zone coverage (Phase 4.1; taxonomy ROADMAP Item 17)
+# ------------------------------------------------------------------------
+# Detection must hold the thru phase continuously from the single advance
+# detector (at the safe stopping distance) all the way into the stop-bar-side
+# decision detector (at the indecision-zone end): after a vehicle at design
+# speed leaves a detector, the controller carries the call another
+# ``extension_time_s`` (the detection-channel extension / passage gap),
+# during which the vehicle travels v * t_ext. Coverage is continuous when the
+# clear gap between one detector's downstream edge and the next detector's
+# upstream edge never exceeds that carry distance:
 #
 #     gap_max = v * t_ext
 #
-# `advance_setbacks_ft` therefore chains advance detectors downstream from
-# the safe stopping distance at a pitch of (length + v * t_ext) until the
-# remaining gap to the dilemma detector's upstream edge is within gap_max —
-# one detector at low speeds (45 mph needs two at the 1.0 s default).
-# DEFAULT_EXTENSION_TIME_S = 1.0 s is a typical detection-channel extension
-# for advance loops; it's a per-template field (``extension_time_s``), and
-# like every seeded number the resulting setbacks land in editable schema
-# rows rather than being recomputed at placement.
+# `decision_setbacks_ft` therefore fills the corridor between those two
+# detectors with the fewest decision detectors that keep every gap within
+# gap_max, then spaces them *evenly* so the leftover slack is shared across
+# all the gaps rather than dumped into one (45 mph needs one intermediate
+# decision detector at the 1.0 s default). DEFAULT_EXTENSION_TIME_S = 1.0 s
+# is a typical detection-channel extension for advance loops; it's a
+# per-template field (``extension_time_s``), and like every seeded number the
+# resulting setbacks land in editable schema rows rather than being
+# recomputed at placement.
 DEFAULT_EXTENSION_TIME_S = 1.0
+
+# Default detector length (ft, along travel) the seeder gives decision and
+# advance detectors; per-template seeding inputs (ROADMAP Item 18) and the
+# fallback when a template doesn't override them. (The other fixed geometry —
+# count/stop-bar lengths and setbacks — lives in the kinematics block below.)
+DECISION_LENGTH_FT = 20.0
+ADVANCE_LENGTH_FT = 10.0
 
 
 @dataclass
 class ApproachTemplate:
-    schema_version: int = 2
+    schema_version: int = 3
     name: str = "New approach"
     speed_mph: float = 45.0
     extension_time_s: float = DEFAULT_EXTENSION_TIME_S
+    # Seeding inputs: the length (along travel) the seeder gives decision and
+    # advance detectors. Editable before seeding (ROADMAP Item 18) so the
+    # kinematic chain is sized to the intended loop geometry; like every seed
+    # value a stored row overrides them.
+    decision_length_ft: float = DECISION_LENGTH_FT
+    advance_length_ft: float = ADVANCE_LENGTH_FT
     lanes: list[Lane] = field(default_factory=lambda: [Lane("T")])
     count_loops: bool = True  # seeding input: place a count loop per lane
     # Placeholder-able fields (PLACEHOLDER_FIELDS): None = prompt at placement.
@@ -176,6 +195,12 @@ class ApproachTemplate:
         if self.extension_time_s <= 0:
             raise ValueError(f"extension_time_s must be positive, "
                              f"got {self.extension_time_s!r}")
+        if self.decision_length_ft <= 0:
+            raise ValueError(f"decision_length_ft must be positive, "
+                             f"got {self.decision_length_ft!r}")
+        if self.advance_length_ft <= 0:
+            raise ValueError(f"advance_length_ft must be positive, "
+                             f"got {self.advance_length_ft!r}")
         if self.anchor_lane_line is not None and \
                 not 0 <= self.anchor_lane_line <= len(self.lanes):
             raise ValueError(f"anchor_lane_line must be 0..{len(self.lanes)}, "
@@ -209,7 +234,14 @@ def template_to_dict(t: ApproachTemplate) -> dict:
 
 def template_from_dict(d: dict) -> ApproachTemplate:
     lanes = [Lane(**lane) for lane in d.get("lanes", [])]
-    detectors = [TemplateDetector(**row) for row in d.get("detectors", [])]
+
+    def _row(row: dict) -> TemplateDetector:
+        # v2->v3 compat: the "dilemma" kind was renamed to "decision".
+        if row.get("kind") == "dilemma":
+            row = {**row, "kind": "decision"}
+        return TemplateDetector(**row)
+
+    detectors = [_row(row) for row in d.get("detectors", [])]
     # Ignore unknown keys so legacy/foreign templates still load (notably the
     # retired `starting_input`); `schema_version` is not passed through — the
     # in-memory object is always current-schema, upgraded on load.
@@ -304,28 +336,32 @@ def anchor_lane_line_index(template: ApproachTemplate) -> int:
 # and a = 10.0 ft/s^2 comfortable deceleration (~3.0 m/s^2).
 # 45 mph -> 283.8 ft.
 #
-# The dilemma-zone detector's downstream edge sits at the downstream end of
-# the ITE indecision zone — 2.5 s of travel from the stop bar, the point by
-# which ~90% of drivers are committed to proceed:
+# The stop-bar-side decision detector's downstream edge sits at the
+# downstream end of the ITE indecision (dilemma) zone — 2.5 s of travel from
+# the stop bar, the point by which ~90% of drivers are committed to proceed:
 #
 #     d_dz = v * 2.5 s
 #
 # 45 mph -> 165.0 ft.
 #
-# Between those two, `advance_setbacks_ft` chains advance detectors for
-# continuous coverage (see the DEFAULT_EXTENSION_TIME_S block above).
+# Between the advance detector (at SSD) and that stop-bar decision detector,
+# `decision_setbacks_ft` fills in the evenly-spaced intermediate decision
+# detectors needed for continuous coverage (see the DEFAULT_EXTENSION_TIME_S
+# block above).
 #
-# Which rows `seed_detectors` generates (offset order 0, 1, 2, ...):
+# Which rows `seed_detectors` generates (offset order 0, 1, 2, ... = nearest
+# the stop bar first, ROADMAP Item 15):
 #
 # 1. Count loops (if ``count_loops``): 5 ft x lane width per lane, -15 ft.
 # 2. Stop-bar zones: 30 ft x lane width per lane, -5 ft.
-# 3. Dilemma zone (if any thru lane): 20 ft long, spanning from the first
-#    thru lane to the last (any non-thru lane sandwiched between is
-#    spanned too).
-# 4. Advance detectors: 10 ft x lane width per chain setback (upstream row
-#    first), per thru lane whose ``advance_detector`` toggle is on (the
-#    toggle is ignored on turn-only lanes — advance/dilemma detection
-#    extends the thru phase).
+# 3. Decision detectors (if any thru lane): ``decision_length_ft`` long,
+#    spanning from the first thru lane to the last (any non-thru lane
+#    sandwiched between is spanned too). Stop-bar-side row first, then the
+#    evenly-spaced intermediates going upstream.
+# 4. Advance detector (if any thru lane): a single row per thru lane whose
+#    ``advance_detector`` toggle is on, ``advance_length_ft`` long, at the
+#    safe stopping distance (furthest upstream). The toggle is ignored on
+#    turn-only lanes — advance/decision detection extends the thru phase.
 #
 # Phase roles: a lane is "lt" only when its movement is exactly "L"; every
 # other lane (T, R, and shared TR/LT lanes) is "thru".
@@ -335,15 +371,15 @@ FT_PER_S_PER_MPH = 5280.0 / 3600.0
 # ITE kinematic assumptions (see block comment above)
 PERCEPTION_REACTION_TIME_S = 1.0
 COMFORTABLE_DECEL_FT_S2 = 10.0
-DILEMMA_ZONE_END_TRAVEL_TIME_S = 2.5
+DECISION_ZONE_END_TRAVEL_TIME_S = 2.5
 
-# Fixed default detector geometry (ft) — lengths are along travel
+# Fixed default count/stop-bar geometry (ft) — lengths are along travel.
+# (Decision/advance lengths are ApproachTemplate seeding inputs — see
+# DECISION_LENGTH_FT / ADVANCE_LENGTH_FT near the class.)
 COUNT_LOOP_LENGTH_FT = 5.0
 COUNT_LOOP_SETBACK_FT = -15.0
 STOP_BAR_LENGTH_FT = 30.0
 STOP_BAR_SETBACK_FT = -5.0
-DILEMMA_LENGTH_FT = 20.0
-ADVANCE_LENGTH_FT = 10.0
 
 # Approach side -> travel-direction naming prefix (a north approach carries
 # southbound traffic).
@@ -357,34 +393,50 @@ def safe_stopping_distance_ft(speed_mph: float) -> float:
 
 
 def advance_setback_ft(speed_mph: float) -> float:
-    """The first (upstream-most) advance detector sits at the safe stopping
-    distance."""
+    """The single advance detector sits at the safe stopping distance — the
+    furthest-upstream detector in the seeded chain."""
     return safe_stopping_distance_ft(speed_mph)
 
 
-def dilemma_setback_ft(speed_mph: float) -> float:
-    """Downstream end of the indecision zone: 2.5 s of travel."""
-    return speed_mph * FT_PER_S_PER_MPH * DILEMMA_ZONE_END_TRAVEL_TIME_S
+def decision_setback_ft(speed_mph: float) -> float:
+    """Downstream end of the indecision zone: 2.5 s of travel. This is where
+    the stop-bar-side decision detector's downstream edge sits."""
+    return speed_mph * FT_PER_S_PER_MPH * DECISION_ZONE_END_TRAVEL_TIME_S
 
 
-def advance_setbacks_ft(
+def decision_setbacks_ft(
     speed_mph: float,
     extension_time_s: float = DEFAULT_EXTENSION_TIME_S,
-    detector_length_ft: float = ADVANCE_LENGTH_FT,
+    decision_length_ft: float = DECISION_LENGTH_FT,
 ) -> list[float]:
-    """Advance-detector setback chain for continuous dilemma-zone coverage.
+    """Decision-detector setback chain for continuous coverage of the corridor
+    between the single advance detector (at the safe stopping distance) and
+    the stop-bar-side decision detector (at the indecision-zone end).
 
-    Starts at the safe stopping distance and steps downstream by
-    ``detector_length_ft + v * extension_time_s`` (so each clear gap equals
-    the distance the extension carries a call at design speed) until the
-    remaining gap to the dilemma detector's upstream edge is bridged by the
-    extension. Upstream-most first."""
+    Returns setbacks stop-bar-side first (increasing distance from the stop
+    bar); the stop-bar-side decision detector is always element 0. The
+    intermediate detectors are the fewest that keep every clear gap within
+    the extension carry ``v * extension_time_s``, spaced *evenly* so the
+    slack is shared across all gaps (ROADMAP Item 17) rather than left as one
+    uneven gap. Each detector is ``decision_length_ft`` long."""
     v = speed_mph * FT_PER_S_PER_MPH
     hold_ft = v * extension_time_s
-    dz_upstream_edge = dilemma_setback_ft(speed_mph) + DILEMMA_LENGTH_FT
-    setbacks = [safe_stopping_distance_ft(speed_mph)]
-    while setbacks[-1] - dz_upstream_edge > hold_ft:
-        setbacks.append(setbacks[-1] - (detector_length_ft + hold_ft))
+    dz_setback = decision_setback_ft(speed_mph)
+    setbacks = [dz_setback]
+    # Corridor to fill: the stop-bar decision's upstream edge up to the
+    # advance detector's downstream edge (both measured as setbacks).
+    corridor = safe_stopping_distance_ft(speed_mph) \
+        - (dz_setback + decision_length_ft)
+    if corridor > hold_ft:
+        # n = fewest intermediate detectors keeping every gap <= hold:
+        #   (corridor - n*L) / (n+1) <= hold  ->  n >= (corridor-hold)/(L+hold)
+        n = math.ceil((corridor - hold_ft) / (decision_length_ft + hold_ft))
+        gap = (corridor - n * decision_length_ft) / (n + 1)
+        edge = dz_setback + decision_length_ft  # stop-bar decision upstream edge
+        for _ in range(n):
+            edge += gap  # clear gap, then the next detector's downstream edge
+            setbacks.append(edge)
+            edge += decision_length_ft
     return setbacks
 
 
@@ -418,13 +470,20 @@ def seed_detectors(template: ApproachTemplate) -> list[TemplateDetector]:
             lane_phase(lane))
     thru_idx = [i for i, lane in enumerate(lanes) if "T" in lane.movement]
     if thru_idx:
-        add("dilemma", list(range(thru_idx[0], thru_idx[-1] + 1)),
-            DILEMMA_LENGTH_FT, dilemma_setback_ft(template.speed_mph), "thru")
-        for setback in advance_setbacks_ft(template.speed_mph,
-                                           template.extension_time_s):
-            for i in thru_idx:
-                if lanes[i].advance_detector:
-                    add("advance", [i], ADVANCE_LENGTH_FT, setback, "thru")
+        thru_span = list(range(thru_idx[0], thru_idx[-1] + 1))
+        # Decision detectors span the thru lanes, stop-bar-side first, then
+        # the evenly-spaced intermediates going upstream (ROADMAP Item 17).
+        for setback in decision_setbacks_ft(template.speed_mph,
+                                            template.extension_time_s,
+                                            template.decision_length_ft):
+            add("decision", thru_span, template.decision_length_ft, setback,
+                "thru")
+        # A single advance detector per thru lane, furthest upstream, kept
+        # lane-by-lane via the per-lane advance_detector toggle.
+        for i in thru_idx:
+            if lanes[i].advance_detector:
+                add("advance", [i], template.advance_length_ft,
+                    advance_setback_ft(template.speed_mph), "thru")
     return rows
 
 
@@ -435,7 +494,7 @@ def seed_detectors(template: ApproachTemplate) -> list[TemplateDetector]:
 @dataclass
 class DetectorSpec:
     """One detector in the approach-local frame (conventions above)."""
-    kind: str  # "count" | "stop_bar" | "dilemma" | "advance" | custom
+    kind: str  # "count" | "stop_bar" | "decision" | "advance" | custom
     name: str
     output_number: int
     phase: int
@@ -522,8 +581,8 @@ def _base_name(kind: str, prefix: str, label: str, phase: int) -> str:
         return f"{prefix}{label} Count"
     if kind == "stop_bar":
         return f"Ph {phase} {prefix}{label} Stop Bar"
-    if kind == "dilemma":
-        return f"Ph {phase} Dilemma"
+    if kind == "decision":
+        return f"Ph {phase} Decision"
     if kind == "advance":
         return f"Ph {phase} Advance"
     return f"Ph {phase} {prefix}{label} {kind.replace('_', ' ').title()}"

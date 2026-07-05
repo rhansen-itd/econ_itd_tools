@@ -1544,7 +1544,138 @@ Suggested prompt:
   Opus-planned one). ROADMAP.md trimmed at the same time — completed Items
   1–9 and 11 removed (archived here), leaving only Item 10 (webserver).
 
-## Appendix — example template (acceptance case for Session 6)
+- 2026-07-05 — **ROADMAP Items 12 & 13 closed (Sonnet, `gui/app.py`).**
+  Both were toolbar-only fixes, no `model/` changes, so no new pytest
+  coverage was warranted. Item 12: the move-along-centerline button
+  (`move_station_btn`) had `set_enabled` logic gating it on a selected,
+  centerline-attached zone (`refresh_status`, pre-existing from Item 8) but
+  no `set_visibility` call in `update_context_bar`, so it stayed visible
+  under Draw/Background/etc. — just added it alongside the other Edit-only
+  buttons (`rotate_btn`, `delete_btn`). Item 13: swapped the clear-ruler
+  button's icon from `wrong_location` (an old waypoint-marker relic) to
+  `clear` — no ruler-themed "ruler-with-x" icon exists in the project's
+  Material Icons set (no extra icon set like mdi/eva-icons is loaded), so
+  used the documented plain delete/clear fallback.
+
+- 2026-07-05 — **ROADMAP Items 15, 17 & 18 closed (Opus, `model/templates.py`
+  + `gui/templates_ui.py`).** One coherent change to the seeding/expansion
+  taxonomy, done end-to-end.
+  - **Item 17 — dilemma→decision + advance/decision taxonomy.** Renamed the
+    `dilemma` detector kind to `decision` everywhere (`DETECTOR_KINDS`,
+    `_base_name` → "Ph N Decision", the `DILEMMA_*` constants/functions →
+    `DECISION_*` / `decision_setback_ft`, docstrings). Old JSONs that stored
+    the `dilemma` kind migrate on load (`template_from_dict`). Restructured
+    the thru-lane chain: the **single** furthest-upstream detector (at the
+    safe stopping distance) is now the only `advance` detector and keeps the
+    lane-by-lane toggle; everything between it and the stop-bar-side decision
+    detector is a `decision` detector spanning the thru lanes. Replaced the
+    old downstream-stepping `advance_setbacks_ft` with `decision_setbacks_ft`,
+    which computes the *count* of intermediates needed for continuous
+    coverage (fewest keeping every clear gap ≤ `v·t_ext`) and then spaces
+    them **evenly** so the slack is shared across all gaps rather than dumped
+    into one (45 mph/1.0 s: one intermediate, two 39.4 ft gaps instead of
+    66 + 22.8).
+  - **Item 15 — consistent stop-bar order.** Seeding now emits rows in
+    ascending distance from the stop bar (count → stop bar → decision chain
+    stop-bar-side-first → the single furthest advance), so the grid table no
+    longer renders the near-stop-bar advances at the bottom. This falls out
+    of the Item 17 restructure (decision setbacks returned stop-bar-side
+    first, advance appended last) — output offsets follow the same order.
+  - **Item 18 — seed lengths before seeding.** Added `decision_length_ft` /
+    `advance_length_ft` seeding inputs to `ApproachTemplate` (default 20 / 10,
+    the old hardcoded values), threaded into `seed_detectors` and the
+    coverage math, and surfaced as "Decision len (ft)" / "Advance len (ft)"
+    inputs in the template editor's top section (load/seed/collect wired like
+    the existing extension field). Schema bumped v2→v3 (additive, backward
+    compatible: missing keys fall back to the defaults on load).
+  - Tests: rewrote the acceptance/seed/kinematics cases in
+    `tests/test_templates.py` (12 detectors now, not 13), added even-spacing,
+    length-seeding, and kind-migration tests, and fixed the two
+    `tests/test_drawing.py` counts (13→12). Full suite green (370).
+
+- 2026-07-05 — **ROADMAP Item 14 closed (Opus, `gui/app.py`) — zoom freeze
+  / server disconnect on large files.**
+  Investigated end-to-end against the worst realistic case (the default
+  `sites/Banks/banks.iprj`: 2000×4800 / 9.6 MP background, 128 event zones).
+  - **Bottleneck (measured, not guessed).** Ruled out the two obvious
+    suspects: the background is *not* re-encoded per zoom (it's a static
+    temp-file `<img>` scaled by a CSS transform), and the server-side
+    overlay build is cheap — `Viewer.svg()` is 7.8 KB and 0.14 ms on Banks.
+    The real cost was **zoom-event rate**. The wheel handler was the only
+    interaction with no throttle (unlike `mousemove`'s `throttle=0.03`), and
+    every tick did a full server round-trip: `on_wheel` → `apply_transform`
+    → `refresh_overlay` set `ii.content`, which made the browser re-parse the
+    SVG overlay (`interactive_image.updated()` → `innerHTML`) *and*
+    re-composite the scaled 9.6 MP background — every frame. A fast scroll
+    fires 60–120 events/s; that saturates the browser main thread, the
+    missed socket heartbeat drops the connection, and the fit-on-reload
+    (`ui.timer(0.3, fit_view, once=True)`) is what snaps back to the
+    zoomed-out view. "Zooming in too quickly" = event rate, exactly.
+  - **Fix — move the zoom transform client-side.** Added `_WHEEL_ZOOM_JS`, a
+    `js_handler` on the wheel `.on(...)` that reads the live transform matrix
+    (`getComputedStyle`), applies the zoom-at-cursor CSS transform directly
+    to the interactive_image root every tick (GPU-cheap, no content
+    re-parse), and calls NiceGUI's closure `emit` — which stays throttled
+    (`throttle=0.05`) so it can't flood the socket. The emit carries
+    **absolute** viewport state `{scale, tx, ty}` (not deltas), so it's
+    idempotent: dropped/reordered/last-only syncs just adopt the browser's
+    truth. `on_wheel` shrank to "assign `v.viewport`, `apply_transform`,
+    update status" so overlay stroke-widths and the status label catch up at
+    the throttled rate. `js_handler` must stay an inline arrow (it needs the
+    render closure's `emit`; a head-defined global can't see it). Imported
+    `gui/viewport.py`'s existing `MIN_SCALE`/`MAX_SCALE` into the JS clamp so
+    it can't drift from the Python one.
+  - **Why this is robust.** `getComputedStyle` re-reads the matrix each tick,
+    so server-driven pan/fit stay authoritative between gestures; the
+    transform, wheel listener, and `ii.style` all land on the same
+    interactive_image root (Vue attribute fallthrough), so `e.currentTarget`
+    is the element being transformed; `e.offsetX/Y` are the img's
+    untransformed local coords (= image pixels), the same values the old
+    server handler consumed.
+  - **Verified (Playwright, headless Chromium, against Banks).** After fit
+    (scale 0.16), a burst of 400 native wheel events processed in **12 ms**
+    (main thread not frozen), zoom accumulated **losslessly** to the max
+    (status `zoom 0.16x` → `zoom 40.00x`, confirming the throttled emit
+    reached the server), `socket.connected` stayed **true**, zero JS/server
+    errors. Pure `gui/` change (no model logic touched); full pytest suite
+    still green (370). **Resolved by Opus — no Fable escalation.**
+
+- 2026-07-05 — **ROADMAP Items 19 + 20 done (Opus, one session) —
+  place-along-centerline controls + nameable centerlines.** Run together
+  because Item 20's names are what Item 19's per-centerline dropdown labels.
+  - **Root cause of "snaps far too aggressively."** `Viewer.centerline_for`
+    picked the nearest centerline by `|offset|` with **no threshold** — so
+    once *any* centerline existed, *every* template anchor click followed the
+    nearest one however far away it was, with no way to opt out. It wasn't a
+    mis-tuned distance; there was no distance at all.
+  - **Fix (Item 19).** Extracted the nearest-datum selection into a pure,
+    tested model helper `geometry.nearest_centerline(centerlines, pt,
+    max_offset)` (skips `None` datums; `max_offset=None` = old unbounded
+    behavior). `centerline_for` now passes `CENTERLINE_SNAP_FT` (40 ft,
+    module constant in `gui/app.py`) converted to world px via `ft_per_px`;
+    beyond it, placement falls back to the aim-upstream second click. Added
+    an "along CL" **toggle** (`template_follow_centerline`, default on,
+    mirroring the snap switch) to disable following entirely, and a "pick CL"
+    **dropdown** (`template_centerline_idx`, default blank) that pins
+    placement to one specific centerline and **bypasses** the threshold. The
+    three combine in `Viewer.template_target_centerline`: explicit pick wins,
+    else follow→nearest-within-threshold, else None. `template_status`
+    reflects all three states.
+  - **Item 20.** Added a session-only `CenterlineController.name` (empty =
+    unnamed) and `Viewer.centerline_label(i)` (name or `C{n}` fallback). A
+    "name" input in the Centerline context bar renames the active centerline;
+    the label flows to the active-centerline selector, the Item 19 dropdown,
+    and the placement notification. Not persisted — the `.iprj` Lineals have
+    nowhere to carry it (consistent with the attachment-derivation approach).
+  - **Model-purity note.** The one piece of new math (nearest-within-
+    threshold) lives in `model/geometry.py` and is unit-tested
+    (`test_geometry.py`: smallest-offset pick, `None`-entry skipping,
+    `max_offset` boundary). The rest is GUI wiring. Verified headless:
+    `template_target_centerline` returns the right centerline/None across all
+    toggle+dropdown combinations against `sites/Banks/banks.iprj`, the page
+    builds and serves (HTTP 200, no errors), full pytest suite green (373).
+
+## Appendix — example template (acceptance case, revised for Items 15/17/18)
 
 45 mph approach, lanes `12' L | 12' T | 12' T | 12' R`, count loops, starting
 input 33, lane-by-lane advance detectors, north approach (SB traffic),
@@ -1560,10 +1691,15 @@ phase 4 thru / phase 7 LT:
 | 38 | Ph 4 SBT Stop Bar 1 | 30 | 12 | -5 |
 | 39 | Ph 4 SBT Stop Bar 2 | 30 | 12 | -5 |
 | 40 | Ph 4 SBR Stop Bar | 30 | 12 | -5 |
-| 41 | Ph 4 Dilemma | 20 | 24 (across thru lanes) | ~100 (ITE kinematic) |
-| 42 | Ph 4 Advance 1 | 10 | 12 | ~200 (ITE kinematic) |
-| 43 | Ph 4 Advance 2 | 10 | 12 | ~200 (ITE kinematic) |
+| 41 | Ph 4 Decision 1 | 20 | 24 (across thru lanes) | 165.0 (ITE kinematic) |
+| 42 | Ph 4 Decision 2 | 20 | 24 (across thru lanes) | 224.4 (even-spaced infill) |
+| 43 | Ph 4 Advance 1 | 10 | 12 | 283.8 (safe stopping distance) |
+| 44 | Ph 4 Advance 2 | 10 | 12 | 283.8 (safe stopping distance) |
 
-Distances for dilemma/advance are placeholders — compute from ITE kinematics
-at the template's design speed. (Session 6.2's documented formulas give
-165.0 ft dilemma / 283.8 ft advance at 45 mph — see the decisions log.)
+Distances are computed from ITE kinematics at the template's design speed.
+At 45 mph / 1.0 s extension: the stop-bar-side decision detector sits at
+165.0 ft (2.5 s indecision-zone end), the single advance detector at 283.8 ft
+(safe stopping distance), and one evenly-spaced intermediate decision detector
+bridges the corridor at 224.4 ft (two 39.4 ft gaps). Decision and advance
+lengths default to 20 / 10 ft but are template seeding inputs (Item 18). See
+the decisions log for the Item 15/17/18 revision.

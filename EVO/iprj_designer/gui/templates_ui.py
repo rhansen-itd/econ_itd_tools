@@ -1,10 +1,10 @@
 """iprj Designer — approach-template editor (Session 6.1, Phase 4.2 grid).
 
 NiceGUI form for creating/editing approach-template JSON files
-(model/templates.py): name, design speed, extension time, lane
-configuration, detector toggles, base output, approach direction, thru/LT
-phase. Direction/phase/base-output fields left blank are saved as
-placeholders (prompted at placement — Phase 4.3).
+(model/templates.py): name, design speed, extension time, decision/advance
+detector seed lengths, lane configuration, detector toggles, base output,
+approach direction, thru/LT phase. Direction/phase/base-output fields left
+blank are saved as placeholders (prompted at placement — Phase 4.3).
 
 Phase 4.2 adds a Detectors grid below the lane list: one CSS Grid whose
 columns are the template's physical lanes, so each detector row's editable
@@ -140,6 +140,8 @@ def build_ui(template: ApproachTemplate, path: Path | None) -> None:
             temp = ApproachTemplate(
                 lanes=current_lanes(), speed_mph=float(speed.value or 0),
                 extension_time_s=float(extension.value or 1.0),
+                decision_length_ft=float(decision_length.value or 0),
+                advance_length_ft=float(advance_length.value or 0),
                 count_loops=bool(count_loops.value))
         except ValueError as e:
             ui.notify(f"fix the lanes/speed first: {e}", type="negative")
@@ -258,6 +260,8 @@ def build_ui(template: ApproachTemplate, path: Path | None) -> None:
         name.value = t.name
         speed.value = t.speed_mph
         extension.value = t.extension_time_s
+        decision_length.value = t.decision_length_ft
+        advance_length.value = t.advance_length_ft
         direction.value = t.direction
         count_loops.value = t.count_loops
         base_output.value = t.base_output
@@ -281,6 +285,8 @@ def build_ui(template: ApproachTemplate, path: Path | None) -> None:
             name=name.value or "New approach",
             speed_mph=float(speed.value or 0),
             extension_time_s=float(extension.value or 1.0),
+            decision_length_ft=float(decision_length.value or 0),
+            advance_length_ft=float(advance_length.value or 0),
             lanes=lanes,
             count_loops=bool(count_loops.value),
             base_output=opt_int(base_output),
@@ -368,6 +374,16 @@ def build_ui(template: ApproachTemplate, path: Path | None) -> None:
             with extension:
                 ui.tooltip("detection-channel extension assumed when seeding "
                            "the continuous-coverage advance chain")
+            decision_length = ui.number("Decision len (ft)", min=0.1, step=1,
+                                        precision=1).classes("w-32")
+            with decision_length:
+                ui.tooltip("length the seeder gives decision detectors "
+                           "(the indecision-zone chain); set before seeding")
+            advance_length = ui.number("Advance len (ft)", min=0.1, step=1,
+                                       precision=1).classes("w-32")
+            with advance_length:
+                ui.tooltip("length the seeder gives the advance detector; "
+                           "set before seeding")
             direction = ui.select(list(DIRECTIONS),
                                   label="Approach direction") \
                 .classes("w-40").props("clearable")

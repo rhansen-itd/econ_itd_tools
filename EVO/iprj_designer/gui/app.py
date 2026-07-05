@@ -125,8 +125,10 @@ the "placement values" button). Then click the anchor reference point
 (where the stop bar crosses the template's anchor lane line — by default
 the line between the exclusive left-turn lanes and the thru lanes). With a
 centerline drawn, that one click places the whole detector set along the
-nearest centerline (live preview under the cursor); with no centerline,
-click again to aim upstream and place along that straight line.
+nearest centerline within a snap threshold (~40 ft laterally, Item 19); with
+no centerline near (or the "along CL" toggle off), click again to aim
+upstream and place along that straight line. The "pick CL" dropdown pins
+placement to one specific centerline instead, bypassing the threshold.
 Centerline-placed zones stay attached: reshaping the centerline re-stations
 them. The .iprj cannot store the attachment itself, so reopening a project
 re-derives it — zones that are still exact station/offset rectangles on a
@@ -135,9 +137,12 @@ centerline re-attach automatically (a notification reports how many).
 Centerline tool: pick the active centerline from its selector (or add a new
 one for another approach), then click along it starting at the stop bar
 (station 0) and continuing upstream; click-drag repositions a vertex, x/Del
-removes the selected one. The status/position readouts show live station +
-offset while the tool is active. All centerlines in the project render at
-once; only the active one is editable.
+removes the selected one. Name the active centerline in the "name" box
+(Item 20; session-only, e.g. N_CL for the north approach) — the name shows
+in every centerline picker, including the template "pick CL" dropdown. The
+status/position readouts show live station + offset while the tool is
+active. All centerlines in the project render at once; only the active one
+is editable.
 """
 
 from __future__ import annotations
@@ -167,7 +172,7 @@ from gui.drawing import (ARROWS, DIM_OFF, IGNORE_KIND, LINEAL_KIND, LOOP_KIND,
                          NUDGE_FT, CenterlineController, DrawingController,
                          derive_attachments, element_points, insert_zone,
                          is_placeholder, next_output_number)
-from gui.viewport import Viewport
+from gui.viewport import MAX_SCALE, MIN_SCALE, Viewport
 from model import domain, geometry, units
 from model.centerline import (load_centerlines, load_lineals,
                               save_centerlines, save_lineals)
@@ -186,6 +191,15 @@ TEMPLATES_DIR = Path(__file__).resolve().parents[1] / "templates"
 
 PHASE_COLORS = ["#d62728", "#1f77b4", "#2ca02c", "#ff7f0e", "#9467bd",
                 "#8c564b", "#e377c2", "#bcbd22", "#17becf"]
+
+# How far (feet, laterally) the template anchor click may sit from a
+# centerline and still snap "along" it (Item 19). The old behavior had no
+# threshold — any click followed the nearest centerline however far away —
+# which made snapping overwhelmingly strong. One approach's worth of lanes
+# is a generous but bounded reach; beyond it, placement falls back to the
+# aim-upstream click. Only consulted for the auto/nearest path; an explicitly
+# picked centerline (the toolbar dropdown) ignores it.
+CENTERLINE_SNAP_FT = 40.0
 
 # Draw sub-types (PHASE3_UI_PLAN §4.1) shown in the Draw tool's context bar.
 DRAW_KINDS = {"Event Zone": LOOP_KIND, "Ignore Zone": IGNORE_KIND, "Lineal": LINEAL_KIND}
@@ -355,6 +369,13 @@ class Viewer:
         # model.templates.PlacementContext). Reset whenever the template
         # selection changes; edited via the "placement values" dialog.
         self.template_context = PlacementContext()
+        # Item 19: whether template placement follows a centerline at all, and
+        # optionally which one. follow=True + idx=None is the default (snap to
+        # the nearest centerline within CENTERLINE_SNAP_FT of the anchor,
+        # else aim-upstream); follow=False forces aim-upstream; a non-None idx
+        # pins placement to that specific centerline (no nearest/threshold).
+        self.template_follow_centerline = True
+        self.template_centerline_idx: int | None = None
         # approach centerlines (Session 7.2 draw/edit, Session 7.4
         # persistence): one CenterlineController per centerline found in the
         # project's Lineals, plus a fresh empty one ready to draw if there
@@ -422,19 +443,37 @@ class Viewer:
         self.active_cli = len(self.centerlines) - 1
         return self.active_cli
 
+    def centerline_label(self, i: int) -> str:
+        """Display name for centerline *i* — its session name (Item 20) or
+        the positional C{n} fallback."""
+        return self.centerlines[i].name or f"C{i + 1}"
+
     def centerline_for(self, p) -> CenterlineController | None:
         """The drawn centerline nearest world point *p* (smallest |offset|
-        of its projection) — the datum template placement follows — or None
-        when no controller has a usable (≥2 distinct points) datum yet."""
-        best, best_off = None, None
-        for ctrl in self.centerlines:
-            c = ctrl.current()
-            if c is None:
-                continue
-            off = abs(c.project(p)[1])
-            if best_off is None or off < best_off:
-                best, best_off = ctrl, off
-        return best
+        of its projection) *within CENTERLINE_SNAP_FT laterally* — the datum
+        template placement snaps to — or None when none qualifies (no usable
+        datum yet, or all of them are farther than the threshold). Item 19
+        added the threshold; before it any click followed the nearest datum
+        however far away."""
+        fpp = self.ft_per_px()
+        max_off = None if fpp is None else CENTERLINE_SNAP_FT / fpp
+        datums = [ctrl.current() for ctrl in self.centerlines]
+        i = geometry.nearest_centerline(datums, p, max_off)
+        return None if i is None else self.centerlines[i]
+
+    def template_target_centerline(self, p) -> CenterlineController | None:
+        """Which centerline (if any) template placement should follow for an
+        anchor click at world point *p*, honoring the Item 19 toolbar state:
+        an explicitly picked centerline pins placement (no threshold); else,
+        when following is on, the nearest within CENTERLINE_SNAP_FT; else
+        None (aim-upstream placement)."""
+        idx = self.template_centerline_idx
+        if idx is not None and 0 <= idx < len(self.centerlines):
+            ctrl = self.centerlines[idx]
+            return ctrl if ctrl.current() is not None else None
+        if not self.template_follow_centerline:
+            return None
+        return self.centerline_for(p)
 
     def reproject_attachments(self) -> None:
         """After a manual zone edit: let every centerline re-derive its
@@ -498,10 +537,18 @@ class Viewer:
             return (f"mode: template | {self.template.name} | fill in "
                      f"placement values ({', '.join(missing)}) above before "
                      "placing")
-        if any(cl.current() is not None for cl in self.centerlines):
+        idx = self.template_centerline_idx
+        if idx is not None and 0 <= idx < len(self.centerlines) \
+                and self.centerlines[idx].current() is not None:
             return (f"mode: template | {self.template.name} | click the "
                     "anchor point (stop bar at the LT/thru lane line) — "
-                    "detectors follow the nearest centerline")
+                    f"detectors follow {self.centerline_label(idx)}")
+        if self.template_follow_centerline \
+                and any(cl.current() is not None for cl in self.centerlines):
+            return (f"mode: template | {self.template.name} | click the "
+                    "anchor point (stop bar at the LT/thru lane line) — "
+                    "detectors follow the nearest centerline within "
+                    f"{CENTERLINE_SNAP_FT:.0f} ft, else aim upstream")
         if self.template_ref is None:
             return (f"mode: template | {self.template.name} | click the "
                     "anchor point (stop bar at the LT/thru lane line)")
@@ -680,7 +727,10 @@ class Viewer:
         # (single click places); otherwise the legacy ref-then-aim flow.
         if self.mode == "Template" and self.template is not None:
             cursor = self.template_cursor
-            cl_ctrl = self.centerline_for(cursor) if cursor is not None else None
+            # mirror place_template's target so the preview matches what the
+            # click will actually do (Item 19 toggle/pick/threshold state)
+            cl_ctrl = (self.template_target_centerline(cursor)
+                       if cursor is not None else None)
             placed = []
             fpp = self.ft_per_px()
             if cl_ctrl is not None:
@@ -721,6 +771,42 @@ class Viewer:
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
+
+# Client-side wheel-zoom (Item 14). The freeze on large-background/many-loop
+# files was a per-event server round-trip: every wheel tick re-ran the Python
+# handler, re-sent the whole SVG overlay, and — the expensive part — made the
+# browser re-parse that overlay (interactive_image.updated() → innerHTML) and
+# re-composite the scaled 9.6 MP background. Unthrottled, a fast scroll fires
+# 60–120 events/s and saturates the browser main thread; the missed socket
+# heartbeat drops the connection, and the fit-on-reload snaps back to the
+# zoomed-out view. Doing the CSS transform in JS makes zooming a GPU-cheap
+# local update with no content re-parse, and the (throttled) emit only syncs
+# *absolute* viewport state so the server can refresh overlay stroke-widths
+# and the status label. Absolute state (not deltas) keeps it idempotent: a
+# dropped or reordered sync just means last-write-wins, never lost zoom.
+# `emit` is captured from NiceGUI's event closure, so this must stay an inline
+# arrow (a head-defined global couldn't see `emit`). getComputedStyle re-reads
+# the live matrix each tick, so server-driven pan/fit stay authoritative
+# between gestures. e.offsetX/Y are the img's untransformed local coords
+# (= image pixels), exactly what the old server handler consumed.
+_WHEEL_ZOOM_JS = f"""(e) => {{
+  const el = e.currentTarget;
+  const cs = getComputedStyle(el).transform;
+  let s = 1, tx = 0, ty = 0;
+  if (cs && cs !== 'none') {{
+    const m = cs.match(/matrix\\(([^)]+)\\)/);
+    if (m) {{ const p = m[1].split(',').map(Number); s = p[0]; tx = p[4]; ty = p[5]; }}
+  }}
+  const ns = Math.min({MAX_SCALE}, Math.max({MIN_SCALE}, s * Math.pow(0.9, e.deltaY / 100)));
+  const k = ns / s;
+  tx += s * e.offsetX * (1 - k);
+  ty += s * e.offsetY * (1 - k);
+  s = ns;
+  el.style.transformOrigin = '0 0';
+  el.style.transform = `translate(${{tx}}px, ${{ty}}px) scale(${{s}})`;
+  emit({{scale: s, tx: tx, ty: ty}});
+}}"""
+
 
 def build_ui(viewer: Viewer, state: dict) -> None:
     v = viewer
@@ -1135,17 +1221,27 @@ def build_ui(viewer: Viewer, state: dict) -> None:
 
     # -- centerlines ---------------------------------------------------------
 
+    def centerline_options() -> dict:
+        return {i: v.centerline_label(i) for i in range(len(v.centerlines))}
+
     def update_centerline_options():
-        centerline_sel.set_options(
-            {i: f"C{i + 1}" for i in range(len(v.centerlines))},
-            value=v.active_cli)
+        centerline_sel.set_options(centerline_options(), value=v.active_cli)
+        centerline_name_in.value = v.centerline_ctrl.name
+        update_template_centerline_options()  # Item 19 dropdown uses the names
 
     def change_active_centerline(e):
         if e.value is None or e.value == v.active_cli:
             return
         v.set_active_centerline(e.value)
+        centerline_name_in.value = v.centerline_ctrl.name
         refresh_overlay()
         refresh_status()
+
+    def rename_centerline(e):
+        """Item 20: session-only rename of the active centerline; refreshes
+        every picker that shows centerline labels."""
+        v.centerline_ctrl.name = (e.value or "").strip()
+        update_centerline_options()
 
     def add_centerline():
         v.add_centerline()
@@ -1153,7 +1249,29 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         tool.value = "Centerline"
         refresh_overlay()
         refresh_status()
-        ui.notify(f"C{len(v.centerlines)} ready — click the stop bar to start it")
+        ui.notify(f"{v.centerline_label(len(v.centerlines) - 1)} ready — "
+                  "click the stop bar to start it")
+
+    # -- template placement along centerlines (Item 19) ----------------------
+
+    def update_template_centerline_options():
+        """Options for the "along" dropdown: only centerlines with a usable
+        datum (a specific pick bypasses the nearest/threshold logic, so an
+        empty one would be a dead choice). Preserves the current pick when it
+        still resolves; otherwise clears back to auto/nearest."""
+        opts = {i: v.centerline_label(i) for i in range(len(v.centerlines))
+                if v.centerlines[i].current() is not None}
+        keep = v.template_centerline_idx if v.template_centerline_idx in opts else None
+        v.template_centerline_idx = keep
+        template_cl_sel.set_options(opts, value=keep)
+
+    def toggle_template_follow(e):
+        v.template_follow_centerline = bool(e.value)
+        refresh_status()
+
+    def change_template_centerline(e):
+        v.template_centerline_idx = e.value  # int index, or None for auto/nearest
+        refresh_status()
 
     # -- template placement ------------------------------------------------------
 
@@ -1242,7 +1360,7 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             refresh_overlay()
             refresh_status()
             return
-        cl_ctrl = v.centerline_for(pw)
+        cl_ctrl = v.template_target_centerline(pw)
         try:
             if cl_ctrl is not None:
                 # curvilinear (Session 7.5): the click is the anchor reference;
@@ -1280,7 +1398,7 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         v.template_cursor = None
         refresh_overlay()
         refresh_status()
-        along = (f" along C{v.centerlines.index(cl_ctrl) + 1}"
+        along = (f" along {v.centerline_label(v.centerlines.index(cl_ctrl))}"
                  if cl_ctrl is not None else "")
         ui.notify(f"placed {len(placed)} detectors from {v.template.name}{along} "
                   f"(outputs {placed[0].spec.output_number}-"
@@ -1880,7 +1998,7 @@ def build_ui(viewer: Viewer, state: dict) -> None:
                 edit_placement_values(auto=False)
                 return
             pw = units.image_to_world(v.bg, p)
-            if v.centerline_for(pw) is not None:
+            if v.template_target_centerline(pw) is not None:
                 place_template(pw)  # curvilinear: one click, no aim needed
             elif v.template_ref is None:
                 v.template_ref = pw
@@ -2116,6 +2234,7 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         select_count_label.set_visibility(v.mode == "Edit")
         properties_btn.set_visibility(v.mode == "Edit")
         rotate_btn.set_visibility(v.mode == "Edit")
+        move_station_btn.set_visibility(v.mode == "Edit")
         delete_btn.set_visibility(v.mode == "Edit")
         calibrate_size_btn.set_visibility(v.mode == "Background")
         upload_bg_btn.set_visibility(v.mode == "Background")
@@ -2123,12 +2242,27 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         template_values_btn.set_visibility(
             v.mode == "Template" and v.template is not None)
         template_editor_btn.set_visibility(v.mode == "Template")
+        template_follow_switch.set_visibility(v.mode == "Template")
+        template_cl_sel.set_visibility(v.mode == "Template")
+        if v.mode == "Template":  # refresh which centerlines are pickable
+            update_template_centerline_options()
         centerline_sel.set_visibility(v.mode == "Centerline")
         add_centerline_btn.set_visibility(v.mode == "Centerline")
+        centerline_name_in.set_visibility(v.mode == "Centerline")
 
     def on_wheel(e):
-        factor = 0.9 ** (e.args["deltaY"] / 100.0)
-        v.viewport.zoom_at((e.args["offsetX"], e.args["offsetY"]), factor)
+        # The visual zoom already happened client-side (_WHEEL_ZOOM_JS); this
+        # throttled sync just adopts the browser's absolute viewport so the
+        # overlay stroke-widths and status label catch up. apply_transform
+        # re-asserts the same transform on ii.style, keeping the server's
+        # known style consistent with the DOM for the next Vue re-render.
+        a = e.args
+        try:
+            v.viewport.scale = min(MAX_SCALE, max(MIN_SCALE, float(a["scale"])))
+            v.viewport.tx = float(a["tx"])
+            v.viewport.ty = float(a["ty"])
+        except (KeyError, TypeError, ValueError):
+            return
         apply_transform()
         scale_label.set_text(status_scale())
 
@@ -2176,7 +2310,7 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         with ruler_btn:
             ui.tooltip("ruler (r) — measures distance in any tool, "
                        "independent of the active tool")
-        with ui.button(icon="wrong_location", on_click=clear_ruler) \
+        with ui.button(icon="clear", on_click=clear_ruler) \
                 .props("flat dense"):
             ui.tooltip("clear ruler")
         ui.space()
@@ -2277,15 +2411,35 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             icon="edit_square", on_click=open_template_editor).props("flat dense")
         with template_editor_btn:
             ui.tooltip("open the template editor (new tab)")
+        template_follow_switch = ui.switch(
+            "along CL", value=v.template_follow_centerline,
+            on_change=toggle_template_follow).props("dense")
+        with template_follow_switch:
+            ui.tooltip(f"place along the nearest centerline within "
+                       f"{CENTERLINE_SNAP_FT:.0f} ft of the anchor click; "
+                       "off = always aim upstream with a second click")
+        template_cl_sel = ui.select(
+            {}, label="pick CL", on_change=change_template_centerline) \
+            .classes("w-28").props("dense clearable")
+        with template_cl_sel:
+            ui.tooltip("place along one specific centerline instead of the "
+                       "nearest (blank = nearest); ignores the distance "
+                       "threshold")
 
         centerline_sel = ui.select(
-            {i: f"C{i + 1}" for i in range(len(v.centerlines))},
+            centerline_options(),
             value=v.active_cli, label="centerline",
             on_change=change_active_centerline).classes("w-28").props("dense")
         add_centerline_btn = ui.button(icon="add_road", on_click=add_centerline) \
             .props("flat dense")
         with add_centerline_btn:
             ui.tooltip("add a new centerline (another approach)")
+        centerline_name_in = ui.input(
+            "name", value=v.centerline_ctrl.name,
+            on_change=rename_centerline).classes("w-32").props("dense clearable")
+        with centerline_name_in:
+            ui.tooltip("session-only name for this centerline (e.g. N_CL for "
+                       "the north approach); shown in the centerline pickers")
 
     update_context_bar()
 
@@ -2304,7 +2458,10 @@ def build_ui(viewer: Viewer, state: dict) -> None:
                   throttle=0.03)
             ii.on("mouseup", on_up, ["offsetX", "offsetY"])
             ii.on("dblclick", on_dblclick, ["offsetX", "offsetY"])
-            ii.on("wheel.prevent", on_wheel, ["deltaY", "offsetX", "offsetY"])
+            # js_handler zooms locally every tick; the emit (throttled, so it
+            # can't flood the socket) syncs absolute viewport state to on_wheel.
+            ii.on("wheel.prevent", on_wheel, args=None,
+                  js_handler=_WHEEL_ZOOM_JS, throttle=0.05)
         with ui.column().classes("w-96 px-1 overflow-y-auto") \
                 .style("height: calc(100vh - 120px);") as zone_panel:
             zone_table = ui.table(

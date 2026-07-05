@@ -894,7 +894,7 @@ def _corner_candidates(p: Point, datum, tol: float) -> list[tuple[float, float]]
     """All (station, offset) readings of *p*, one per datum segment whose
     reading ``locate`` confirms. ``project`` alone returns only the globally
     nearest reading, which is the wrong one for a corner on the concave
-    side of a bend (e.g. a dilemma zone straddling the vertex)."""
+    side of a bend (e.g. a decision zone straddling the vertex)."""
     cands = []
     pts, stations = datum.points, datum.stations
     for i in range(len(pts) - 1):
@@ -999,6 +999,10 @@ class CenterlineController:
 
     def __init__(self, ft_per_px: Callable[[], float | None]):
         self.ft_per_px = ft_per_px
+        # Session-only display name (Item 20) — e.g. "N_CL" for the north
+        # approach. Empty means "unnamed"; the GUI falls back to C{n}. Not
+        # persisted (the .iprj Lineals have nowhere to carry it).
+        self.name: str = ""
         self.points: list[Point] = []
         self.cursor: Point | None = None
         self.selected: int = -1
