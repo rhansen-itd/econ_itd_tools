@@ -112,3 +112,49 @@ def test_guard_sees_chains_written_by_save_centerlines():
     # nothing merged: still exactly one centerline, no strays
     assert load_centerlines(project) == [[(0.0, 0.0), (50.0, 0.0), (100.0, 0.0)]]
     assert load_lineals(project) == []
+
+
+# ---------------------------------------------------------------------------
+# Band ownership (ROADMAP Item 21)
+# ---------------------------------------------------------------------------
+
+from model.bands import Owner  # noqa: E402
+from model.centerline import load_lineals_owned, save_lineals_owned  # noqa: E402
+
+
+def _full():
+    return [placeholder() for _ in range(100)]
+
+
+def test_save_lineals_owned_places_in_bands():
+    project = Project(lineals=_full())
+    strays = [
+        (Owner.GENERAL, Lineal(enable=1, point_0=(1.0, 1.0), point_1=(2.0, 2.0))),
+        (Owner.FILE1, Lineal(enable=1, point_0=(3.0, 3.0), point_1=(4.0, 4.0))),
+        (Owner.FILE2, Lineal(enable=1, point_0=(5.0, 5.0), point_1=(6.0, 6.0))),
+    ]
+    assert save_lineals_owned(project, strays) == []
+    assert project.lineals[0].point_0 == (1.0, 1.0)
+    assert project.lineals[20].point_0 == (3.0, 3.0)
+    assert project.lineals[60].point_0 == (5.0, 5.0)
+
+
+def test_load_lineals_owned_infers_band():
+    project = Project(lineals=_full())
+    project.lineals[25] = Lineal(enable=1, point_0=(3.0, 3.0), point_1=(4.0, 4.0))
+    project.lineals[70] = Lineal(enable=1, point_0=(5.0, 5.0), point_1=(6.0, 6.0))
+    owned = load_lineals_owned(project)
+    assert [(o, l.point_0) for o, l in owned] == [
+        (Owner.FILE1, (3.0, 3.0)), (Owner.FILE2, (5.0, 5.0))]
+
+
+def test_owned_strays_survive_the_file(tmp_path):
+    from model.iprj_io import load_iprj, save_iprj
+    project = Project(lineals=_full())
+    save_lineals_owned(project, [
+        (Owner.FILE1, Lineal(enable=1, point_0=(3.0, 3.0), point_1=(4.0, 4.0)))])
+    path = tmp_path / "owned_strays.iprj"
+    save_iprj(project, path)
+    owned = load_lineals_owned(load_iprj(path))
+    assert [(o, l.point_0, l.point_1) for o, l in owned] == [
+        (Owner.FILE1, (3.0, 3.0), (4.0, 4.0))]

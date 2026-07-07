@@ -80,10 +80,11 @@ upload button to replace the current project's image in place.
 
 Keys: d Draw · e Edit · t Template · c Centerline · s Sensor ·
 r ruler (toggle, any tool) · (within Draw) z Event Zone · l Lineal ·
-i Ignore Zone · g snap · u / Ctrl-Z undo · Esc cancel · digits + Enter
-dimension entry (Event Zone/Ignore) · n/b cycle selection · arrows nudge ·
-x/Del delete · Shift-click toggles a zone in/out of the selection ·
-Ctrl-drag copies the selected zone · p / double-click zone properties ·
+i Ignore Zone · a Text Label · g snap · u / Ctrl-Z undo · Esc cancel ·
+digits + Enter dimension entry (Event Zone/Ignore) · n/b cycle selection ·
+arrows nudge · x/Del delete · Shift-click toggles a zone in/out of the
+selection · Ctrl-drag copies the selected zone · p / double-click properties
+(zone or text label) ·
 v insert vertex (single selection, Edit tool) · f fit view · Ctrl-S save.
 Free-draw Event Zone/Ignore polygons take any number of corners; finish
 with Enter or a double-click (ROADMAP Item 7).
@@ -100,10 +101,17 @@ selection; use Delete/Move/Rotate for group edits. `v` inserts a vertex
 into the single selected element, on the edge nearest the cursor.
 
 Draw tool: the sub-type toggle (context bar) picks what a click places —
-Event Zone, Ignore Zone, or Lineal (generic 2-point reference line). Event
-Zone and Ignore Zone are 4-click/dimensioned polygons; Lineal is a 2-click
-segment. The sub-type also retargets Edit — pick Ignore Zone or Lineal in
-Draw to then select/edit that kind's elements.
+Event Zone, Ignore Zone, Lineal (generic 2-point reference line), or Text
+Label (a single-click point label). Event Zone and Ignore Zone are
+4-click/dimensioned polygons; Lineal is a 2-click segment; Text Label commits
+on one click. The sub-type also retargets Edit — pick another kind in Draw to
+then select/edit that kind's elements. For the owned kinds (Lineal, Text
+Label) and centerlines, a General/Active-sensor toggle (ROADMAP Item 22)
+chooses the vendor index band the element is saved into, so it travels to the
+right file on the 2-file split. Text Label draw mode also shows an inline
+editor bar (text / size / color / B·I·U / rotation) whose current values are
+what a click places — the draft ghosts at the cursor before you click; the
+properties dialog edits a placed label the same way.
 
 Background tool: click two reference points then enter the known distance
 between them (2-point calibration), or use the context bar's calibrate
@@ -154,6 +162,7 @@ import base64
 import io
 import math
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -168,16 +177,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from nicegui import ui
 
-from gui.drawing import (ARROWS, DIM_OFF, IGNORE_KIND, LINEAL_KIND, LOOP_KIND,
-                         NUDGE_FT, CenterlineController, DrawingController,
-                         derive_attachments, element_points, insert_zone,
-                         is_placeholder, next_output_number)
+from gui.drawing import (ARROWS, DIM_OFF, IGNORE_KIND, LABEL_KIND, LINEAL_KIND,
+                         LOOP_KIND, NUDGE_FT, CenterlineController,
+                         DrawingController, derive_attachments, element_owner,
+                         element_points, insert_zone, is_placeholder,
+                         next_output_number, set_element_owner)
 from gui.viewport import MAX_SCALE, MIN_SCALE, Viewport
 from model import domain, geometry, units
-from model.centerline import (load_centerlines, load_lineals,
-                              save_centerlines, save_lineals)
+from model.bands import Owner, sensor_owner
+from model.centerline import (load_centerlines_owned, load_lineals_owned,
+                              save_centerlines_owned, save_lineals_owned)
+from model.labels import (load_labels_owned, match_name_labels,
+                          save_labels_owned)
 from model.iprj_io import (Background, Condition, EventZone, Project, Sensor,
-                           load_iprj, save_iprj)
+                           TextLabel, load_iprj, save_iprj)
 from model.multifile import (MAX_SENSORS, BackgroundMismatch,
                              check_background_match, is_multifile,
                              is_valid_pair, merge_pair, pair_paths,
@@ -202,7 +215,13 @@ PHASE_COLORS = ["#d62728", "#1f77b4", "#2ca02c", "#ff7f0e", "#9467bd",
 CENTERLINE_SNAP_FT = 40.0
 
 # Draw sub-types (PHASE3_UI_PLAN §4.1) shown in the Draw tool's context bar.
-DRAW_KINDS = {"Event Zone": LOOP_KIND, "Ignore Zone": IGNORE_KIND, "Lineal": LINEAL_KIND}
+# "Text Label" is the ROADMAP Item 22 point entity.
+DRAW_KINDS = {"Event Zone": LOOP_KIND, "Ignore Zone": IGNORE_KIND,
+              "Lineal": LINEAL_KIND, "Text Label": LABEL_KIND}
+
+# Which draw sub-types are band-owned project-wide pools (route to a sensor
+# file by index band) rather than a sensor's own zone list (ROADMAP Item 22).
+OWNED_KINDS = {"Lineal", "Text Label"}
 
 # Vendor-confirmed ZoneType names (see model/domain.py): 0 Motion,
 # 1 Presence, 2 Sidewalk.
@@ -356,8 +375,28 @@ class Viewer:
         self.ruler_pending = False
         # Generic (non-chain) Lineals: a project-wide pool the Lineal draw
         # kind targets, round-tripped via model/centerline.py's
-        # load_lineals/save_lineals (PHASE3_UI_PLAN §4.3).
-        self.lineals: list = load_lineals(project)
+        # load_lineals/save_lineals (PHASE3_UI_PLAN §4.3). Each carries its
+        # band Owner as a transient `_owner` (ROADMAP Item 22).
+        self.lineals: list = []
+        for owner, lin in load_lineals_owned(project):
+            set_element_owner(lin, owner)
+            self.lineals.append(lin)
+        # Text labels (ROADMAP Item 22): the same working-pool model as
+        # lineals — enabled TextLabels, owner-tagged, saved back into bands.
+        self.labels: list = []
+        for owner, lbl in load_labels_owned(project):
+            set_element_owner(lbl, owner)
+            self.labels.append(lbl)
+        # Ownership assignment for newly drawn owned annotations (lineals /
+        # labels / centerlines): when True they go to the GENERAL band (both
+        # files); when False they follow the active sensor's file band
+        # (S1/S2 -> _1_2, S3/S4 -> _3_4). Defaults to General, matching
+        # Item 21's "everything defaults to the general band".
+        self.assign_general = True
+        # Draft text label edited in the Draw-mode editor bar (ROADMAP Item 22
+        # follow-up): a click in Text Label draw mode places a copy of this,
+        # anchored at the click. The bar's controls write its fields live.
+        self.label_draft: TextLabel = domain.new_label((0.0, 0.0), "Label")
         # px per SVG unit shrinks as we zoom in; keep overlay strokes readable
         self.overlay_px = 2.0
         # template placement (Session 6.3): ref click -> aim click -> place
@@ -381,19 +420,27 @@ class Viewer:
         # project's Lineals, plus a fresh empty one ready to draw if there
         # were none; active_cli picks which is currently editable.
         self.centerlines: list[CenterlineController] = []
-        for pts in load_centerlines(project):
+        for owner, pts in load_centerlines_owned(project):
             ctrl = CenterlineController(self.ft_per_px)
             ctrl.points = list(pts)
+            ctrl.owner = owner
             self.centerlines.append(ctrl)
         if not self.centerlines:
             self.centerlines.append(CenterlineController(self.ft_per_px))
         self.active_cli = 0
+        # Re-derive each centerline's name from a no-rotation label sitting at
+        # its far end (ROADMAP Item 22) — the .iprj carries no association tag,
+        # the way derive_attachments reconstructs zone/centerline links. The
+        # adopted label becomes that centerline's managed name_label.
+        self._derive_centerline_names()
         # drawing/editing operates on the active sensor's zones
         if not project.sensors:
             project.sensors.append(Sensor())
         self.active_si = 0
         self.ctrl = DrawingController(self.draw_zones(),
-                                      self.ft_per_px, self.next_output)
+                                      self.ft_per_px, self.next_output,
+                                      owner_supplier=self.current_owner,
+                                      label_draft=lambda: self.label_draft)
         # self.mode defaults to "Edit" (ctrl.mode "edit"); a ui.toggle's on_change
         # fires only on a user-driven change, never for its initial value,
         # so the controller needs this nudge to start in step with the tool.
@@ -412,13 +459,21 @@ class Viewer:
 
     def draw_zones(self) -> list:
         """The element list the active draw kind/Edit targets: the active
-        sensor's event zones or ignore zones, or the project-wide lineal
-        pool (PHASE3_UI_PLAN §4.1, §6.1 — one kind/list at a time)."""
+        sensor's event zones or ignore zones, or the project-wide lineal or
+        text-label pool (PHASE3_UI_PLAN §4.1, §6.1 — one kind/list at a time)."""
         if self.draw_kind_name == "Event Zone":
             return self.active_zones()
         if self.draw_kind_name == "Ignore Zone":
             return self.project.sensors[self.active_si].ignore_zones
+        if self.draw_kind_name == "Text Label":
+            return self.labels
         return self.lineals
+
+    def current_owner(self) -> Owner:
+        """The band Owner a newly drawn owned annotation gets (ROADMAP
+        Item 22): GENERAL when 'assign to General' is on, else the active
+        sensor's file band."""
+        return Owner.GENERAL if self.assign_general else sensor_owner(self.active_si)
 
     def set_active_sensor(self, si: int) -> None:
         self.active_si = si
@@ -439,7 +494,9 @@ class Viewer:
         self.active_cli = ci
 
     def add_centerline(self) -> int:
-        self.centerlines.append(CenterlineController(self.ft_per_px))
+        ctrl = CenterlineController(self.ft_per_px)
+        ctrl.owner = self.current_owner()
+        self.centerlines.append(ctrl)
         self.active_cli = len(self.centerlines) - 1
         return self.active_cli
 
@@ -447,6 +504,57 @@ class Viewer:
         """Display name for centerline *i* — its session name (Item 20) or
         the positional C{n} fallback."""
         return self.centerlines[i].name or f"C{i + 1}"
+
+    # -- centerline-name labels (ROADMAP Item 22) ---------------------------
+
+    def _label_index(self, lbl) -> int:
+        """Index of *lbl* in the label pool by identity (TextLabel is an
+        eq-comparing dataclass, so `in`/`index` would match a twin)."""
+        for i, x in enumerate(self.labels):
+            if x is lbl:
+                return i
+        return -1
+
+    def _derive_centerline_names(self) -> None:
+        """On load: adopt a no-rotation label at each centerline's far end as
+        that centerline's managed name label, and take its text as the name —
+        the geometric re-link the .iprj can't persist (cf.
+        `derive_attachments`)."""
+        far_ends = [cl.far_end() for cl in self.centerlines]
+        for ci, li in match_name_labels(far_ends, self.labels).items():
+            cl, lbl = self.centerlines[ci], self.labels[li]
+            cl.name = (lbl.text or "").strip()
+            cl.name_label = lbl
+
+    def sync_centerline_labels(self) -> None:
+        """Keep every centerline's managed name label in step with its name,
+        far end, and owner band (ROADMAP Item 22) — create it when a named
+        centerline first has geometry, move it to the far end as the shape
+        changes, and drop it when the name is cleared."""
+        for cl in self.centerlines:
+            self._sync_one_centerline_label(cl)
+
+    def _sync_one_centerline_label(self, cl: CenterlineController) -> None:
+        lbl = cl.name_label
+        if lbl is not None and self._label_index(lbl) == -1:
+            lbl = cl.name_label = None  # user deleted it from the pool
+        name = (cl.name or "").strip()
+        end = cl.far_end()
+        if not name or end is None:
+            if lbl is not None:
+                idx = self._label_index(lbl)
+                if idx != -1:
+                    self.labels.pop(idx)
+                cl.name_label = None
+            return
+        if lbl is None:
+            lbl = domain.new_label(end, name)
+            cl.name_label = lbl
+            self.labels.append(lbl)
+        lbl.text = name
+        lbl.position_x, lbl.position_y = float(end[0]), float(end[1])
+        lbl.rotation_angle = 0.0
+        set_element_owner(lbl, cl.owner)
 
     def centerline_for(self, p) -> CenterlineController | None:
         """The drawn centerline nearest world point *p* (smallest |offset|
@@ -628,6 +736,42 @@ class Viewer:
             parts.append(f'<line x1="{pts[0][0]:.1f}" y1="{pts[0][1]:.1f}" '
                          f'x2="{pts[1][0]:.1f}" y2="{pts[1][1]:.1f}" '
                          f'stroke="{color}" stroke-width="{width:.2f}"/>')
+        # text labels (§ ROADMAP Item 22): a point-anchored, styled <text>.
+        # Font size tracks the label's FontSize but stays screen-relative so
+        # it reads at any zoom (fs 12 ≈ the zone-name label size, 7*lw).
+        def label_text_svg(lbl, x, y, *, fill=None, opacity=1.0) -> str:
+            lfs = max((lbl.font_size or 12) * lw / 2.0, 1.0)
+            color = fill or (f"rgb({lbl.textcolor_red or 0},"
+                             f"{lbl.textcolor_green or 0},{lbl.textcolor_blue or 0})")
+            style = [f'font-size="{lfs:.1f}"', f'fill="{color}"',
+                     'text-anchor="middle"', 'dominant-baseline="middle"',
+                     'paint-order="stroke"', 'stroke="black"',
+                     f'stroke-width="{lfs / 8:.2f}"']
+            if opacity < 1.0:
+                style.append(f'opacity="{opacity:.2f}"')
+            if lbl.font_bold:
+                style.append('font-weight="bold"')
+            if lbl.font_italic:
+                style.append('font-style="italic"')
+            if lbl.font_underline:
+                style.append('text-decoration="underline"')
+            transform = (f' transform="rotate({-(lbl.rotation_angle or 0):.1f} '
+                         f'{x:.1f} {y:.1f})"' if lbl.rotation_angle else '')
+            return (f'<text x="{x:.1f}" y="{y:.1f}" {" ".join(style)}'
+                    f'{transform}>{escape(lbl.text or "")}</text>')
+
+        lbl_targeted = is_draw_target(self.labels)
+        for li, lbl in enumerate(self.labels):
+            if not self.show_labels or not lbl.enable:
+                continue
+            x, y = w2i((lbl.position_x, lbl.position_y))
+            selected = lbl_targeted and li in self.ctrl.selection
+            if selected:
+                r = max((lbl.font_size or 12) * lw / 2.0, 1.0) * 0.75
+                parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{r:.1f}" '
+                             f'fill="none" stroke="white" stroke-width="{lw}"/>')
+            parts.append(label_text_svg(lbl, x, y,
+                                        fill="white" if selected else None))
         for ci, cl in enumerate(self.centerlines):
             cl_pts = [w2i(p) for p in cl.points]
             active = ci == self.active_cli
@@ -718,6 +862,13 @@ class Viewer:
         for wp in self.ctrl.pending:
             x, y = w2i(wp)
             parts.append(_cross(x, y, 4 * lw, "#00e5ff", lw))
+        # Text Label draw mode: ghost the draft label at the cursor so the
+        # user sees exactly what a click will place (ROADMAP Item 22 follow-up).
+        if self.mode == "Draw" and self.draw_kind_name == "Text Label" \
+                and self.ctrl.cursor is not None and (self.label_draft.text or "").strip():
+            x, y = w2i(self.ctrl.cursor)
+            parts.append(_cross(x, y, 4 * lw, "#00e5ff", lw))
+            parts.append(label_text_svg(self.label_draft, x, y, opacity=0.55))
         if self.ctrl.snap_indicator is not None:
             x, y = w2i(self.ctrl.snap_indicator)
             parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{4 * lw:.1f}" '
@@ -1030,6 +1181,83 @@ def build_ui(viewer: Viewer, state: dict) -> None:
                 ui.button("Cancel", on_click=dialog.close)
         dialog.open()
 
+    # -- text-label properties (ROADMAP Item 22) --------------------------------
+
+    def _hex_to_rgb(value: str) -> tuple[int, int, int]:
+        """Parse a '#rrggbb' (or 'rgb(r,g,b)') color into 0–255 ints; falls
+        back to white on anything unexpected from the color picker."""
+        s = (value or "").strip()
+        try:
+            if s.startswith("#") and len(s) >= 7:
+                return int(s[1:3], 16), int(s[3:5], 16), int(s[5:7], 16)
+            if s.startswith("rgb"):
+                nums = [int(float(n)) for n in re.findall(r"[\d.]+", s)[:3]]
+                if len(nums) == 3:
+                    return nums[0], nums[1], nums[2]
+        except ValueError:
+            pass
+        return 255, 255, 255
+
+    def label_properties():
+        if v.mode != "Edit" or v.draw_kind_name != "Text Label":
+            ui.notify("select a text label in the Edit tool first", type="warning")
+            return
+        if len(v.ctrl.selection) != 1:
+            ui.notify("select exactly one text label for properties", type="warning")
+            return
+        li = v.ctrl.selected
+        if not (0 <= li < len(v.labels)):
+            ui.notify("select a text label first", type="warning")
+            return
+        lbl = v.labels[li]
+        hexcolor = "#%02x%02x%02x" % (lbl.textcolor_red or 0,
+                                      lbl.textcolor_green or 0,
+                                      lbl.textcolor_blue or 0)
+        owner_opts = {Owner.GENERAL: "General (both files)",
+                      Owner.FILE1: "S1/2 (_1_2)", Owner.FILE2: "S3/4 (_3_4)"}
+        with ui.dialog() as dialog, ui.card().style("min-width: 420px"):
+            ui.label("Text label properties").classes("text-lg")
+            text_in = ui.input("Text", value=lbl.text or "").classes("w-full")
+            with ui.row().classes("items-center"):
+                size_in = ui.number("Font size", value=lbl.font_size or 12,
+                                    min=1, precision=0).classes("w-24")
+                rot_in = ui.number("Rotation°", value=lbl.rotation_angle or 0.0,
+                                   precision=1).classes("w-24")
+                color_in = ui.color_input("Color", value=hexcolor).classes("w-40")
+            with ui.row().classes("items-center gap-4"):
+                bold_cb = ui.checkbox("Bold", value=bool(lbl.font_bold))
+                italic_cb = ui.checkbox("Italic", value=bool(lbl.font_italic))
+                underline_cb = ui.checkbox("Underline", value=bool(lbl.font_underline))
+            owner_sel = ui.select(owner_opts, value=element_owner(lbl),
+                                  label="Belongs to").classes("w-56")
+
+            def apply():
+                lbl.text = text_in.value or ""
+                lbl.font_size = int(size_in.value or 12)
+                lbl.rotation_angle = float(rot_in.value or 0.0)
+                r, g, b = _hex_to_rgb(color_in.value)
+                lbl.textcolor_red, lbl.textcolor_green, lbl.textcolor_blue = r, g, b
+                lbl.font_bold = int(bold_cb.value)
+                lbl.font_italic = int(italic_cb.value)
+                lbl.font_underline = int(underline_cb.value)
+                set_element_owner(lbl, owner_sel.value)
+                dialog.close()
+                refresh_overlay()
+                refresh_status()
+
+            with ui.row():
+                ui.button("Apply", on_click=apply)
+                ui.button("Cancel", on_click=dialog.close)
+        dialog.open()
+
+    def open_properties():
+        """Route the Properties action (p / Enter / double-click / button) to
+        the dialog for the active Edit sub-type (ROADMAP Item 22)."""
+        if v.mode == "Edit" and v.draw_kind_name == "Text Label":
+            label_properties()
+        else:
+            zone_properties()
+
     # -- move along centerline (Item 8) -----------------------------------------
 
     def attached_centerline_for(zone) -> CenterlineController | None:
@@ -1140,6 +1368,7 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             return
         cancel_rotate()  # retarget clears the controller's selection
         v.set_active_sensor(e.value)
+        update_owner_hint()  # "Active sensor" band tracks the active sensor
         refresh_overlay()
         refresh_status()
 
@@ -1238,10 +1467,13 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         refresh_status()
 
     def rename_centerline(e):
-        """Item 20: session-only rename of the active centerline; refreshes
-        every picker that shows centerline labels."""
+        """Item 20: rename the active centerline; refreshes every picker that
+        shows centerline labels. Item 22: the name persists as a no-rotation
+        label at the far end, so re-sync the managed name label and redraw."""
         v.centerline_ctrl.name = (e.value or "").strip()
+        v.sync_centerline_labels()
         update_centerline_options()
+        refresh_overlay()
 
     def add_centerline():
         v.add_centerline()
@@ -1410,13 +1642,24 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         """path is always the _1_2 target for a multi-file (3-4 sensor)
         project — the single-file path otherwise (Item 9 §6)."""
         v.project.date = time.strftime("%Y_%m_%d_%H:%M:%S")
-        save_centerlines(v.project, [cl.points for cl in v.centerlines])
+        # refresh centerline-name labels (position/text/owner) before they are
+        # written out with the rest of the label pool (ROADMAP Item 22)
+        v.sync_centerline_labels()
+        save_centerlines_owned(
+            v.project, [(cl.owner, cl.points) for cl in v.centerlines])
         # after save_centerlines, so the endpoint-coincidence guard sees the
         # final chain vertices (model/centerline.py's save_lineals docstring)
-        skipped = save_lineals(v.project, v.lineals)
+        skipped = save_lineals_owned(
+            v.project, [(element_owner(l), l) for l in v.lineals])
         if skipped:
             ui.notify(f"{len(skipped)} lineal(s) not saved — they touch a "
-                      "centerline or another lineal's endpoint", type="warning")
+                      "centerline or another lineal's endpoint, or their band "
+                      "is full", type="warning")
+        label_skipped = save_labels_owned(
+            v.project, [(element_owner(l), l) for l in v.labels])
+        if label_skipped:
+            ui.notify(f"{len(label_skipped)} text label(s) not saved — their "
+                      "index band is full", type="warning")
         if not is_multifile(v.project):
             save_iprj(v.project, path)
             v.source = path
@@ -2033,8 +2276,10 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         elif v.mode == "Draw":
             dragging = bool(e.args.get("buttons", 0) & 1)
             v.ctrl.mouse_move(pw, dragging)
-            # only redraw while something tracks the mouse
-            if v.ctrl.pending or dragging or v.ctrl.snap_enabled:
+            # only redraw while something tracks the mouse — including the
+            # Text Label draft ghost, which follows the cursor (Item 22)
+            if v.ctrl.pending or dragging or v.ctrl.snap_enabled \
+                    or v.draw_kind_name == "Text Label":
                 refresh_overlay()
         elif v.mode == "Edit" and v.rotate_armed:
             if v.rotate_pivot is not None:
@@ -2095,13 +2340,14 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             refresh_status()
         elif v.mode == "Centerline":
             v.centerline_ctrl.mouse_up(pw)
+            v.sync_centerline_labels()  # name label follows the far end (Item 22)
             refresh_overlay()
             refresh_status()
 
     def on_dblclick(e):
         # the two mousedowns already selected the zone under the cursor
         if v.mode == "Edit":
-            zone_properties()
+            open_properties()
         elif v.mode == "Draw" and v.ctrl.finish_polygon():
             notify_ctrl_warning()
             refresh_overlay()
@@ -2117,7 +2363,8 @@ def build_ui(viewer: Viewer, state: dict) -> None:
     # the Edit-tool insert-vertex action.
     TOOL_KEYS = {"d": "Draw", "e": "Edit",
                 "t": "Template", "c": "Centerline", "s": "Sensor"}
-    DRAW_SUBTYPE_KEYS = {"z": "Event Zone", "l": "Lineal", "i": "Ignore Zone"}
+    DRAW_SUBTYPE_KEYS = {"z": "Event Zone", "l": "Lineal", "i": "Ignore Zone",
+                         "a": "Text Label"}
 
     async def on_key(e):
         name = e.key.name
@@ -2149,7 +2396,7 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             return
         if name in ("p", "Enter") and v.mode == "Edit" \
                 and v.ctrl.dim_stage == DIM_OFF:
-            zone_properties()
+            open_properties()
             return
         if name == "Escape" and v.rotate_armed:
             cancel_rotate()
@@ -2175,6 +2422,7 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             refresh_overlay()
             refresh_status()
         elif v.mode == "Centerline" and v.centerline_ctrl.key(name, e.modifiers.ctrl):
+            v.sync_centerline_labels()  # delete/undo may move the far end (Item 22)
             refresh_overlay()
             refresh_status()
         elif v.mode == "Sensor" and name in ARROWS:
@@ -2206,8 +2454,46 @@ def build_ui(viewer: Viewer, state: dict) -> None:
     def change_draw_kind(e):
         cancel_rotate()  # retarget clears the controller's selection
         v.set_draw_kind(e.value)
+        update_context_bar()  # ownership control only shows for owned kinds
         refresh_overlay()
         refresh_status()
+
+    _OWNER_BAND_TEXT = {Owner.GENERAL: "→ both files",
+                        Owner.FILE1: "→ S1/2 (_1_2)",
+                        Owner.FILE2: "→ S3/4 (_3_4)"}
+
+    def owner_controls_visible() -> bool:
+        return ((v.mode == "Draw" and v.draw_kind_name in OWNED_KINDS)
+                or v.mode == "Centerline")
+
+    def update_owner_hint():
+        owner_hint_label.set_text(_OWNER_BAND_TEXT[v.current_owner()])
+
+    def change_assign_owner(e):
+        """ROADMAP Item 22: toggle new owned annotations between the GENERAL
+        band and the active sensor's file band. In Centerline mode it also
+        re-bands the active centerline (and its name label) live."""
+        v.assign_general = (e.value == "General")
+        if v.mode == "Centerline":
+            v.centerline_ctrl.owner = v.current_owner()
+            v.sync_centerline_labels()
+        update_owner_hint()
+        refresh_overlay()
+
+    def read_label_draft(*_):
+        """Draw-mode editor bar -> v.label_draft (ROADMAP Item 22 follow-up):
+        a click in Text Label draw mode places a copy of this. Redraws so the
+        cursor preview tracks the edited text/styling."""
+        d = v.label_draft
+        d.text = label_draft_text.value or ""
+        d.font_size = int(label_draft_size.value or 12)
+        d.rotation_angle = float(label_draft_rot.value or 0.0)
+        d.textcolor_red, d.textcolor_green, d.textcolor_blue = \
+            _hex_to_rgb(label_draft_color.value)
+        d.font_bold = int(label_draft_bold.value)
+        d.font_italic = int(label_draft_italic.value)
+        d.font_underline = int(label_draft_underline.value)
+        refresh_overlay()
 
     def set_ruler_active(on: bool):
         v.ruler_active = on
@@ -2249,6 +2535,12 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         centerline_sel.set_visibility(v.mode == "Centerline")
         add_centerline_btn.set_visibility(v.mode == "Centerline")
         centerline_name_in.set_visibility(v.mode == "Centerline")
+        assign_toggle.set_visibility(owner_controls_visible())
+        owner_hint_label.set_visibility(owner_controls_visible())
+        update_owner_hint()
+        drafting = v.mode == "Draw" and v.draw_kind_name == "Text Label"
+        for _w in label_draft_widgets:
+            _w.set_visibility(drafting)
 
     def on_wheel(e):
         # The visual zoom already happened client-side (_WHEEL_ZOOM_JS); this
@@ -2354,19 +2646,59 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             ui.tooltip("delete active sensor (x / Del) — prompts to reassign "
                        "or delete its zones")
 
-        draw_kind_toggle = ui.toggle(["Event Zone", "Ignore Zone", "Lineal"],
-                                     value="Event Zone",
-                                     on_change=change_draw_kind).props("dense")
+        draw_kind_toggle = ui.toggle(
+            ["Event Zone", "Ignore Zone", "Lineal", "Text Label"],
+            value="Event Zone",
+            on_change=change_draw_kind).props("dense")
         with draw_kind_toggle:
-            ui.tooltip("draw sub-type: z Event Zone · l Lineal · i Ignore Zone — "
-                       "also picks what Edit operates on")
+            ui.tooltip("draw sub-type: z Event Zone · l Lineal · i Ignore Zone "
+                       "· a Text Label — also picks what Edit operates on")
+
+        # Ownership assignment (ROADMAP Item 22): which file band a newly drawn
+        # lineal / text label / centerline lands in. General -> both files;
+        # Active sensor -> the active sensor's file (S1/2 -> _1_2, S3/4 -> _3_4).
+        assign_toggle = ui.toggle(
+            ["General", "Active sensor"],
+            value="General" if v.assign_general else "Active sensor",
+            on_change=change_assign_owner).props("dense")
+        with assign_toggle:
+            ui.tooltip("which file a new lineal/label/centerline belongs to: "
+                       "General = both files; Active sensor = the active "
+                       "sensor's file (S1/2 → _1_2, S3/4 → _3_4)")
+        owner_hint_label = ui.label("").classes("text-white font-mono text-xs")
+
+        # Text Label draw-time editor bar (ROADMAP Item 22 follow-up): the same
+        # fields as the properties dialog, inline; a click places a copy of
+        # this draft. Widgets write v.label_draft live via read_label_draft.
+        d0 = v.label_draft
+        label_draft_text = ui.input("label text", value=d0.text or "") \
+            .classes("w-40").props("dense")
+        with label_draft_text:
+            ui.tooltip("text placed on the next click (Text Label draw mode)")
+        label_draft_size = ui.number("size", value=d0.font_size or 12, min=1,
+                                     precision=0).classes("w-16").props("dense")
+        label_draft_rot = ui.number("rot°", value=d0.rotation_angle or 0.0,
+                                    precision=1).classes("w-16").props("dense")
+        label_draft_color = ui.color_input(
+            "color", value="#%02x%02x%02x" % (d0.textcolor_red or 0,
+                                              d0.textcolor_green or 0,
+                                              d0.textcolor_blue or 0)) \
+            .classes("w-28").props("dense")
+        label_draft_bold = ui.checkbox("B", value=bool(d0.font_bold)).props("dense")
+        label_draft_italic = ui.checkbox("I", value=bool(d0.font_italic)).props("dense")
+        label_draft_underline = ui.checkbox("U", value=bool(d0.font_underline)).props("dense")
+        label_draft_widgets = [label_draft_text, label_draft_size, label_draft_rot,
+                               label_draft_color, label_draft_bold,
+                               label_draft_italic, label_draft_underline]
+        for _w in label_draft_widgets:
+            _w.on_value_change(read_label_draft)
 
         select_count_label = ui.label("").classes("text-white font-mono")
-        properties_btn = ui.button(icon="tune", on_click=lambda: zone_properties()) \
+        properties_btn = ui.button(icon="tune", on_click=lambda: open_properties()) \
             .props("flat dense")
         with properties_btn:
-            ui.tooltip("zone properties (p / Enter / double-click) — "
-                       "single selection only")
+            ui.tooltip("properties (p / Enter / double-click) — zone or text "
+                       "label, single selection only")
         rotate_btn = ui.button(icon="rotate_right", on_click=start_rotate) \
             .props("flat dense")
         with rotate_btn:
@@ -2438,8 +2770,9 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             "name", value=v.centerline_ctrl.name,
             on_change=rename_centerline).classes("w-32").props("dense clearable")
         with centerline_name_in:
-            ui.tooltip("session-only name for this centerline (e.g. N_CL for "
-                       "the north approach); shown in the centerline pickers")
+            ui.tooltip("name for this centerline (e.g. N_CL for the north "
+                       "approach); shown in the pickers and saved as a label "
+                       "at the far end")
 
     update_context_bar()
 

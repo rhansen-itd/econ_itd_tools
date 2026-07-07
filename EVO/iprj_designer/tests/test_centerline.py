@@ -250,3 +250,59 @@ def test_file_roundtrip_full_precision(tmp_path):
     path = tmp_path / "centerline.iprj"
     save_iprj(project, path)
     assert load_centerlines(load_iprj(path)) == [pts]
+
+
+# ---------------------------------------------------------------------------
+# Band ownership (ROADMAP Item 21)
+# ---------------------------------------------------------------------------
+
+from model.bands import Owner  # noqa: E402
+from model.centerline import (  # noqa: E402
+    load_centerlines_owned,
+    save_centerlines_owned,
+)
+
+
+def test_save_centerlines_owned_places_each_in_its_band():
+    project = Project(lineals=[placeholder() for _ in range(100)])
+    skipped = save_centerlines_owned(project, [
+        (Owner.GENERAL, POINTS),  # 3 segments -> 0,1,2
+        (Owner.FILE1, CROSS),     # 3 segments -> 20,21,22
+        (Owner.FILE2, POINTS),    # 3 segments -> 60,61,62
+    ])
+    assert skipped == []
+    assert [l.enable for l in project.lineals[0:3]] == [1, 1, 1]
+    assert [l.enable for l in project.lineals[20:23]] == [1, 1, 1]
+    assert [l.enable for l in project.lineals[60:63]] == [1, 1, 1]
+    # nothing bled into the gaps between bands
+    assert all(not l.enable for l in project.lineals[3:20])
+    assert all(not l.enable for l in project.lineals[23:60])
+
+
+def test_load_centerlines_owned_infers_band():
+    project = Project(lineals=[placeholder() for _ in range(100)])
+    save_centerlines_owned(project, [(Owner.FILE2, POINTS), (Owner.GENERAL, CROSS)])
+    owned = load_centerlines_owned(project)
+    # file order: GENERAL chain (idx 0) before FILE2 chain (idx 60)
+    assert owned == [(Owner.GENERAL, CROSS), (Owner.FILE2, POINTS)]
+
+
+def test_owned_centerlines_survive_the_file(tmp_path):
+    project = Project(lineals=[placeholder() for _ in range(100)])
+    save_centerlines_owned(project, [(Owner.FILE1, POINTS), (Owner.FILE2, CROSS)])
+    path = tmp_path / "banded.iprj"
+    save_iprj(project, path)
+    assert load_centerlines_owned(load_iprj(path)) == [
+        (Owner.FILE1, POINTS), (Owner.FILE2, CROSS)]
+
+
+def test_centerline_overflowing_its_band_is_skipped():
+    # A 21-segment centerline can't fit the 20-slot GENERAL band.
+    big = [(float(i), 0.0) for i in range(22)]  # 22 points -> 21 segments
+    project = Project(lineals=[placeholder() for _ in range(100)])
+    skipped = save_centerlines_owned(project, [(Owner.GENERAL, big)])
+    assert skipped == [big]
+    assert load_centerlines_owned(project) == []
+    # the same centerline fits a 40-slot FILE band
+    assert save_centerlines_owned(project, [(Owner.FILE1, big)]) == []
+    assert load_centerlines_owned(project) == [(Owner.FILE1, big)]

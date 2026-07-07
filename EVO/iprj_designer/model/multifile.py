@@ -29,7 +29,9 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from .iprj_io import Background, Project, Sensor
+from .bands import FILE1_BAND, FILE2_BAND, GENERAL_BAND, Owner, owner_of_index
+from .iprj_io import Background, Lineal, Project, Sensor, TextLabel
+from .labels import DISABLED_POSITION
 from .units import (
     background_image_size,
     decode_background_image,
@@ -37,6 +39,67 @@ from .units import (
 )
 
 MAX_SENSORS = 4  # vendor cap of 2 sensors/file x 2 files
+
+
+# ---------------------------------------------------------------------------
+# Band-scoped annotation helpers (ROADMAP Item 21)
+# ---------------------------------------------------------------------------
+
+def _blank_lineal_slot() -> Lineal:
+    return Lineal(enable=0, point_0=(0.0, 0.0), point_1=(0.0, 0.0))
+
+
+def _blank_label_slot() -> TextLabel:
+    return TextLabel(enable=0, text="",
+                     position_x=DISABLED_POSITION, position_y=DISABLED_POSITION)
+
+
+def _blank_band(slots: list, band: range, placeholder) -> None:
+    """Reset every slot of *band* that exists in *slots* to a fresh
+    placeholder (in place)."""
+    for i in band:
+        if i < len(slots):
+            slots[i] = placeholder()
+
+
+def _copy_blanked(slots: list, band: range, placeholder) -> list:
+    """Deep copy *slots* with *band* blanked to placeholders."""
+    out = copy.deepcopy(list(slots))
+    _blank_band(out, band, placeholder)
+    return out
+
+
+def _combine_bands(primary: list, secondary: list, placeholder) -> list:
+    """Recombine two split annotation arrays: the FILE2 band comes from the
+    *secondary* (_3_4) file, everything else (GENERAL + FILE1) from the
+    *primary* (_1_2) file, mirroring the split. Missing slots are
+    placeholders, so length differences degrade cleanly."""
+    n = max(len(primary), len(secondary))
+    out = []
+    for i in range(n):
+        src = secondary if owner_of_index(i) == Owner.FILE2 else primary
+        out.append(copy.deepcopy(src[i]) if i < len(src) else placeholder())
+    return out
+
+
+def _enabled_in_band(slots: list, band: range) -> list:
+    return [slots[i] for i in band if i < len(slots) and slots[i].enable]
+
+
+def general_blocks_match(primary: Project, secondary: Project) -> bool:
+    """Whether the GENERAL band (indices 0–19) of both lineals and text
+    labels agrees between the two files of a pair (ROADMAP Item 21).
+
+    A clean split duplicates the general block into both files, so they are
+    identical; a mismatch means one file's general annotations were edited
+    independently in the vendor software. `merge_pair` keeps the primary's
+    regardless — this is the soft-warn signal the GUI surfaces (cf.
+    `check_background_match`). Compares enabled entries only, so a
+    placeholder-padded array still matches an unpadded one."""
+    return (_enabled_in_band(primary.lineals, GENERAL_BAND)
+            == _enabled_in_band(secondary.lineals, GENERAL_BAND)
+            and _enabled_in_band(primary.text_labels, GENERAL_BAND)
+            == _enabled_in_band(secondary.text_labels, GENERAL_BAND))
 
 _PAIR_RE = re.compile(r"^(.*)_(1_2|3_4)$")  # on the stem
 
@@ -204,14 +267,19 @@ def split_project(project: Project) -> tuple[Project, Project | None]:
     """One in-memory Project -> (primary, secondary) for the two-file save.
 
     secondary is None when <=2 sensors (today's single-file behavior; the
-    primary is then the whole project unchanged). Otherwise:
+    primary is then the whole project unchanged). Otherwise annotations
+    (lineals + text labels) split by index band (ROADMAP Item 21):
 
-    - primary  = sensors[0:2] + every project-wide field (background,
-      lineals, text_labels, extra, date/version/product_code),
-    - secondary = sensors[2:4] + a deep copy of the background only, so the
-      _3_4 file is a self-contained vendor file. date/version/product_code
-      are mirrored so the pair looks alike to the vendor; merge_pair takes
-      the primary's anyway.
+    - primary  = sensors[0:2] + project extra/metadata + the GENERAL (0–19)
+      and FILE1 (20–59) annotation bands (the FILE2 band, 60–99, blanked),
+    - secondary = sensors[2:4] + a deep copy of the background + the GENERAL
+      (0–19) and FILE2 (60–99) annotation bands (the FILE1 band blanked).
+
+    The GENERAL band is duplicated into **both** files; each file's FILE band
+    holds only that pair's sensor annotations. `project.extra` (Zoomfaktor,
+    plot prefs) stays with the primary. date/version/product_code are
+    mirrored so the pair looks alike to the vendor; merge_pair takes the
+    primary's anyway.
 
     save_iprj enumerates the sensor list, so the secondary's sensors come out
     as Radarsensor_0/1 with no index rewriting; OutputNumbers are untouched.
@@ -227,10 +295,14 @@ def split_project(project: Project) -> tuple[Project, Project | None]:
     secondary = Project(
         background=copy.deepcopy(primary.background),
         sensors=primary.sensors[2:n],  # already fresh copies
+        lineals=_copy_blanked(project.lineals, FILE1_BAND, _blank_lineal_slot),
+        text_labels=_copy_blanked(project.text_labels, FILE1_BAND, _blank_label_slot),
         date=primary.date,
         version=primary.version,
         product_code=primary.product_code,
     )
+    _blank_band(primary.lineals, FILE2_BAND, _blank_lineal_slot)
+    _blank_band(primary.text_labels, FILE2_BAND, _blank_label_slot)
     primary.sensors = primary.sensors[:2]
     return primary, secondary
 
@@ -239,9 +311,12 @@ def merge_pair(primary: Project, secondary: Project, *,
                allow_soft: bool = False) -> Project:
     """(_1_2 project, _3_4 project) -> one Project with sensors [p0,p1,s0,s1].
 
-    Project-wide fields (background, lineals, text labels, extra, metadata)
-    come from the primary; the secondary contributes only its sensors — its
-    background is just the pairing duplicate.
+    Background, extra, and metadata come from the primary; the secondary
+    contributes its sensors and its FILE2 annotation band (indices 60–99).
+    Annotations recombine by band (ROADMAP Item 21): GENERAL (0–19) + FILE1
+    (20–59) from the primary, FILE2 from the secondary. The primary's GENERAL
+    block wins silently even if the two disagree — call `general_blocks_match`
+    for the soft-warn signal (the GUI does, cf. `check_background_match`).
 
     Raises BackgroundMismatch on a check_background_match hard fail, and on
     the soft-warn (same geometry, different pixels) case too unless
@@ -264,4 +339,8 @@ def merge_pair(primary: Project, secondary: Project, *,
     merged = copy.deepcopy(primary)
     merged.sensors = (merged.sensors[:n_primary]
                       + copy.deepcopy(secondary.sensors[:n_secondary]))
+    merged.lineals = _combine_bands(
+        primary.lineals, secondary.lineals, _blank_lineal_slot)
+    merged.text_labels = _combine_bands(
+        primary.text_labels, secondary.text_labels, _blank_label_slot)
     return merged

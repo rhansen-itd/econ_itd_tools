@@ -1718,6 +1718,119 @@ Suggested prompt:
     the decisions'/advance's open lanes 0 & 3; Add row → 4 more `+`; clicking
     `+` adds a card; no page errors.
 
+- 2026-07-05 — **ROADMAP Item 21 done (Opus, session 1 of 2) — sensor-scoped
+  lineals/centerlines/labels via vendor index bands.** Model-only foundation
+  for annotations that travel with the right sensor file; the GUI wiring
+  (assignment UI, text-label entity, centerline-name labels) is Item 22.
+  - **New pure model — `model/bands.py`.** `Owner` enum (GENERAL/FILE1/FILE2)
+    + the three bands over the fixed 100-slot arrays (0–19 GENERAL → both
+    files, 20–59 FILE1 → sensors 1&2/`_1_2`, 60–99 FILE2 → sensors 3&4/`_3_4`).
+    `owner_of_index` (load-time inference), `sensor_owner` (active si → band,
+    matching the split boundary), and `allocate` — a generic lowest-free-slot
+    picker that stays inside a band and extends the array only within it, so a
+    full band **overflows (returns None)** rather than spilling past slot 99.
+  - **Design decision — ownership has no on-disk tag.** The vendor format
+    carries nothing per-lineal/label, and the vendor keys slots by index
+    (writing slot 10 with 1–9 absent round-trips as slot 10) and auto-writes
+    to the lowest free index. So the low GENERAL band is a deliberate reserve:
+    the vendor's auto-writes land there and stay "general", never colliding
+    with a sensor band. Owner is inferred from the band on load and
+    re-materialized on save — a pure function of index, no schema change.
+  - **`model/centerline.py`** — `_find_chains` now also returns each chain's
+    lowest Lineal index (the owner signal). New `save_/load_centerlines_owned`
+    and `save_/load_lineals_owned` band-scope allocation; a multi-segment
+    centerline is placed wholly within one band or skipped as overflow. The
+    plain `save_centerlines`/`save_lineals`/`load_*` are kept as **GENERAL
+    wrappers** so every existing caller and test is unchanged (the GUI adopts
+    the `_owned` variants in Item 22).
+  - **New `model/labels.py`** — the Textlabel parallel (`save_/load_labels`,
+    `_owned`). A label is one slot (no chaining); free = disabled. Disabled
+    slots park at the vendor's `Position -9999` sentinel, not `(0,0)`.
+  - **`model/multifile.py`** — split now **blanks the *other* file's band**
+    (primary keeps GENERAL+FILE1, secondary keeps GENERAL+FILE2), so the
+    GENERAL block duplicates into both files and each `_3_4` renders its own
+    sensor guides standalone. Merge recombines by band (GENERAL+FILE1 from
+    primary, FILE2 from secondary; primary's GENERAL wins). New
+    `general_blocks_match` is the annotation soft-warn, parallel to
+    `check_background_match`, for when two overlaid files' GENERAL bands
+    disagree. Two existing split tests updated for the new (general-in-both)
+    ownership; the split→save→load→merge acceptance and the real Franklin
+    pair still round-trip losslessly (Franklin's labels all sit in the GENERAL
+    band, so merge is unchanged from before — no regression).
+  - **Interim behavior between sessions.** Until Item 22 wires ownership to
+    the active sensor, the GUI still calls the plain wrappers, so a re-save
+    collapses all annotations to GENERAL (→ both files). That's the desired
+    "general to both files" change; per-file scoping arrives with the Item 22
+    assignment UI.
+  - **Verification.** New `tests/test_bands.py` (14) + `tests/test_labels.py`
+    (9), band cases added to `test_centerline.py`/`test_lineals.py`/
+    `test_multifile.py`. Full suite green (423). Real-file check against the
+    Franklin pair: the `_3_4` file's enabled labels infer GENERAL, merge
+    recombines, re-split keeps `general_blocks_match` True. IPRJ_FORMAT.md
+    updated (split-ownership + Annotations sections).
+
+- 2026-07-05 — **ROADMAP Item 22 done (Opus, session 2 of 2) — text-label GUI
+  entity + sensor assignment + centerline-name labels.** Wires Item 21's
+  band-scoped persistence to the active sensor and adds text labels as a
+  first-class GUI entity.
+  - **Text Label = a 4th Draw sub-type, not a new tool.** The ROADMAP calls it
+    a "draw kind", so it joins Event/Ignore/Lineal in the Draw toggle (key
+    `a`) rather than getting its own primary tool. That meant teaching the
+    shared `DrawingController` a **`"point"` shape**: 1-click commit,
+    `element_points`/`set_element_points`/`_hit_zone` handle a single-point
+    `TextLabel`, and it reuses selection/move/delete/undo/nudge for free. The
+    alternative — a bespoke `LabelController` à la `CenterlineController` —
+    would have re-implemented all of that; a point label genuinely fits the
+    zone machinery once hit-testing knows about 1-point elements. *Caveat:* a
+    point label's vertex and body coincide, so Ctrl-drag-copy only fires when
+    nothing is pre-selected (the vertex-grab check runs first).
+  - **Draw-time editor bar (owner request, same session).** Text Label draw
+    mode shows an inline editor (the properties dialog's fields — text / size /
+    color / B·I·U / rotation) whose live values are what a click places, so
+    editing happens at/before placement, not only via the Edit workflow. The
+    controller pulls the draft on commit (`DrawingController.label_draft`
+    supplier → `Viewer.label_draft`, applied by `_apply_label_draft`, keeping
+    the clicked anchor) instead of the auto-numbered "Label N"; the draft
+    ghosts at the cursor (translucent) so the placement is a WYSIWYG click.
+  - **Ownership as a transient `_owner`, not an on-disk tag.** Generic lineals
+    and text labels carry their band `Owner` as an instance attribute
+    (`element_owner`/`set_element_owner`); centerlines carry it on the
+    controller (`CenterlineController.owner`). The controller stamps a freshly
+    drawn owned element from an `owner_supplier` (`Viewer.current_owner`). A
+    toolbar toggle picks **General vs. Active sensor** (`assign_general`);
+    `current_owner()` resolves Active sensor via `sensor_owner(active_si)`, so
+    the band tracks whichever sensor is live (S1/2 → `_1_2`, S3/4 → `_3_4`). A
+    hint label surfaces the resolved band; the label properties dialog also
+    exposes an explicit owner select. The GUI now calls the `_owned` save/load
+    variants throughout; `save_labels_owned`'s overflow `skipped` list is
+    surfaced like the lineal one.
+  - **Centerline names now persist — as a no-rotation label at the far end.**
+    Retires the "not persisted" note on `CenterlineController.name` (Item 20).
+    Each controller manages a `name_label` in the label pool:
+    `Viewer.sync_centerline_labels` creates/moves/updates/drops it on
+    rename, geometry edits, and before save (position = furthest-from-stop-bar
+    vertex, rotation 0, band = the centerline's owner). On load the link is
+    **re-derived geometrically** (`model.labels.match_name_labels`, mirroring
+    `derive_attachments`): a no-rotation label within `NAME_LABEL_TOL` of a
+    centerline's far end is adopted as its name label and its text taken as the
+    name. One-to-one, nearest-wins, so coincident far ends resolve
+    deterministically. Editing a name label's text (or rotating it away) is
+    therefore a legitimate way to rename/detach across reloads.
+  - **Model additions** — `domain.new_label`/`insert_label`/
+    `is_placeholder_label` (the label draw-kind trio, parallel to the lineal
+    ones); `model/labels.py` gains `is_name_label` + `match_name_labels`
+    (pure geometry, the re-derivation core).
+  - **Verification.** New model tests for `match_name_labels`/`is_name_label`
+    and controller tests for the point shape + owner stamping/copy
+    (`test_labels.py` +5, `test_drawing.py` +6). Full suite green (434).
+    Headless end-to-end: named-centerline → sync → save → reload re-derives
+    the name and adopts (not duplicates) its label; a FILE2 name label splits
+    only into `_3_4` while a GENERAL label duplicates into both; `svg()`
+    renders styled/rotated labels. IPRJ_FORMAT.md gains the centerline-name
+    label convention (a soft, re-derived interpretation, parallel to the
+    centerline-encoding note — no new on-disk field; Item 21 already covered
+    the label array and bands).
+
 ## Appendix — example template (acceptance case, revised for Items 15/17/18)
 
 45 mph approach, lanes `12' L | 12' T | 12' T | 12' R`, count loops, starting

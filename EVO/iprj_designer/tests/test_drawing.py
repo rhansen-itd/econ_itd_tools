@@ -1,11 +1,14 @@
 import pytest
 
 from gui.drawing import (DIM_LENGTH1, DIM_LENGTH2, DIM_OFF, IGNORE_KIND,
-                         LINEAL_KIND, CenterlineController, DrawingController,
-                         bumped_name, derive_attachments, is_placeholder,
-                         next_output_number)
+                         LABEL_KIND, LINEAL_KIND, CenterlineController,
+                         DrawingController, bumped_name, derive_attachments,
+                         element_owner, element_points, is_placeholder,
+                         next_output_number, set_element_owner,
+                         set_element_points)
 from model import domain, geometry
-from model.iprj_io import EventZone, IgnoreZone, Lineal
+from model.bands import Owner
+from model.iprj_io import EventZone, IgnoreZone, Lineal, TextLabel
 
 FT_PER_PX = 0.25  # 10 ft == 40 world px
 
@@ -1263,3 +1266,82 @@ def test_d_no_longer_starts_dimension_entry():
     assert ctrl.dim_stage == DIM_OFF
     assert ctrl.key("1")                       # digits still do
     assert ctrl.dim_stage == DIM_LENGTH1
+
+
+# -- text labels (ROADMAP Item 22: point shape + owner) ----------------------
+
+def label_ctrl(labels=None, owner=Owner.GENERAL):
+    labels = labels if labels is not None else []
+    return DrawingController(labels, lambda: FT_PER_PX, kind=LABEL_KIND,
+                             owner_supplier=lambda: owner)
+
+
+def test_textlabel_element_points_roundtrip():
+    lbl = domain.new_label((10.0, 20.0), "hi")
+    assert element_points(lbl) == [(10.0, 20.0)]
+    set_element_points(lbl, [(30.0, 40.0)])
+    assert (lbl.position_x, lbl.position_y) == (30.0, 40.0)
+
+
+def test_label_draw_commits_on_single_click():
+    ctrl = label_ctrl()
+    ctrl.mouse_down((15.0, 25.0))
+    assert ctrl.pending == []                  # committed, not held
+    assert len(ctrl.zones) == 1
+    lbl = ctrl.zones[0]
+    assert isinstance(lbl, TextLabel) and lbl.enable == 1
+    assert (lbl.position_x, lbl.position_y) == (15.0, 25.0)
+    assert lbl.font_size == 12 and lbl.rotation_angle == 0.0
+    assert (lbl.textcolor_red, lbl.textcolor_green, lbl.textcolor_blue) == (255, 255, 255)
+
+
+def test_label_draw_stamps_active_sensor_owner():
+    ctrl = label_ctrl(owner=Owner.FILE2)
+    ctrl.mouse_down((0.0, 0.0))
+    assert element_owner(ctrl.zones[0]) == Owner.FILE2
+
+
+def test_label_edit_select_and_move():
+    ctrl = label_ctrl([domain.new_label((50.0, 50.0), "x")])
+    ctrl.set_mode("edit")
+    ctrl.mouse_down((50.0, 50.0))              # within handle radius
+    assert ctrl.selected == 0
+    ctrl.mouse_move((70.0, 60.0), dragging=True)
+    ctrl.mouse_up((70.0, 60.0))
+    assert element_points(ctrl.zones[0]) == [(70.0, 60.0)]
+
+
+def test_label_copy_preserves_owner():
+    ctrl = label_ctrl([domain.new_label((10.0, 10.0), "a")], owner=Owner.FILE1)
+    set_element_owner(ctrl.zones[0], Owner.FILE2)
+    ctrl.set_mode("edit")
+    ctrl.selected = -1                         # a point label's vertex is its
+    ctrl.mouse_down((10.0, 10.0), ctrl=True)   # body, so copy needs no prior sel
+    ctrl.mouse_up((10.0, 10.0))
+    assert len(ctrl.zones) == 2
+    assert element_owner(ctrl.zones[1]) == Owner.FILE2  # copy keeps source band
+
+
+def test_insert_vertex_refuses_label():
+    ctrl = label_ctrl([domain.new_label((10.0, 10.0), "a")])
+    ctrl.set_mode("edit")
+    ctrl.selected = 0
+    assert not ctrl.insert_vertex((10.0, 10.0))
+
+
+def test_label_draft_applied_on_placement_keeps_anchor():
+    draft = domain.new_label((0.0, 0.0), "STOP BAR")
+    draft.font_size, draft.font_bold, draft.rotation_angle = 18, 1, 90.0
+    draft.textcolor_red, draft.textcolor_green, draft.textcolor_blue = 255, 0, 0
+    ctrl = DrawingController([], lambda: FT_PER_PX, kind=LABEL_KIND,
+                             label_draft=lambda: draft)
+    ctrl.mouse_down((250.0, 300.0))
+    placed = ctrl.zones[0]
+    assert placed.text == "STOP BAR"                       # draft text, not "Label 1"
+    assert (placed.position_x, placed.position_y) == (250.0, 300.0)  # click anchor
+    assert (placed.font_size, placed.font_bold, placed.rotation_angle) == (18, 1, 90.0)
+    assert (placed.textcolor_red, placed.textcolor_green,
+            placed.textcolor_blue) == (255, 0, 0)
+    # the placed label is independent of the draft prototype
+    placed.text = "changed"
+    assert draft.text == "STOP BAR"

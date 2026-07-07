@@ -44,7 +44,8 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from model import domain, geometry
-from model.iprj_io import EventZone, Lineal, Point
+from model.bands import Owner
+from model.iprj_io import EventZone, Lineal, Point, TextLabel
 
 # Stages of dimensioned-rectangle entry
 DIM_OFF = 0      # not entering dimensions
@@ -92,22 +93,56 @@ def bumped_name(name: str | None) -> str:
 
 def element_points(el) -> list[Point]:
     """The editable vertex list of any drawable element. A `Lineal` stores
-    its two endpoints as scalar fields; everything else carries `.points`."""
+    its two endpoints as scalar fields; a `TextLabel` is anchored at a single
+    point; everything else carries `.points`."""
     if isinstance(el, Lineal):
         return [p for p in (el.point_0, el.point_1) if p is not None]
+    if isinstance(el, TextLabel):
+        return [(el.position_x, el.position_y)]
     return el.points
 
 
 def set_element_points(el, pts: list[Point]) -> None:
     if isinstance(el, Lineal):
         el.point_0, el.point_1 = pts[0], pts[1]
+    elif isinstance(el, TextLabel):
+        el.position_x, el.position_y = pts[0]
     else:
         el.points = pts
 
 
 def _element_name(el) -> str:
+    if isinstance(el, TextLabel):
+        return (el.text or "").strip() or "text label"
     return getattr(el, "zone_name", "") or \
         ("lineal" if isinstance(el, Lineal) else "zone")
+
+
+# -- band ownership (ROADMAP Item 22) -----------------------------------------
+# Generic lineals and text labels are project-wide but route to a sensor file
+# by index band (model/bands.py). The GUI carries that intent as a transient
+# `_owner` attribute on the working object — no on-disk tag; save materializes
+# it into a band. Zones need none (they live in a sensor's list already).
+
+def element_owner(el) -> Owner:
+    return getattr(el, "_owner", Owner.GENERAL)
+
+
+def set_element_owner(el, owner: Owner) -> None:
+    el._owner = owner
+
+
+# Text-label styling fields a draw-time draft carries onto a placed label
+# (ROADMAP Item 22 — the Draw-mode editor bar); the anchor is the click point.
+_LABEL_DRAFT_FIELDS = (
+    "text", "font_size", "font_bold", "font_italic", "font_underline",
+    "rotation_angle", "textcolor_red", "textcolor_green", "textcolor_blue")
+
+
+def _apply_label_draft(label: TextLabel, draft: TextLabel) -> None:
+    """Copy the draft's text/styling onto *label*, leaving its position."""
+    for f in _LABEL_DRAFT_FIELDS:
+        setattr(label, f, getattr(draft, f))
 
 
 @dataclass(frozen=True)
@@ -119,8 +154,8 @@ class DrawKind:
     slot-else-append helper and may raise ValueError at the vendor cap,
     which the controller surfaces via ``warning``."""
 
-    name: str                                   # "loop" | "ignore" | "lineal"
-    shape: str                                  # "polygon" (free multi-click/dim) | "segment" (2-click)
+    name: str                                   # "loop" | "ignore" | "lineal" | "text label"
+    shape: str                                  # "polygon" (free multi-click/dim) | "segment" (2-click) | "point" (1-click)
     make: Callable[[list[Point], int], object]
     insert: Callable[[list, object], int]
     is_placeholder: Callable[[object], bool]
@@ -129,6 +164,10 @@ class DrawKind:
     # endpoint coincident with any other lineal/centerline vertex merges into
     # a chain on reload (model/domain.py), so their kind must never snap.
     snappable: bool = True
+    # Project-wide, band-owned kinds (generic lineals, text labels): the
+    # controller stamps a fresh element's `_owner` from its owner_supplier on
+    # commit so a re-save routes it to the right sensor file (ROADMAP Item 22).
+    owned: bool = False
     style: dict = field(default_factory=dict)   # render hints for the GUI svg()
 
 
@@ -150,8 +189,15 @@ LINEAL_KIND = DrawKind(
     name="lineal", shape="segment",
     make=lambda pts, seq: domain.new_lineal(pts[0], pts[1]),
     insert=domain.insert_lineal, is_placeholder=domain.is_placeholder_lineal,
-    snappable=False,
+    snappable=False, owned=True,
     style={"stroke": "#9e9e9e", "width": 1})  # thin gray ≠ centerline green
+
+LABEL_KIND = DrawKind(
+    name="text label", shape="point",
+    make=lambda pts, seq: domain.new_label(pts[0], f"Label {seq}"),
+    insert=domain.insert_label, is_placeholder=domain.is_placeholder_label,
+    snappable=False, owned=True,
+    style={"fill": "#ffd54f"})  # amber text ≠ zone name labels (white)
 
 
 class DrawingController:
@@ -161,11 +207,20 @@ class DrawingController:
     def __init__(self, zones: list,
                  ft_per_px: Callable[[], float | None],
                  next_output: Callable[[], int] | None = None,
-                 kind: DrawKind = LOOP_KIND):
+                 kind: DrawKind = LOOP_KIND,
+                 owner_supplier: Callable[[], Owner] | None = None,
+                 label_draft: Callable[[], TextLabel] | None = None):
         self.zones = zones
         self.ft_per_px = ft_per_px
         self.next_output = next_output
         self.kind = kind
+        # Supplies the band Owner stamped onto a freshly drawn owned element
+        # (ROADMAP Item 22); None leaves owner unset (defaults to GENERAL).
+        self.owner_supplier = owner_supplier
+        # Supplies the draft TextLabel whose text/styling a click adopts when
+        # placing a text label (the Draw-mode editor bar); the clicked point
+        # is the anchor. None -> the kind's own `make` default is kept.
+        self.label_draft = label_draft
 
         self.mode = "draw"            # "draw" | "edit"
         self.snap_enabled = False
@@ -271,8 +326,12 @@ class DrawingController:
     def _commit_element(self, points: list[Point]) -> None:
         pts = [(float(x), float(y)) for x, y in points]
         el = self.kind.make(pts, len(self._real_indices()) + 1)
+        if isinstance(el, TextLabel) and self.label_draft is not None:
+            _apply_label_draft(el, self.label_draft())
         if self.kind.numbered and self.next_output is not None:
             el.output_number = self.next_output()
+        if self.kind.owned and self.owner_supplier is not None:
+            set_element_owner(el, self.owner_supplier())
         if self._insert(el) == -1:
             return  # vendor cap; warning already set
         name = getattr(el, "zone_name", "") or self.kind.name
@@ -338,6 +397,8 @@ class DrawingController:
             if len(pts) == 2 and geometry.point_segment_distance(
                     p, pts[0], pts[1]) <= self.handle_radius / 2:
                 return i
+            if len(pts) == 1 and geometry.dist(p, pts[0]) <= self.handle_radius:
+                return i
         return -1
 
     # -- mouse ---------------------------------------------------------------
@@ -350,9 +411,11 @@ class DrawingController:
             if self.dim_stage != DIM_OFF:
                 return  # dimensions are committed with Enter, not clicks
             self.pending.append(self._snapped(p))
-            # only segments auto-commit at a fixed count; polygons keep
-            # accepting corners until finish_polygon() (Enter/double-click)
-            if self.kind.shape == "segment" and len(self.pending) == 2:
+            # points commit on the first click, segments on the second;
+            # polygons keep accepting corners until finish_polygon()
+            # (Enter/double-click).
+            fixed = {"point": 1, "segment": 2}.get(self.kind.shape)
+            if fixed is not None and len(self.pending) == fixed:
                 self._commit_element(self.pending)
                 self.pending = []
         elif self.mode == "edit":
@@ -755,6 +818,9 @@ class DrawingController:
         if isinstance(zone, Lineal):
             self.message = "a lineal has fixed endpoints — can't add a vertex"
             return False
+        if isinstance(zone, TextLabel):
+            self.message = "a text label is a single point — can't add a vertex"
+            return False
         if p is None:
             p = self.cursor
         if p is None:
@@ -851,7 +917,9 @@ class DrawingController:
     def status(self) -> str:
         parts = [f"mode: {self.mode}", f"snap: {'ON' if self.snap_enabled else 'off'}"]
         if self.mode == "draw":
-            if self.kind.shape == "segment":
+            if self.kind.shape == "point":
+                parts.append(f"click to place a {self.kind.name}")
+            elif self.kind.shape == "segment":
                 parts.append("click the end point" if self.pending
                              else f"click the start point of a {self.kind.name}")
             elif self.dim_stage == DIM_LENGTH1:
@@ -999,10 +1067,18 @@ class CenterlineController:
 
     def __init__(self, ft_per_px: Callable[[], float | None]):
         self.ft_per_px = ft_per_px
-        # Session-only display name (Item 20) — e.g. "N_CL" for the north
-        # approach. Empty means "unnamed"; the GUI falls back to C{n}. Not
-        # persisted (the .iprj Lineals have nowhere to carry it).
+        # Display name (Item 20) — e.g. "N_CL" for the north approach. Empty
+        # means "unnamed"; the GUI falls back to C{n}. Persisted (Item 22) as
+        # a no-rotation text label at the far end, carried by `name_label`;
+        # re-derived on load via model.labels.match_name_labels.
         self.name: str = ""
+        # The managed centerline-name TextLabel in the GUI's label pool
+        # (ROADMAP Item 22), or None until the centerline is named. Its band
+        # follows `owner`; the GUI keeps its text/position in sync.
+        self.name_label: "TextLabel | None" = None
+        # File band this centerline (and its name label) is written to on the
+        # two-file split (ROADMAP Item 21/22): GENERAL -> both files.
+        self.owner: Owner = Owner.GENERAL
         self.points: list[Point] = []
         self.cursor: Point | None = None
         self.selected: int = -1
@@ -1018,6 +1094,11 @@ class CenterlineController:
             return geometry.Centerline(self.points)
         except ValueError:
             return None
+
+    def far_end(self) -> Point | None:
+        """The vertex furthest from the stop bar (station 0 is ``points[0]``)
+        — where the centerline-name label sits (ROADMAP Item 22)."""
+        return self.points[-1] if self.points else None
 
     def _snapshot(self) -> None:
         self._undo.append(list(self.points))

@@ -71,25 +71,38 @@ per-file concept). Both files are otherwise **100% vendor-clean single
 filename convention, so either one opens standalone in the vendor
 software without choking on an unrecognized attribute.
 
-Ownership on the split: the `_1_2` file carries every project-wide field
-— background, `Lineals_*`, `Textlabel_*`, and `project.extra` — while the
-`_3_4` file gets only a **deep copy of the background** (so it still
-renders standalone) plus its two sensors. Consequence: opening the `_3_4`
-file alone in the vendor viewer shows its zones but not the project-wide
-annotations/centerline guides. Accepted for v1 since zone geometry is
-already baked into world coordinates; see ITEM9_SPLIT_PLAN.md §8 for the
-per-sensor-lineal-range idea if that's ever revisited.
+Ownership on the split (ROADMAP Item 21, `model/bands.py`): `Lineals_*` and
+`Textlabel_*` are routed by **index band** rather than all living in the
+`_1_2` file. Each 100-slot array is divided into indices **0–19** (GENERAL),
+**20–59** (FILE1 — sensors 1&2) and **60–99** (FILE2 — sensors 3&4). The
+`_1_2` file carries GENERAL + FILE1 (FILE2 band blanked); the `_3_4` file
+carries GENERAL + FILE2 (FILE1 band blanked). The **GENERAL band is
+duplicated into both files**, so notes/centerlines placed there — or
+auto-written by the vendor, which fills the lowest free index — render in
+both. `project.extra` (Zoomfaktor, plot prefs) still stays with the `_1_2`
+file. Ownership carries **no on-disk tag**: it is inferred on load from the
+band an element's slot index falls in and re-materialized into that band on
+save (`model/centerline.py`, `model/labels.py`). A multi-segment centerline
+stays wholly within one band; a band with no room for an element overflows
+(the writer returns it, the GUI warns) rather than spilling past the vendor's
+fixed 100 slots. This realizes the ITEM9_SPLIT_PLAN.md §8
+per-sensor-lineal-range idea; the `_3_4` file now renders its sensor-specific
+guides standalone, not just the shared general ones.
 
 Pairing relies on Item 11's origin normalization above: because both
 files share the same background image and both are independently
 normalized to `Background_PosX/Y = (0,0)`, "relative to top-left" is a
-common frame and the merge is a plain sensor-list append — no cross-file
-coordinate delta is ever computed. `check_background_match` verifies this
-premise on the overlay-open path (where a user picks two arbitrary
-files): image dimensions, post-normalization position, scale, rotation,
-and effective meters-per-pixel must all agree (hard fail if not); a
-pixel-content hash mismatch on otherwise-matching geometry is a soft
-warning the GUI confirms rather than blocks.
+common frame and the merge is a sensor-list append plus a per-band recombine
+of the annotation arrays (GENERAL + FILE1 from the `_1_2` file, FILE2 from the
+`_3_4` file; the primary's GENERAL block wins) — no cross-file coordinate
+delta is ever computed. `check_background_match` verifies this premise on the
+overlay-open path (where a user picks two arbitrary files): image dimensions,
+post-normalization position, scale, rotation, and effective meters-per-pixel
+must all agree (hard fail if not); a pixel-content hash mismatch on
+otherwise-matching geometry is a soft warning the GUI confirms rather than
+blocks. `general_blocks_match` is a parallel soft-warn on the annotations: if
+the two files' GENERAL bands disagree (one edited independently), the GUI can
+flag that the primary's copy will win.
 
 ## Attribute namespace (flat, underscore-indexed)
 
@@ -227,6 +240,17 @@ exactly a `0` zone still ignores **(open — needs vendor software)**.
 - `Textlabel_{i}_…`: `Enable`, `Text`, `Position_X/Y`, `FontSize`, `FontBold`,
   `FontUnderline`, `FontItalic`, `RotationAngle`, `Textcolor_Red/Green/Blue`
 
+Both arrays are the vendor's fixed 100 slots (`{i}` 0–99). Vendor software
+keys these **by index** — writing slot 10 with 1–9 absent reloads and
+re-saves as slot 10 — and auto-writes new entries to the lowest free index.
+The designer exploits that: the slot index band carries file ownership on the
+2-file split (see "Multi-sensor 2-file split" above and `model/bands.py`).
+Disabled `Textlabel` slots park off-canvas at `Position_X/Y = -9999.00` (not
+`(0,0)`); disabled `Lineals` slots zero their points. A real enabled text
+label is `FontSize="12"` with `RotationAngle` in **degrees** (`90.00` seen)
+and `Textcolor_*` in 0–255 RGB; the designer creates new labels white
+(`255/255/255`), size 12, no bold/italic/underline, rotation 0.
+
 **Centerline encoding (ours, Session 7.3 — `model/centerline.py`):** the
 format has no polyline entity, so the designer's approach centerlines
 (typically several per project — two intersecting roads at minimum) are
@@ -254,6 +278,17 @@ endpoint with another Lineal is part of a centerline. Consequences:
   being recognized) on reload — don't snap centerline vertices together.
 - Components with branching vertices or cycles are never centerline
   candidates and are left untouched by save.
+
+**Centerline-name labels (ours, ROADMAP Item 22 — `model/labels.py`):** a
+centerline's display name is likewise carried with no format extension — as a
+**no-rotation `Textlabel` sitting at the centerline's far end** (the vertex
+furthest from the stop bar). Like the centerline chain and the zone/centerline
+attachments, the link has no on-disk tag and is **re-derived on load by
+geometry**: a no-rotation enabled label within a small tolerance (~0.05 world
+px, `NAME_LABEL_TOL`) of a centerline's far end is adopted as that centerline's
+name label, and its `Text` becomes the name (`match_name_labels`, one-to-one,
+nearest-wins). The label lives in the same index band as its centerline, so a
+sensor-owned centerline's name travels to the right file on the 2-file split.
 
 ### Plot preferences
 

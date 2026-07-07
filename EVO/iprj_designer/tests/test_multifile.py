@@ -25,9 +25,11 @@ from model.iprj_io import (
     load_iprj,
     save_iprj,
 )
+from model.bands import Owner
 from model.multifile import (
     BackgroundMismatch,
     check_background_match,
+    general_blocks_match,
     is_multifile,
     is_valid_pair,
     merge_pair,
@@ -182,9 +184,14 @@ def test_split_ownership_and_no_aliasing():
     primary, secondary = split_project(project)
     assert [s.event_zones[0].zone_name for s in primary.sensors] == ["Zone 1", "Zone 2"]
     assert [s.event_zones[0].zone_name for s in secondary.sensors] == ["Zone 3", "Zone 4"]
-    # Project-wide fields live in the primary only.
+    # ROADMAP Item 21: annotations split by band. make_project's lineal/label
+    # sit in the GENERAL band (index 0), so they duplicate into *both* files;
+    # extra stays with the primary. (This project has nothing in the FILE
+    # bands, so nothing is blanked from either side here.)
     assert primary.lineals == project.lineals and primary.extra == project.extra
-    assert secondary.lineals == [] and secondary.text_labels == [] and secondary.extra == {}
+    assert secondary.lineals == project.lineals  # GENERAL band duplicated
+    assert secondary.text_labels == project.text_labels
+    assert secondary.extra == {}
     assert secondary.background == project.background
     # Deep copies throughout — mutating an output never touches the input.
     assert primary.background is not project.background
@@ -212,8 +219,11 @@ def test_34_file_serializes_as_radarsensor_0_1_outputs_untouched(tmp_path):
     assert attrs["Radarsensor_0_EventZone_0_OutputNumber"] == "33"
     assert attrs["Radarsensor_1_EventZone_0_OutputNumber"] == "34"
     assert not any(k.startswith("Radarsensor_2_") for k in attrs)
-    # Project-wide extras stay in the _1_2 file.
-    assert not any(k.startswith(("Lineals_", "Textlabel_")) for k in attrs)
+    # ROADMAP Item 21: the GENERAL-band annotations (index 0) are duplicated
+    # into the _3_4 file so it renders standalone; only project.extra
+    # (Zoomfaktor) stays exclusive to the _1_2 file.
+    assert attrs["Lineals_0_Enable"] == "1"
+    assert attrs["Textlabel_0_Enable"] == "1"
     assert "Zoomfaktor" not in attrs
 
 
@@ -335,6 +345,77 @@ def test_merge_over_four_sensors_raises():
 
 FRANKLIN_12 = SITES / "Franklin_KCID" / "Phase 2 & 6 sensor 1 and 2.iprj"
 FRANKLIN_34 = SITES / "Franklin_KCID" / "Phase 4 & 8 sensor 3 and 4 with speed.iprj"
+
+
+# ---------------------------------------------------------------------------
+# Band-scoped annotation split/merge (ROADMAP Item 21)
+# ---------------------------------------------------------------------------
+
+def _placeholder_lineal():
+    return Lineal(enable=0, point_0=(0.0, 0.0), point_1=(0.0, 0.0))
+
+
+def _placeholder_label():
+    return TextLabel(enable=0, text="", position_x=-9999.0, position_y=-9999.0)
+
+
+def make_banded_project(n_sensors: int = 4) -> Project:
+    """A project whose lineals and text labels carry one enabled entry in
+    each band: index 0 (GENERAL), 20 (FILE1), 60 (FILE2)."""
+    project = make_project(n_sensors)
+    lineals = [_placeholder_lineal() for _ in range(100)]
+    lineals[0] = Lineal(enable=1, point_0=(10.0, 0.0), point_1=(15.0, 0.0))
+    lineals[20] = Lineal(enable=1, point_0=(100.0, 0.0), point_1=(105.0, 0.0))
+    lineals[60] = Lineal(enable=1, point_0=(200.0, 0.0), point_1=(205.0, 0.0))
+    labels = [_placeholder_label() for _ in range(100)]
+    labels[0] = TextLabel(enable=1, text="gen", position_x=1.0, position_y=1.0, font_size=12)
+    labels[20] = TextLabel(enable=1, text="s12", position_x=2.0, position_y=2.0, font_size=12)
+    labels[60] = TextLabel(enable=1, text="s34", position_x=3.0, position_y=3.0, font_size=12)
+    project.lineals = lineals
+    project.text_labels = labels
+    return project
+
+
+def test_split_routes_annotations_by_band():
+    primary, secondary = split_project(make_banded_project(4))
+    # primary (_1_2): GENERAL + FILE1 kept, FILE2 blanked
+    assert primary.lineals[0].enable and primary.lineals[20].enable
+    assert not primary.lineals[60].enable
+    assert primary.text_labels[0].enable and primary.text_labels[20].enable
+    assert not primary.text_labels[60].enable
+    # secondary (_3_4): GENERAL + FILE2 kept, FILE1 blanked
+    assert secondary.lineals[0].enable and secondary.lineals[60].enable
+    assert not secondary.lineals[20].enable
+    assert secondary.text_labels[0].enable and secondary.text_labels[60].enable
+    assert not secondary.text_labels[20].enable
+
+
+def test_banded_split_save_load_merge_roundtrip(tmp_path):
+    project = make_banded_project(4)
+    primary, secondary = split_project(project)
+    p12, p34 = pair_paths(tmp_path / "banded.iprj")
+    save_iprj(primary, p12)
+    save_iprj(secondary, p34)
+    merged = merge_pair(load_iprj(p12), load_iprj(p34))
+    assert merged == project
+
+
+def test_general_blocks_match_after_clean_split():
+    primary, secondary = split_project(make_banded_project(4))
+    assert general_blocks_match(primary, secondary)
+
+
+def test_general_blocks_mismatch_detected():
+    primary, secondary = split_project(make_banded_project(4))
+    secondary.text_labels[0].text = "edited-independently"
+    assert not general_blocks_match(primary, secondary)
+
+
+def test_merge_keeps_primary_general_even_on_mismatch():
+    primary, secondary = split_project(make_banded_project(4))
+    secondary.lineals[0].point_0 = (777.0, 777.0)  # foreign edit to _3_4's general
+    merged = merge_pair(primary, secondary)
+    assert merged.lineals[0].point_0 == primary.lineals[0].point_0 == (10.0, 0.0)
 
 
 def test_franklin_pair_merges():

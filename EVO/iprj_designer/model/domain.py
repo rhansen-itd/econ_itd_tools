@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from enum import IntEnum
 
-from .iprj_io import Condition, IgnoreZone, Lineal, Point
+from .iprj_io import Condition, IgnoreZone, Lineal, Point, TextLabel
 
 # Vendor placeholder-array capacities (per IPRJ_FORMAT.md survey): the vendor
 # writes fixed-size arrays of this many slots, so treat them as hard caps.
@@ -236,3 +236,50 @@ def insert_lineal(lineals: list[Lineal], lineal: Lineal) -> int:
         raise ValueError(f"project already has {MAX_LINEALS} lineals")
     lineals.append(lineal)
     return len(lineals) - 1
+
+
+# ---------------------------------------------------------------------------
+# Text Labels (ROADMAP Item 22 GUI entity)
+# ---------------------------------------------------------------------------
+#
+# The GUI carries text labels as a working pool of *enabled* TextLabels (like
+# the generic-lineal pool), round-tripped through the band mechanism in
+# model/labels.py on save. New-label defaults follow the vendor's real enabled
+# labels: FontSize 12, white text, no style flags, no rotation.
+
+# Defaults for a freshly drawn label (ROADMAP Item 22).
+LABEL_FONT_SIZE = 12
+LABEL_COLOR = (255, 255, 255)  # white
+
+
+def is_placeholder_label(label: TextLabel) -> bool:
+    """A free slot in the working label pool: any disabled label (enabled
+    labels are the project's real annotations). Mirrors model/labels._is_free
+    so the GUI draw-kind machinery treats the pool the vendor way."""
+    return not label.enable
+
+
+def new_label(anchor: Point, text: str = "") -> TextLabel:
+    """Enabled text label at *anchor* with the ROADMAP Item 22 new-label
+    defaults (FontSize 12, white, no style flags, rotation 0°)."""
+    r, g, b = LABEL_COLOR
+    return TextLabel(enable=1, text=text,
+                     position_x=float(anchor[0]), position_y=float(anchor[1]),
+                     font_size=LABEL_FONT_SIZE, font_bold=0, font_underline=0,
+                     font_italic=0, rotation_angle=0.0,
+                     textcolor_red=r, textcolor_green=g, textcolor_blue=b)
+
+
+def insert_label(labels: list[TextLabel], label: TextLabel) -> int:
+    """Put *label* in the first placeholder slot else append; returns the
+    index used. Raises ValueError past the vendor's 100-slot array. (The GUI
+    pool holds only enabled labels, so this appends in practice — the
+    placeholder branch mirrors insert_lineal for shared draw-kind handling.)"""
+    for i, l in enumerate(labels):
+        if is_placeholder_label(l):
+            labels[i] = label
+            return i
+    if len(labels) >= MAX_TEXTLABELS:
+        raise ValueError(f"project already has {MAX_TEXTLABELS} text labels")
+    labels.append(label)
+    return len(labels) - 1
