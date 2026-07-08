@@ -1831,6 +1831,374 @@ Suggested prompt:
     centerline-encoding note — no new on-disk field; Item 21 already covered
     the label array and bands).
 
+- 2026-07-07 — **ROADMAP Item 23 done (Opus) — toolbar/layout planning +
+  mockups; no command wiring.** Synthesized the owner-batch toolbar requests
+  into one target layout and delivered runnable static mockups
+  (`gui/toolbar_mockup.py`, port 8081, inert buttons) plus a decision doc
+  (`ITEM23_TOOLBAR_PLAN.md`) that specifies exactly what Items 24 & 27 build.
+  - **Three options mocked, Option A recommended.** A · two-tier (segmented
+    sub-kind toggle, filename inline on row 1), B · single command bar
+    (sub-kind dropdown, filename in the folder menu, ~30 px more canvas), C ·
+    left tool rail. Picked **A**: it matches the ROADMAP's own "both bars fit
+    `calc(100vh - 120px)`" framing, reuses the shipped Phase-3
+    build-once/`set_visibility` context-bar mechanic (smallest code delta),
+    and keeps the six draw sub-kinds glanceable. B is the documented fallback
+    if the canvas feels short (pure re-parent of A's controls); C is deferred
+    (biggest departure for little gain). All three share the same control set,
+    so a later switch to B/C changes arrangement, not semantics.
+  - **Decided layout.** Top tool toggle shrinks `Edit·Draw·Template·Centerline·
+    Sensor·Background` → **`Draw·Edit·Background`** (Draw first); Sensor +
+    Centerline (Item 24) and Template (Item 27) fold into the `draw_kind_toggle`
+    sub-kinds. Per-sub-kind context matrix + the Edit/Background contexts are
+    pinned in plan §3.2.
+  - **Unified Owner/Sensor dropdown — the load-bearing seam.** `sensor_sel` +
+    `assign_toggle` collapse into one `ui.select` (options General + S1…Sn;
+    General suppressed for Event/Ignore zones + Sensor mgmt). Resolution:
+    **keep `active_si` and `assign_general` as two internal fields and project
+    them through one widget** (§3.3) — General sets `assign_general` without
+    touching `active_si`, a sensor sets both; `current_owner()` + band routing
+    stay untouched. The many `active_si` readers (§8) are the chief Item-24 risk.
+  - **Row-1 grouping + filename (owner review, refined the recommendation).**
+    After eyeballing the mockups the owner picked A and asked for command
+    grouping by *type* with `|` separators: modes (Draw/Edit/Background)
+    top-left, permanent drawing tools (snap/ruler/**clear-ruler**/undo/layers/
+    fit) left-justified against Background behind a `|`, and a right-justified
+    **file cluster** (folder · template-editor · filename · save) with the
+    **filename beside Save**. The earlier "move filename to row 2" call is
+    retired; the `"iprj Designer — "` product prefix is dropped. (Also restored
+    the clear-ruler button the first mockup pass had accidentally dropped.)
+  - **Zone table Auto/On/Off**, right-justified on **row 2** above the table
+    (owner's call — not the row-1 tool cluster). Auto = visible only when a zone
+    kind is the active target. Height budget: keep `- 120px`, verify empirically.
+  - **Item 27 home decisions.** Template = a mode of Event Zone (no sub-kind);
+    `template_follow_switch` + `template_cl_sel` → one CL dropdown bound to every
+    drawn event zone via Item 26 membership; **template-editor button moves to
+    the row-1 file cluster** (owner's call — it's a document-level action, so it
+    leaves the Event-Zone context bar and stays persistently visible).
+    Provisional 24/27 scope boundaries hold — 23 refines, doesn't re-cut them (§9).
+  - **No model/ change** (planning only): mockup imports nothing from `model/`;
+    band routing/`current_owner()` unchanged, so no pytest/IPRJ_FORMAT delta this
+    session. Validated the mockup runs (HTTP 200) and drove it headless
+    (Playwright: every tool/sub-kind switch + all three tabs, zero console
+    errors).
+- 2026-07-07 — **ROADMAP Item 24 done (Opus, one session) — toolbar &
+  drawing-mode consolidation, implementing Item 23's Option A** (`gui/app.py`,
+  `model/bands.py`). Sensor + Centerline fold from top-level tools into Draw
+  sub-kinds; the active-sensor selector + General/Active-sensor toggle collapse
+  into one Owner/Sensor dropdown; Row-1 chrome regrouped. (Template still rides
+  with Item 27.)
+  - **Effective-mode, not a mode rename — the key design call.** Rather than
+    rewrite the ~40 `v.mode == …` branches in on_down/on_move/on_up/on_key/
+    refresh, `v.mode` stays the *effective* mode the state machine reads
+    (`Draw`/`Edit`/`Background`/`Centerline`/`Sensor`/`Template`). The 3-entry
+    tool toggle + the 6-entry `draw_kind_toggle` feed one pure
+    `effective_mode(tool, sub_kind)` (module-level, unit-tested): Sensor/
+    Centerline sub-kinds resolve to their own modes, everything else under Draw
+    to `Draw`. So the drawing-controller branches are untouched — only the
+    toggle wiring changed. `change_tool`/`change_draw_kind` share one
+    `_enter_mode()` doing the teardown `change_tool` used to (clear template
+    preview, end centerline drag, cancel rotate, drop marquee).
+  - **`draw_kind_name` diverges from the sub-kind toggle by design.** The
+    toggle now carries 6 values; `draw_kind_name` (the Viewer field
+    `draw_zones()`/`DRAW_KINDS` read) keeps the last *drawing* kind, so
+    Centerline/Sensor sub-kinds don't break the zone/lineal targeting.
+    `change_draw_kind` calls `set_draw_kind` only for real drawing kinds
+    (`kind not in MODE_SUBKINDS`).
+  - **Unified Owner/Sensor dropdown (plan §3.3) — `active_si` + `assign_general`
+    stay the source of truth, projected through one widget.** New pure helper
+    `model.bands.resolve_owner(assign_general, active_si, general_ok)` centralizes
+    the rule so a stale `assign_general=True` can't leak GENERAL onto a
+    sensor-scoped annotation. `general_offered(mode, draw_kind)` (module-level,
+    tested) gates whether "General" is in the options — owned kinds + Centerline
+    yes; zones, Sensor, and Edit no (Edit only scopes the active sensor, so on
+    startup the dropdown reads "S1", not "General"). `refresh_owner_sel()`
+    rebuilds options+value
+    from the fields on every context change, behind a re-entrancy lock so its
+    programmatic `set_options` echo can't flip `assign_general` (plan §8). All
+    former `sensor_sel.set_value(si)` sites (table select, sensor drag,
+    add/delete sensor) route through a new `activate_sensor()`/`refresh_owner_sel`
+    instead. `current_owner()` + band routing unchanged, so **no `.iprj`
+    format change** → no IPRJ_FORMAT.md delta.
+  - **Row-1 chrome (plan §3.1/§4).** Product name dropped; filename is a muted
+    inline label in a right-justified file cluster (template-editor · folder ·
+    filename · save), folder beside the filename, filename beside Save, full
+    path in the folder tooltip. Tool toggle `Draw·Edit·Background` (Draw first,
+    `d`/`e` keys). Accelerators: `c`/`s` moved from tool keys to Draw sub-kind
+    keys; `t` retired (Template gone until 27).
+  - **Zone table Auto/On/Off (plan §5)** on a Row-2 button+menu, right-justified
+    above the table; Auto shows it only when a zone kind is the active target
+    (`_zone_kind_active()`, recomputed in `update_context_bar`). Stored as
+    `Viewer.zone_panel_mode`.
+  - **Template deliberately dormant between 24 and 27.** The plan sequences the
+    Template fold into Item 27 (needs Item 26's CL membership), so Item 24
+    removes Template from the tool toggle/`TOOL_KEYS` and hides `template_sel` /
+    values / follow-switch / CL-select (the editor button moved to Row 1 and
+    stays visible). Template *placement* is therefore temporarily unavailable
+    from the toolbar until Item 27 wires it into Event Zone — an accepted
+    interim per plan §7 ("already gone as of Item 24's toggle").
+  - **Verified.** 460 pytest pass (19 new: `resolve_owner`, `effective_mode`,
+    `general_offered`). App builds end-to-end under NiceGUI script-mode
+    (HTTP 200, full toolbar rendered, no server errors); simulated-User click
+    driving is blocked only by `ui.toggle` options not being findable elements
+    (harness limit), so the mode/owner rules are covered by the pure unit tests
+    instead. Height budget kept at `calc(100vh - 120px)`.
+
+- 2026-07-07 — **ROADMAP Item 25 done (Opus, one session) — draw off the
+  background: oversized canvas** (`gui/app.py`, `gui/viewport.py`). The drawing
+  surface used to *be* the background: the `interactive_image` was sized exactly
+  `image_w × image_h`, mouse `offsetX/Y` were bg-image pixels, and nothing could
+  live past the image edge. Now the surface is a canvas **2× the background each
+  way, background centered**, so zones/lineals/labels/sensors can be placed
+  off-image.
+  - **Origin decision (settled up front, per the item): world coordinates are
+    untouched.** `world_to_image`/`image_to_world` stay anchored to the bg-pixel
+    origin; the canvas offset (`canvas_off_x/y = image_w/2, image_h/2`) is applied
+    **only at the render/mouse boundary** via two new `Viewer` helpers
+    `world_to_canvas` (= `world_to_image` + offset) and `canvas_to_world`
+    (= `image_to_world` of point − offset). So a load→save of an untouched
+    project is a coord no-op (existing `test_roundtrip` still green, unchanged),
+    and an off-image point is just a negative / beyond-extent world pixel value —
+    which the vendor format already stores as a plain float (confirmed: nothing
+    clamps to image bounds). **No `.iprj` format change → no IPRJ_FORMAT delta.**
+    `model/` stays pure — all the offset logic lives in the `gui` layer.
+  - **DOM split so the bg bitmap isn't quadrupled.** Rather than composite a
+    2×-sized (mostly transparent) PNG — which would 4× the decoded bitmap the
+    memory-conscious file-source design (see the Viewer.__init__ note) exists to
+    avoid — the layout now nests, inside a new transformed `stage` div, a *static*
+    `ui.image` background at the canvas offset **plus** a **transparent,
+    bitmap-free** `interactive_image` (no `source`, `size=(canvas_w, canvas_h)`,
+    so its SVG viewBox comes from `size`, not a loaded image) that owns the SVG
+    overlay and the mouse events. `offsetX/Y` are now canvas px (the overlay is
+    the full canvas at natural size). Both children ride `stage`'s transform, so
+    pan/zoom move them together.
+  - **Transform + wheel moved from `ii` to `stage`.** `apply_transform` styles
+    `stage`; the client-side `_WHEEL_ZOOM_JS` is bound to `stage` (so the JS
+    `getComputedStyle`/write and the server's style stay on the same element).
+    `set_bg_visible` now dims the separate `bg_img` directly (the old `.bg-off img`
+    CSS hack is gone). Background-swap (`upload_background`) calls a new
+    `_recompute_canvas()` so the canvas tracks the new image size.
+  - **`Viewport.fit` gained a `content_origin`** so load/fit frames the
+    *background* (passing the canvas offset), not the mostly-empty whole canvas;
+    the off-image margin is reachable by panning. Default `(0,0)` keeps every
+    existing caller/test identical.
+  - **Verified.** 466 pytest pass (6 new: `test_canvas.py` — canvas is 2×/centered,
+    world↔canvas round-trip identity, on-image geometry only shifts by the offset,
+    off-image click → valid negative world point, bg-swap recompute; plus
+    `test_fit_frames_offset_content`). Driven live under NiceGUI + Playwright on
+    `ex27.iprj`: viewBox `0 0 3396 1760` (= 2× the 1698×880 bg), zone polygon
+    renders at canvas = image+offset, mouse over bg-center reads world
+    `(849, 440) px` = exact image center, mouse past the top edge reads
+    `(849, −44) px` — a real off-image negative coord — no JS errors.
+
+- 2026-07-07 — **ROADMAP Item 26 done (Opus, one session) — bulk-edit selected
+  zones + explicit, persisted centerline membership** (`model/labels.py`,
+  `gui/drawing.py`, `gui/app.py`).
+  - **File-routing decision (settled first, as the item required): membership
+    does NOT override a zone's file — sensor placement still does.** The owner's
+    request was "a zone follows its centerline's band owner." But a zone can't
+    move to `_1_2` without moving to a sensor in that file: `split_project`
+    partitions strictly by sensor and the vendor stores zones in per-sensor
+    arrays, so "membership picks the file" is structurally impossible for zone
+    *bytes* without silently reassigning the sensor (which loses which sensor's
+    detection field the zone covers — sensor and approach are orthogonal; one
+    approach's detectors can span sensors). Resolution: membership is an
+    **organizational grouping**, not a zone→file override. What *does* follow the
+    centerline's band owner is the **membership label** (like the name label), so
+    a sensor-owned group's membership travels to the right file. A zone with no
+    centerline is unaffected (routed by its sensor). To actually consolidate a
+    group into one file the user reassigns its **sensor** — which the bulk editor
+    now does in one action. Recorded here + in IPRJ_FORMAT.md.
+  - **Membership = the `attached` set, made explicit and persisted — no new
+    parallel structure.** `CenterlineController.attached` already *was* "which
+    zones belong here" (plus the station/offset corners restation needs); Item 26
+    just changes how it is populated. New `attach_projected` (derive corners from
+    the current datum by projection — accepts any zone shape, not only an exact
+    station/offset rectangle), `detach`, `member_outputs`. The old geometric
+    `derive_attachments` becomes a **backward-compat fallback**: it skips
+    already-attached zones, and the GUI runs it only when the loaded project
+    carries *no* membership label (a pre-Item-26 file). So a file touched by this
+    feature is fully label-driven; a legacy file still auto-groups on open.
+  - **Persistence mirrors the Item 22 name label; the member key is the zone
+    slot, not OutputNumber.** The first cut keyed members by `OutputNumber`, but
+    the owner flagged that real projects reuse outputs (count loops all on 9),
+    so it isn't unique — reload would attach the wrong zone. Switched to each
+    member's **(sensor index, zone index) vendor slot**, which *is* unique and
+    round-trips exactly: `save_iprj` writes every `EventZone_{zi}` slot verbatim
+    and `load_iprj` restores it to that index (the property `model/bands.py`
+    already leans on). Intra-session index shifts (a delete compacts the list)
+    are a non-issue: in-session membership is tracked by `id(zone)`, and
+    `sync_membership_labels` recomputes the slot from live positions on every
+    save. The label `Text` is `"[name]: [sensor_zone slots]"`
+    (`format/parse_membership_label`); GUI `sync_membership_labels`
+    creates/refreshes/drops one per named centerline with members (parked
+    top-left, band = the centerline's owner); `_derive_membership` re-parses on
+    load and re-attaches by projecting each slot's zone onto the datum — **zero
+    geometry matching**. Told apart from a plain/name label purely by its
+    `name: sensor_zone-list` text shape (`is_name_label` excludes it, so the two
+    managed labels never cross-adopt).
+  - **Absolute sensor indices + pair-role offset, so a bare `_3_4` half
+    reconstructs.** Slots are written in absolute (merged-project) sensor space
+    (0–3). The split renumbers the `_3_4` half's sensors to 0/1 on disk, so a
+    naive local index would break when that half is opened standalone (the
+    owner's requirement). Fix: the reader maps absolute↔file-local via the file's
+    pair role (`Viewer._sensor_index_offset` — `+2` for a `_3_4` file, else 0),
+    on both save (local→absolute) and load (absolute→local), so absolute `2_0`
+    resolves to the `_3_4` half's local sensor `0`, a slot for a sensor absent
+    from the loaded file just doesn't resolve, and the merged overlay reads
+    straight through. **Limitation (documented):** only a *named* centerline
+    persists membership (the label needs a name to re-link); in-session
+    membership works regardless.
+  - **Bulk editor.** `gui/drawing.bulk_reassign` (pure, tested) sets phase,
+    nudges output ±1 (clamped ≥0, never set-to-N), and moves zones between
+    sensor lists by **reusing `insert_zone`** — the same cross-file move the
+    single-zone Properties dialog does. The `bulk_zone_properties` dialog (routed
+    from Properties whenever >1 event zone is selected; the old "select exactly
+    one" floor is gone) also sets the new centerline field for the whole group,
+    and after a sensor move follows the zones to the target sensor and re-selects
+    them. Membership is also an editable **Centerline** field in single-zone
+    Properties and a **CL** column in the zone table.
+  - **Verified.** 481 pytest pass (+15: `test_membership.py` ×5 — persist +
+    reload-without-geometry, label follows centerline band, dropped when
+    unnamed/empty, **bare `_3_4`-half reconstruction via the offset**, pre-Item-26
+    geometric fallback; `test_labels.py` ×4 — slot parse/format round-trip +
+    non-membership rejection + name-label exclusion; `test_drawing.py` ×6 —
+    `bulk_reassign` phase/output/clamp/cross-sensor, derive-attachments skip,
+    `attach_projected`/`member_zones`/`detach`). Headless `Viewer` drive: assign
+    membership → sync → both `N_CL` and `N_CL: 0_0` labels in the pool → `svg()`
+    renders.
+  - **Bulk editor.** `gui/drawing.bulk_reassign` (pure, tested) sets phase,
+    nudges output ±1 (clamped ≥0, never set-to-N), and moves zones between
+    sensor lists by **reusing `insert_zone`** — the same cross-file move the
+    single-zone Properties dialog does. The `bulk_zone_properties` dialog (routed
+    from Properties whenever >1 event zone is selected; the old "select exactly
+    one" floor is gone) also sets the new centerline field for the whole group,
+    and after a sensor move follows the zones to the target sensor and re-selects
+    them. Membership is also an editable **Centerline** field in single-zone
+    Properties and a **CL** column in the zone table.
+  - **Verified.** 480 pytest pass (+14: `test_membership.py` ×5 — persist +
+    reload-without-geometry, label follows centerline band, dropped when
+    unnamed/empty, pre-Item-26 geometric fallback; `test_labels.py` ×4 —
+    parse/format round-trip + non-membership rejection + name-label exclusion;
+    `test_drawing.py` ×6 — `bulk_reassign` phase/output/clamp/cross-sensor,
+    derive-attachments skip, `attach_projected`/`member_outputs`/`detach`).
+    Headless `Viewer` drive: assign membership → sync → both `N_CL` and
+    `N_CL: 5` labels in the pool → `svg()` renders.
+
+- 2026-07-07 — **ROADMAP Item 27 done (Opus, one session) — fold Template into
+  Draw › Event Zone; one CL dropdown for every drawn zone** (`gui/app.py`,
+  `gui/drawing.py`). Completes the Draw-hub fold (Item 24 did Sensor +
+  Centerline).
+  - **Template is a sub-state of "Draw", not an effective mode.** The old
+    standalone Template tool went away in Item 24; rather than resurrect a
+    `"Template"` effective mode, template placement is now the predicate
+    `Viewer.template_placement_active()` = *Draw ∧ Event Zone ∧ a template
+    picked*. The `on_down`/`on_move`/`on_dblclick`/Escape/`draw_zones`/status
+    branches that used to gate on `v.mode == "Template"` (dead since Item 24
+    dropped it from the tool toggle) now gate on that predicate, checked
+    **before** the plain `mode == "Draw"` branch — so a picked template turns a
+    click into a template drop and a blank picker leaves plain free-draw
+    untouched. `effective_mode()` is unchanged (never returns "Template"); the
+    drawing state machine still only sees Draw/Edit/Background/Centerline/Sensor.
+  - **One CL dropdown replaces the Item-19 follow-switch + pick-select.** The
+    two controls (`template_follow_switch` "along CL" bool + `template_cl_sel`
+    "pick CL" idx) collapsed into a single `event_cl_sel` backed by one field,
+    `Viewer.event_cl_idx`. Semantics simplified from three states to two: a
+    centerline **chosen** ⇒ place *along* it (one click); **blank** ⇒
+    aim-upstream (ref-then-second-click). The old "follow on, no pick ⇒ nearest
+    within `CENTERLINE_SNAP_FT`" auto mode is **retired** — the owner picks the
+    centerline explicitly now, so `Viewer.centerline_for` and the
+    `CENTERLINE_SNAP_FT` constant are gone from the live path (the constant's
+    doc moved to a tombstone; `geometry.nearest_centerline` stays, still backing
+    the on-load geometric-membership fallback in `derive_attachments`).
+  - **The CL dropdown governs *every* event zone, not just templates (the
+    Item 26 dependency).** Added an optional `on_commit(el)` hook to
+    `DrawingController`, fired in `_commit_element` after a fresh element lands
+    (covers free-draw polygons, 2-click segments, and dimensioned rects; bulk
+    `insert_many` and Edit-mode copies bypass it and own their own membership).
+    The Viewer wires it to `on_zone_committed`, which — for the Event-Zone kind
+    with a CL picked — routes the drawn zone through Item 26's
+    `set_zone_membership`, so a plain hand-drawn zone joins the chosen
+    centerline's group exactly like a template's detectors do. Blank picker ⇒ no
+    membership; non-Event-Zone kinds never take one.
+  - **Chrome per the Item 23 plan (§7).** The template-editor button already
+    lives in the Row-1 file cluster (moved there in Item 24), so it stays put
+    and persistently visible. `update_context_bar` now shows the `template`
+    picker + `event_cl_sel` in Draw › Event Zone (and the placement-values
+    button only once a template is picked); everything template-related is
+    hidden in every other tool/sub-kind. `open_template_editor` opens straight
+    to whatever template is picked (was gated on the retired `mode ==
+    "Template"`). The `t` tool key stays retired (template is reached via `z` →
+    the Event-Zone bar).
+  - **No `.iprj` format change.** Template placement, the CL dropdown, and the
+    membership binding all reuse Item 26's existing membership-label
+    persistence; no new persisted field or label shape, so IPRJ_FORMAT.md is
+    unchanged.
+  - **Height budget re-verified (plan §6).** Kept `calc(100vh - 120px)`. The
+    CL dropdown was added to the existing Event-Zone context row, which is
+    `no-wrap overflow-x-auto`, so it scrolls horizontally rather than growing:
+    headless drive at 1500×950 measured Row 1 = 32 px and the (now busiest)
+    Event-Zone Row 2 = 40 px, a single line, and the viewport
+    (`calc(100vh-120px)` = 830 px) sits flush at the window bottom. Both
+    toolbar bars fit; no regression from this item. (A pre-existing ~50 px
+    overflow from the *status bar below* the viewport is independent of Item 27
+    — the viewport budget only accounts for the top chrome — and was left as-is.)
+  - **Verified.** 492 pytest pass (+11 `tests/test_template_fold.py`:
+    `template_placement_active` gating ×3, `template_target_centerline`
+    picked/blank/datum-less ×3, `on_zone_committed` membership picked/blank/
+    non-event-zone ×3, `DrawingController.on_commit` fires-once + end-to-end
+    free-draw→membership ×2). Live Playwright drive (raw-PNG project): Draw ›
+    Event Zone shows the template picker + along-CL dropdown; Ignore Zone hides
+    them; picking a template opens the placement-values prompt and reveals the
+    placement-values button; no console/page errors.
+
+- 2026-07-08 — **Height budget fix (Opus) — the app was ~one row too tall on
+  every machine** (`gui/app.py` layout only). The owner ran the app after the
+  Items 23–27 batch and found it still overflowed the window by about one row;
+  the batch's "height budget" checkboxes (Item 24 "-120px kept", Item 27
+  "re-verify") had only ever confirmed the *two toolbar bars* fit, never that
+  the whole page did.
+  - **Root cause (reproduced, not machine-specific).** The viewport div and the
+    zone panel were both `height: calc(100vh - 120px)`. That `120px` covered
+    only the chrome *above* the viewport (top padding + the two toolbar rows +
+    gaps ≈ 120px), so the viewport stretched flush to the window's bottom edge
+    and the **status bar below it had no budget** — it plus the row gaps hung
+    off the bottom. A headless Chromium sweep confirmed a *constant* 53px
+    overflow at window heights 760/900/1080 (a machine quirk would vary; a fixed
+    offset is structural), with `viewportBottom == windowHeight` every time.
+  - **Fix: a real flex column, no pixel constant.** Pinned `.nicegui-content`
+    to `height: 100vh; padding: 0; gap: 0; overflow: hidden` (via `ui.query`),
+    made the canvas row `flex-1 min-h-0` so it absorbs exactly the leftover
+    space, and changed the viewport div + zone panel from `calc(100vh - 120px)`
+    to `height: 100%`. The toolbar rows and status bar now sit at their natural
+    heights and the canvas fills the rest — correct on any font/DPI/mode with
+    nothing to keep in sync. (`Viewport.fit` already reads the live viewport
+    `clientHeight`, so framing adapts automatically.)
+  - **Verified.** Headless sweep at window heights 700/760/900/1080 in Draw ›
+    Event Zone (the busiest bar): **0px overflow** at all four, status bar fully
+    on screen (bottom == window height), viewport height scales with the window
+    (chrome is now exactly 32 + 40 + 21 = 93px of natural row heights). 492
+    pytest still pass (layout-only change); no console/page errors.
+
+- 2026-07-08 — **Two post-batch UI fixes (Opus) — zone-table width + ruler
+  auto-exit** (`gui/app.py`; both issues the Items 23–27 batch introduced).
+  - **Zone table no longer needs a horizontal scrollbar.** The panel was `w-96`
+    (384px) but the 7-column table (S · On · Name · Ph · Out · Type · CL, plus
+    the multi-select checkbox) measures ~466px, so Quasar's internal scroll
+    container scrolled sideways. Widened the panel to `w-[32rem]` (512px) — the
+    table now fills it (504px, zero internal overflow) and reads at a glance, at
+    the cost of a little canvas width (owner's explicit trade). It grew past
+    `w-96` as Item 16 (side-by-side detector table) and Item 26 (the CL column)
+    added columns.
+  - **Ruler exits when another tool is selected.** The ruler is a cross-tool
+    overlay that captures clicks regardless of the active tool (Item 1), so once
+    armed it blocked every other tool until toggled off — a trap once
+    Sensor/Centerline/Template folded into the Draw sub-kinds (more ways to
+    "pick a tool" that didn't clear it). Added `set_ruler_active(False)` to
+    `_enter_mode`, the shared teardown for `change_tool` + `change_draw_kind`, so
+    selecting any tool or Draw sub-kind drops the ruler. Verified headlessly: arm
+    with `r` → select Edit → off; re-arm → switch sub-kind to Lineal → off.
+  - 492 pytest still pass (GUI-handler/layout only); no console/page errors.
+
 ## Appendix — example template (acceptance case, revised for Items 15/17/18)
 
 45 mph approach, lanes `12' L | 12' T | 12' T | 12' R`, count loops, starting

@@ -4,6 +4,18 @@ Read ROADMAP.md first; sessions are scoped there. At the end of a session,
 check off completed items, log decisions in the Decisions log, and update
 IPRJ_FORMAT.md if format knowledge changed.
 
+## Scoping new ROADMAP items
+
+When the owner hands over a batch of requests to scope, **group them into
+session-sized items** — each item should be a reasonable single working
+session / one context window (plan + implement + tests + finishing pass),
+**not** one item per bullet the owner listed. Merge small/related requests
+(e.g. several toolbar tweaks → one "toolbar pass") and keep genuinely large
+or independent work as its own item; split a request only when it's too big
+for one session. Assign new stable IDs continuing from the last one used
+(unless the owner says to restart), note dependencies between items inline,
+and keep the Target/Scope/Suggested-prompt format the existing items use.
+
 ## Architecture (non-negotiable)
 
 - `model/` is pure Python — no GUI framework imports, no global state. All

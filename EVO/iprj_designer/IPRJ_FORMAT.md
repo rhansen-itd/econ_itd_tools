@@ -290,6 +290,37 @@ name label, and its `Text` becomes the name (`match_name_labels`, one-to-one,
 nearest-wins). The label lives in the same index band as its centerline, so a
 sensor-owned centerline's name travels to the right file on the 2-file split.
 
+**Centerline-membership labels (ours, ROADMAP Item 26 — `model/labels.py`):**
+which zones belong to which approach centerline is likewise carried with no
+format extension — as a second **no-rotation `Textlabel`** whose `Text` reads
+`"[centerline name]: [sensor_zone slots]"` (e.g. `"N_CL: 2_5, 2_7, 3_1"`),
+parked top-left (its position is cosmetic). Each member is named by its
+**(sensor index, zone index) slot**, because the vendor stores zones in fixed
+per-sensor slots that persist by index across a save/reload (`save_iprj` writes
+every `EventZone_{zi}` slot verbatim, `load_iprj` restores it to the same
+index — the same property `model/bands.py` relies on for Lineals/Textlabels).
+The slot is therefore a *unique*, round-trip-stable identifier, unlike
+`OutputNumber`, which real projects reuse across zones (e.g. count loops sharing
+one output). On load the label is re-parsed (`parse_membership_label`) and each
+listed slot re-attached by projecting the zone onto the datum — **no geometry
+matching** — superseding the older geometric `derive_attachments`, which now
+runs only for a file carrying no membership label at all.
+
+The sensor index is written in **absolute (merged-project) space** (sensors
+0–3). On the 2-file split the `_3_4` half's sensors are renumbered to 0/1, so on
+load the reader offsets file-local indices back to absolute from the file's pair
+role (`_derive_membership` / `Viewer._sensor_index_offset`): opening a bare
+`_3_4` half (its sensor 0 = absolute sensor 2) still resolves its own members, a
+slot for a sensor absent from the loaded file simply doesn't resolve, and the
+merged overlay reads them straight through. The label sits in its centerline's
+index band (so a sensor-owned group's membership travels to the right file), but
+that routes only the *label*: a **zone's** file is still decided by which sensor
+holds it (`split_project` partitions by sensor), because the vendor stores zones
+in per-sensor arrays — membership is an organizational grouping, not a zone→file
+override. A membership label is told apart from a plain/name label purely by its
+`name: sensor_zone-list` text shape, so an ordinary label is never mistaken for
+one.
+
 ### Plot preferences
 
 `PlotPreferences_…`: `AdjustTrackToLane`, `HideBackgroundImage`, `HideClass`,

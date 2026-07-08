@@ -120,34 +120,38 @@ upload button replaces the open project's background image in place —
 zones, sensors, and centerlines are kept; recalibrate afterward if the new
 image is at a different scale.
 
-Ruler: a persistent chrome-row toggle (r), not a tool — click to set the
-first point, move to see the live distance in feet, click again (or
-release a drag) to set the second, while whatever tool you're already in
-(Draw, Edit, …) stays active underneath. "Clear ruler" next to it clears
-the measurement; Esc cancels one in progress.
+Ruler: a chrome-row toggle (r) — click to set the first point, move to see
+the live distance in feet, click again (or release a drag) to set the
+second. It captures clicks over whatever tool is active underneath, but
+selecting another tool or Draw sub-kind turns it off (so a picked tool is
+usable immediately, not blocked by a forgotten ruler). "Clear ruler" next to
+it clears the measurement; Esc cancels one in progress.
 
-Template tool: pick a template from the context bar dropdown; if it leaves
-any placement value unresolved, a dialog prompts for direction/thru
-phase/LT phase/Base Output before you can place it (reopen it any time via
-the "placement values" button). Then click the anchor reference point
-(where the stop bar crosses the template's anchor lane line — by default
-the line between the exclusive left-turn lanes and the thru lanes). With a
-centerline drawn, that one click places the whole detector set along the
-nearest centerline within a snap threshold (~40 ft laterally, Item 19); with
-no centerline near (or the "along CL" toggle off), click again to aim
-upstream and place along that straight line. The "pick CL" dropdown pins
-placement to one specific centerline instead, bypassing the threshold.
-Centerline-placed zones stay attached: reshaping the centerline re-stations
-them. The .iprj cannot store the attachment itself, so reopening a project
-re-derives it — zones that are still exact station/offset rectangles on a
-centerline re-attach automatically (a notification reports how many).
+Templates (Item 27: folded into Draw › Event Zone, no separate tool): in
+Draw with the Event Zone sub-kind, pick a template from the context-bar
+"template" dropdown to switch clicks from free-draw to template drops; leave
+it blank to free-draw a plain event zone. If a picked template leaves any
+placement value unresolved, a dialog prompts for direction/thru phase/LT
+phase/Base Output before you can place it (reopen it any time via the
+"placement values" button). Then click the anchor reference point (where the
+stop bar crosses the template's anchor lane line — by default the line
+between the exclusive left-turn lanes and the thru lanes). The one "along CL"
+dropdown (Item 27, replacing the Item-19 follow-switch + pick-select) governs
+every event zone drawn here: pick a centerline and that one click places the
+whole detector set along it (and a plain drawn zone joins its membership
+group, Item 26); leave it blank to click again and aim upstream, placing
+along that straight line with no group. Centerline-placed zones stay
+attached: reshaping the centerline re-stations them. Membership is persisted
+explicitly (Item 26), so reopening a project restores it without re-deriving
+from geometry; pre-Item-26 files fall back to the geometric re-derivation
+(a notification reports how many zones re-attached).
 
 Centerline tool: pick the active centerline from its selector (or add a new
 one for another approach), then click along it starting at the stop bar
 (station 0) and continuing upstream; click-drag repositions a vertex, x/Del
 removes the selected one. Name the active centerline in the "name" box
 (Item 20; session-only, e.g. N_CL for the north approach) — the name shows
-in every centerline picker, including the template "pick CL" dropdown. The
+in every centerline picker, including the Event-Zone "along CL" dropdown. The
 status/position readouts show live station + offset while the tool is
 active. All centerlines in the project render at once; only the active one
 is editable.
@@ -179,15 +183,16 @@ from nicegui import ui
 
 from gui.drawing import (ARROWS, DIM_OFF, IGNORE_KIND, LABEL_KIND, LINEAL_KIND,
                          LOOP_KIND, NUDGE_FT, CenterlineController,
-                         DrawingController, derive_attachments, element_owner,
-                         element_points, insert_zone, is_placeholder,
-                         next_output_number, set_element_owner)
+                         DrawingController, bulk_reassign, derive_attachments,
+                         element_owner, element_points, insert_zone,
+                         is_placeholder, next_output_number, set_element_owner)
 from gui.viewport import MAX_SCALE, MIN_SCALE, Viewport
 from model import domain, geometry, units
-from model.bands import Owner, sensor_owner
+from model.bands import Owner, resolve_owner, sensor_owner
 from model.centerline import (load_centerlines_owned, load_lineals_owned,
                               save_centerlines_owned, save_lineals_owned)
-from model.labels import (load_labels_owned, match_name_labels,
+from model.labels import (format_membership_label, load_labels_owned,
+                          match_name_labels, parse_membership_label,
                           save_labels_owned)
 from model.iprj_io import (Background, Condition, EventZone, Project, Sensor,
                            TextLabel, load_iprj, save_iprj)
@@ -205,14 +210,23 @@ TEMPLATES_DIR = Path(__file__).resolve().parents[1] / "templates"
 PHASE_COLORS = ["#d62728", "#1f77b4", "#2ca02c", "#ff7f0e", "#9467bd",
                 "#8c564b", "#e377c2", "#bcbd22", "#17becf"]
 
-# How far (feet, laterally) the template anchor click may sit from a
-# centerline and still snap "along" it (Item 19). The old behavior had no
-# threshold — any click followed the nearest centerline however far away —
-# which made snapping overwhelmingly strong. One approach's worth of lanes
-# is a generous but bounded reach; beyond it, placement falls back to the
-# aim-upstream click. Only consulted for the auto/nearest path; an explicitly
-# picked centerline (the toolbar dropdown) ignores it.
-CENTERLINE_SNAP_FT = 40.0
+# (ROADMAP Item 27 retired the nearest-centerline snap threshold that used to
+# live here — template placement now follows an explicitly picked centerline
+# or aims upstream, never an auto/nearest datum. `geometry.nearest_centerline`
+# still backs the on-load geometric membership fallback in derive_attachments.)
+
+# Where a centerline's membership label parks (ROADMAP Item 26): stacked near
+# the image's top-left, in image px, converted to world on placement. The tie
+# is re-derived from the label's Text, not its position, so this is purely
+# cosmetic — a tidy spot out of the way of the geometry.
+MEMBERSHIP_MARGIN_PX = 16.0
+MEMBERSHIP_STEP_PX = 22.0
+
+# Centerline-select sentinels for the properties/bulk dialogs (Item 26): a real
+# centerline is a 0-based index, so these stay out of that range.
+_CL_NONE = -1        # "— none —" (detach from any centerline)
+_CL_UNCHANGED = -2   # bulk editor: leave each zone's membership as-is
+_SENSOR_UNCHANGED = -1  # bulk editor: leave each zone's sensor as-is
 
 # Draw sub-types (PHASE3_UI_PLAN §4.1) shown in the Draw tool's context bar.
 # "Text Label" is the ROADMAP Item 22 point entity.
@@ -222,6 +236,45 @@ DRAW_KINDS = {"Event Zone": LOOP_KIND, "Ignore Zone": IGNORE_KIND,
 # Which draw sub-types are band-owned project-wide pools (route to a sensor
 # file by index band) rather than a sensor's own zone list (ROADMAP Item 22).
 OWNED_KINDS = {"Lineal", "Text Label"}
+
+# Draw sub-kinds that aren't element-drawing kinds but fold into the Draw tool
+# as their own effective modes (ROADMAP Item 24). draw_kind_toggle carries them
+# alongside DRAW_KINDS; the Viewer's draw_kind_name stays the last *drawing*
+# kind (so draw_zones()/DRAW_KINDS lookups remain valid) while these are active.
+MODE_SUBKINDS = ("Centerline", "Sensor")
+
+# Sentinel option key for "General" in the unified Owner/Sensor dropdown
+# (Item 24); sensor options use plain int indices, so a non-int key is unambiguous.
+_GENERAL_KEY = "G"
+
+
+def effective_mode(tool_val: str, kind_val: str) -> str:
+    """The effective mode the drawing state machine branches on (ROADMAP
+    Item 24), derived from the top-level tool (Draw/Edit/Background) plus the
+    Draw sub-kind. Sensor and Centerline sub-kinds resolve to their own modes;
+    everything else under Draw is "Draw". Template (Item 27) is a sub-state of
+    "Draw" › Event Zone, not an effective mode, so it never resolves here."""
+    if tool_val == "Edit":
+        return "Edit"
+    if tool_val == "Background":
+        return "Background"
+    if kind_val == "Centerline":
+        return "Centerline"
+    if kind_val == "Sensor":
+        return "Sensor"
+    return "Draw"
+
+
+def general_offered(mode: str, draw_kind: str) -> bool:
+    """Whether "General" is a valid owner in the given mode/sub-kind (Item 24,
+    §3.3): owned annotations (Lineal/Text Label) and centerlines may be General.
+    Zones and sensor picking must name a sensor; Edit only scopes the active
+    sensor (it never sets an owner), so it offers sensors only too."""
+    if mode == "Centerline":
+        return True
+    if mode == "Draw":
+        return draw_kind in OWNED_KINDS
+    return False  # Edit, Sensor, Background
 
 # Vendor-confirmed ZoneType names (see model/domain.py): 0 Motion,
 # 1 Presence, 2 Sidewalk.
@@ -333,12 +386,28 @@ class Viewer:
             f.write(png)
         self.image_file = Path(name)
         atexit.register(lambda p=self.image_file: p.unlink(missing_ok=True))
+        # Item 25: the drawing surface is an oversized canvas — 2x the background
+        # each way, background centered inside it — so zones/lineals/labels/
+        # sensors can be placed *off* the image. World coordinates are untouched
+        # (saved .iprj coords never shift): world<->image stays anchored to the
+        # bg-pixel origin, and the canvas offset is applied only at the render /
+        # mouse boundary via world_to_canvas / canvas_to_world.
+        self._recompute_canvas()
         self.viewport = Viewport()
-        # Phase 3.2b: 6 primary tools (Edit/Draw/Template/Centerline/
-        # Sensor/Background) replace the old 9-entry flat toggle; Pan is gone
-        # (PHASE3_UI_PLAN §5) — Edit is the default and panning is an
-        # implicit gesture (space_pan / middle-drag) available everywhere.
+        # ROADMAP Item 24: the top-level tool toggle is now Draw/Edit/Background
+        # only; Sensor and Centerline fold into Draw sub-kinds (draw_kind_toggle).
+        # `self.mode` stays the *effective* mode the drawing state machine
+        # branches on — "Draw"/"Edit"/"Background"/"Centerline"/"Sensor" —
+        # derived from tool + sub-kind by effective_mode(). Item 27 folded
+        # template placement into Draw › Event Zone: it is not its own mode but
+        # a sub-state of "Draw" (see template_placement_active()), live when a
+        # template is picked in the Event-Zone bar. (History: Phase 3.2b had six
+        # top-level tools; Pan is gone since PHASE3_UI_PLAN §5 — Edit is the
+        # default and panning is space_pan / middle-drag everywhere.)
         self.mode = "Edit"
+        # Zone-table panel visibility (Item 24, §5): "Auto" shows it only when a
+        # zone kind is the active target, "On" always, "Off" never.
+        self.zone_panel_mode = "Auto"
         self.space_pan = False       # True while the space bar is held
         # Draw sub-type (Event Zone/Ignore Zone/Lineal, §4) also selects what
         # Edit operates on — the two tools share one DrawingController
@@ -408,13 +477,11 @@ class Viewer:
         # model.templates.PlacementContext). Reset whenever the template
         # selection changes; edited via the "placement values" dialog.
         self.template_context = PlacementContext()
-        # Item 19: whether template placement follows a centerline at all, and
-        # optionally which one. follow=True + idx=None is the default (snap to
-        # the nearest centerline within CENTERLINE_SNAP_FT of the anchor,
-        # else aim-upstream); follow=False forces aim-upstream; a non-None idx
-        # pins placement to that specific centerline (no nearest/threshold).
-        self.template_follow_centerline = True
-        self.template_centerline_idx: int | None = None
+        # Item 27: one CL dropdown for Event-Zone drawing (was the Item 19
+        # follow-switch + pick-select). A chosen centerline index ⇒ templates
+        # place *along* it and a plain drawn zone joins its membership group
+        # (Item 26); None ⇒ aim-upstream template placement / no membership.
+        self.event_cl_idx: int | None = None
         # approach centerlines (Session 7.2 draw/edit, Session 7.4
         # persistence): one CenterlineController per centerline found in the
         # project's Lineals, plus a fresh empty one ready to draw if there
@@ -440,16 +507,21 @@ class Viewer:
         self.ctrl = DrawingController(self.draw_zones(),
                                       self.ft_per_px, self.next_output,
                                       owner_supplier=self.current_owner,
-                                      label_draft=lambda: self.label_draft)
+                                      label_draft=lambda: self.label_draft,
+                                      on_commit=self.on_zone_committed)
         # self.mode defaults to "Edit" (ctrl.mode "edit"); a ui.toggle's on_change
         # fires only on a user-driven change, never for its initial value,
         # so the controller needs this nudge to start in step with the tool.
         self.ctrl.set_mode("edit")
-        # Attachments don't persist in the .iprj, so re-derive them: zones
-        # that are exact station/offset rectangles on a loaded centerline
-        # follow centerline edits again after reopening the project.
-        self.derived_attachments = derive_attachments(
-            self.centerlines, [s.event_zones for s in project.sensors])
+        # Centerline membership (ROADMAP Item 26) is explicit and persisted as
+        # a per-centerline label; reconstruct it from those labels — no
+        # geometry. Only when the project carries none (a pre-Item-26 file) do
+        # we fall back to the old geometric derivation, which re-attaches zones
+        # that are exact station/offset rectangles on a loaded centerline.
+        self._derive_membership()
+        self.derived_attachments = 0 if self._has_membership_labels else \
+            derive_attachments(
+                self.centerlines, [s.event_zones for s in project.sensors])
 
     def next_output(self) -> int:
         return next_output_number(s.event_zones for s in self.project.sensors)
@@ -556,32 +628,176 @@ class Viewer:
         lbl.rotation_angle = 0.0
         set_element_owner(lbl, cl.owner)
 
-    def centerline_for(self, p) -> CenterlineController | None:
-        """The drawn centerline nearest world point *p* (smallest |offset|
-        of its projection) *within CENTERLINE_SNAP_FT laterally* — the datum
-        template placement snaps to — or None when none qualifies (no usable
-        datum yet, or all of them are farther than the threshold). Item 19
-        added the threshold; before it any click followed the nearest datum
-        however far away."""
-        fpp = self.ft_per_px()
-        max_off = None if fpp is None else CENTERLINE_SNAP_FT / fpp
-        datums = [ctrl.current() for ctrl in self.centerlines]
-        i = geometry.nearest_centerline(datums, p, max_off)
-        return None if i is None else self.centerlines[i]
+    # -- centerline-membership labels (ROADMAP Item 26) ---------------------
 
-    def template_target_centerline(self, p) -> CenterlineController | None:
-        """Which centerline (if any) template placement should follow for an
-        anchor click at world point *p*, honoring the Item 19 toolbar state:
-        an explicitly picked centerline pins placement (no threshold); else,
-        when following is on, the nearest within CENTERLINE_SNAP_FT; else
-        None (aim-upstream placement)."""
-        idx = self.template_centerline_idx
+    @property
+    def _sensor_index_offset(self) -> int:
+        """Absolute-vs-file-local sensor-index offset for membership slots
+        (ROADMAP Item 26). Membership slots are written in absolute
+        (merged-project) sensor space (0-3); the two-file split renumbers the
+        _3_4 half's sensors to 0/1 on disk, so when this project *is* a bare
+        _3_4 half its file-local sensors are 2 below absolute. Everything else
+        — the merged overlay, the _1_2 half, an ordinary single file — is
+        offset 0 (its local indices already equal absolute)."""
+        return 2 if pair_role(self.source) == "3_4" else 0
+
+    def _zone_slot(self, zone) -> tuple[int, int] | None:
+        """The zone's (sensor index, zone index) slot in the loaded project by
+        identity, or None (ROADMAP Item 26). These are *file-local* indices;
+        `member_slots` shifts them to absolute for persistence."""
+        for si, s in enumerate(self.project.sensors):
+            for zi, z in enumerate(s.event_zones):
+                if z is zone:
+                    return (si, zi)
+        return None
+
+    def member_slots(self, cl: CenterlineController) -> list[tuple[int, int]]:
+        """Absolute (sensor, zone-index) slots of *cl*'s member zones — what its
+        membership label persists (ROADMAP Item 26). File-local slots are lifted
+        to absolute space by `_sensor_index_offset` so a re-save from a bare
+        _3_4 half still writes merged-space indices."""
+        off = self._sensor_index_offset
+        slots = []
+        for zone in cl.member_zones():
+            slot = self._zone_slot(zone)
+            if slot is not None:
+                slots.append((slot[0] + off, slot[1]))
+        return slots
+
+    def _derive_membership(self) -> None:
+        """On load: reconstruct each centerline's zone membership from its
+        persisted membership label (ROADMAP Item 26) — the explicit,
+        no-geometry replacement for `derive_attachments`. A label whose Text
+        parses as ``"name: slots"`` (`parse_membership_label`) and whose name
+        matches a centerline is adopted as that centerline's managed membership
+        label, and every listed slot re-attached (projected onto the datum).
+        Slots are absolute sensor indices, mapped to this file's local indexing
+        by `_sensor_index_offset`, so a bare _3_4 half resolves its own members
+        even though its sensors are renumbered to 0/1 on disk (a slot for a
+        sensor not in this file simply doesn't resolve and is skipped). Sets
+        `_has_membership_labels` so the caller knows whether to fall back to the
+        geometric derivation."""
+        self._has_membership_labels = False
+        off = self._sensor_index_offset
+        by_name: dict[str, CenterlineController] = {}
+        for cl in self.centerlines:
+            nm = (cl.name or "").strip()
+            if nm:
+                by_name.setdefault(nm, cl)
+        for lbl in self.labels:
+            parsed = parse_membership_label(lbl.text or "")
+            if parsed is None:
+                continue
+            name, slots = parsed
+            cl = by_name.get(name)
+            if cl is None or cl.membership_label is not None:
+                continue
+            cl.membership_label = lbl
+            self._has_membership_labels = True
+            for abs_si, zi in slots:
+                local_si = abs_si - off
+                if not (0 <= local_si < len(self.project.sensors)):
+                    continue
+                zones = self.project.sensors[local_si].event_zones
+                if 0 <= zi < len(zones) and not is_placeholder(zones[zi]):
+                    cl.attach_projected(zones[zi])
+
+    def _membership_anchor(self, slot: int) -> tuple[float, float]:
+        """World-px parking point for the *slot*-th membership label — stacked
+        near the image's top-left (position is cosmetic; see Item 26)."""
+        return units.image_to_world(
+            self.bg, (MEMBERSHIP_MARGIN_PX,
+                      MEMBERSHIP_MARGIN_PX + slot * MEMBERSHIP_STEP_PX))
+
+    def sync_membership_labels(self) -> None:
+        """Keep every centerline's membership label in step with its members,
+        name, and owner band before save (ROADMAP Item 26): create it when a
+        named centerline first has members, refresh its ``name: slots`` text,
+        and drop it when the name is cleared or the last member leaves. Only
+        named centerlines persist membership (the label needs a name to re-link
+        on load); an unnamed centerline's membership stays session-local."""
+        slot = 0
+        for cl in self.centerlines:
+            slot = self._sync_one_membership_label(cl, slot)
+
+    def _sync_one_membership_label(self, cl: CenterlineController,
+                                   slot: int) -> int:
+        lbl = cl.membership_label
+        if lbl is not None and self._label_index(lbl) == -1:
+            lbl = cl.membership_label = None  # user deleted it from the pool
+        name = (cl.name or "").strip()
+        slots = self.member_slots(cl)
+        if not name or not slots:
+            if lbl is not None:
+                idx = self._label_index(lbl)
+                if idx != -1:
+                    self.labels.pop(idx)
+                cl.membership_label = None
+            return slot
+        text = format_membership_label(name, slots)
+        anchor = self._membership_anchor(slot)
+        if lbl is None:
+            lbl = domain.new_label(anchor, text)
+            cl.membership_label = lbl
+            self.labels.append(lbl)
+        lbl.text = text
+        lbl.position_x, lbl.position_y = float(anchor[0]), float(anchor[1])
+        lbl.rotation_angle = 0.0
+        set_element_owner(lbl, cl.owner)
+        return slot + 1
+
+    def membership_for(self, zone) -> CenterlineController | None:
+        """The centerline *zone* is a member of, or None (ROADMAP Item 26)."""
+        for cl in self.centerlines:
+            if id(zone) in cl.attached:
+                return cl
+        return None
+
+    def set_zone_membership(self, zone, target_ci: int) -> bool:
+        """Move *zone* into centerline index *target_ci* (or detach it when
+        *target_ci* < 0), dropping any prior membership (ROADMAP Item 26).
+        Returns True on success; False when the target centerline has no datum
+        yet (nothing changes in that case)."""
+        target = self.centerlines[target_ci] \
+            if 0 <= target_ci < len(self.centerlines) else None
+        if target is not None and target.current() is None:
+            return False
+        for cl in self.centerlines:
+            cl.detach(zone)
+        if target is not None:
+            target.attach_projected(zone)
+        return True
+
+    def template_placement_active(self) -> bool:
+        """Whether the Event-Zone CL-driven template drop is live (ROADMAP
+        Item 27): Template folded into Draw › Event Zone, so a template picked
+        in the CL/template bar turns each click into a template drop instead of
+        a free-draw polygon. Blank template ⇒ plain event-zone drawing."""
+        return (self.mode == "Draw" and self.draw_kind_name == "Event Zone"
+                and self.template is not None)
+
+    def template_target_centerline(self) -> CenterlineController | None:
+        """The centerline template placement follows, or None for aim-upstream
+        (ROADMAP Item 27). The Item 19 follow-switch + pick-select collapsed
+        into one CL dropdown (`event_cl_idx`): a centerline chosen with a usable
+        datum ⇒ place *along* it; blank (or a datum-less pick) ⇒ None, the
+        ref-then-aim-upstream flow. The nearest-within-threshold auto mode is
+        retired — the owner picks the centerline explicitly now."""
+        idx = self.event_cl_idx
         if idx is not None and 0 <= idx < len(self.centerlines):
             ctrl = self.centerlines[idx]
             return ctrl if ctrl.current() is not None else None
-        if not self.template_follow_centerline:
-            return None
-        return self.centerline_for(p)
+        return None
+
+    def on_zone_committed(self, el) -> None:
+        """DrawingController.on_commit hook (ROADMAP Item 27): a plain event
+        zone drawn while a centerline is picked in the CL dropdown joins that
+        centerline's explicit membership group (Item 26). Only fires for the
+        active draw kind, so it gates on Event Zone; template drops and Edit
+        copies route their own membership and don't reach here."""
+        if self.draw_kind_name != "Event Zone" or self.event_cl_idx is None:
+            return
+        self.set_zone_membership(el, self.event_cl_idx)
 
     def reproject_attachments(self) -> None:
         """After a manual zone edit: let every centerline re-derive its
@@ -608,8 +824,30 @@ class Viewer:
         except ValueError:
             return None
 
-    def describe(self, image_point) -> str:
-        wx, wy = units.image_to_world(self.bg, image_point)
+    def _recompute_canvas(self) -> None:
+        """(Re)derive the oversized-canvas size and background offset from the
+        current image dimensions (Item 25). Called on load and after a
+        background swap so the canvas tracks the new image size."""
+        self.canvas_w = 2 * self.image_w
+        self.canvas_h = 2 * self.image_h
+        self.canvas_off_x = self.image_w / 2.0
+        self.canvas_off_y = self.image_h / 2.0
+
+    def world_to_canvas(self, p):
+        """World px -> canvas px (element/SVG space). The only place the canvas
+        offset is added on the render side."""
+        ix, iy = units.world_to_image(self.bg, p)
+        return (ix + self.canvas_off_x, iy + self.canvas_off_y)
+
+    def canvas_to_world(self, c):
+        """Canvas px (mouse offsetX/Y) -> world px. Inverse of world_to_canvas;
+        an off-image click yields a valid (possibly negative/beyond-extent)
+        world point without disturbing on-image geometry."""
+        return units.image_to_world(
+            self.bg, (c[0] - self.canvas_off_x, c[1] - self.canvas_off_y))
+
+    def describe(self, canvas_point) -> str:
+        wx, wy = self.canvas_to_world(canvas_point)
         fpp = self.ft_per_px()
         base = (f"{wx:.1f}, {wy:.1f} px (uncalibrated)" if fpp is None else
                 f"{wx * fpp:.1f}, {wy * fpp:.1f} ft   ({wx:.1f}, {wy:.1f} px)")
@@ -645,18 +883,12 @@ class Viewer:
             return (f"mode: template | {self.template.name} | fill in "
                      f"placement values ({', '.join(missing)}) above before "
                      "placing")
-        idx = self.template_centerline_idx
+        idx = self.event_cl_idx
         if idx is not None and 0 <= idx < len(self.centerlines) \
                 and self.centerlines[idx].current() is not None:
             return (f"mode: template | {self.template.name} | click the "
                     "anchor point (stop bar at the LT/thru lane line) — "
                     f"detectors follow {self.centerline_label(idx)}")
-        if self.template_follow_centerline \
-                and any(cl.current() is not None for cl in self.centerlines):
-            return (f"mode: template | {self.template.name} | click the "
-                    "anchor point (stop bar at the LT/thru lane line) — "
-                    "detectors follow the nearest centerline within "
-                    f"{CENTERLINE_SNAP_FT:.0f} ft, else aim upstream")
         if self.template_ref is None:
             return (f"mode: template | {self.template.name} | click the "
                     "anchor point (stop bar at the LT/thru lane line)")
@@ -667,7 +899,9 @@ class Viewer:
 
     def svg(self) -> str:
         bg = self.bg
-        w2i = lambda p: units.world_to_image(bg, p)
+        # Overlay geometry is drawn in canvas space (world_to_image + offset)
+        # so it registers with the offset background inside the oversized canvas.
+        w2i = self.world_to_canvas
         lw = self.overlay_px / max(self.viewport.scale, 0.05)
         font = 7 * lw
         parts = []
@@ -876,15 +1110,14 @@ class Viewer:
         # template placement: reference marker, aim line, live detector preview.
         # With a usable centerline the preview follows it at the hover point
         # (single click places); otherwise the legacy ref-then-aim flow.
-        if self.mode == "Template" and self.template is not None:
+        if self.template_placement_active():
             cursor = self.template_cursor
             # mirror place_template's target so the preview matches what the
-            # click will actually do (Item 19 toggle/pick/threshold state)
-            cl_ctrl = (self.template_target_centerline(cursor)
-                       if cursor is not None else None)
+            # click will actually do (the CL dropdown pick, Item 27)
+            cl_ctrl = self.template_target_centerline()
             placed = []
             fpp = self.ft_per_px()
-            if cl_ctrl is not None:
+            if cl_ctrl is not None and cursor is not None:
                 cx, cy = w2i(cursor)
                 parts.append(_cross(cx, cy, 5 * lw, "#00e5ff", lw))
                 if fpp is not None:
@@ -938,8 +1171,10 @@ class Viewer:
 # `emit` is captured from NiceGUI's event closure, so this must stay an inline
 # arrow (a head-defined global couldn't see `emit`). getComputedStyle re-reads
 # the live matrix each tick, so server-driven pan/fit stay authoritative
-# between gestures. e.offsetX/Y are the img's untransformed local coords
-# (= image pixels), exactly what the old server handler consumed.
+# between gestures. e.offsetX/Y are the overlay's untransformed local coords
+# (= canvas pixels since Item 25's oversized canvas), and getComputedStyle
+# reads `stage` — the element this handler is bound to and the one the server
+# transforms — so client and server stay on the same coordinate surface.
 _WHEEL_ZOOM_JS = f"""(e) => {{
   const el = e.currentTarget;
   const cs = getComputedStyle(el).transform;
@@ -962,12 +1197,8 @@ _WHEEL_ZOOM_JS = f"""(e) => {{
 def build_ui(viewer: Viewer, state: dict) -> None:
     v = viewer
 
-    # interactive_image's <img> sets opacity via an inline Vue :style
-    # binding, which always wins over a class selector — !important is
-    # required for .bg-off to actually hide it.
     ui.add_head_html(
-        "<style>body { background: #222; } "
-        ".bg-off img { opacity: 0 !important; }</style>"
+        "<style>body { background: #222; }</style>"
         # keep Ctrl-S for project save instead of the browser's save dialog
         "<script>document.addEventListener('keydown', e => {"
         " if ((e.ctrlKey || e.metaKey) && e.key === 's') e.preventDefault();"
@@ -977,7 +1208,9 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         ii.content = v.svg()
 
     def apply_transform():
-        ii.style(v.viewport.css())
+        # Item 25: pan/zoom act on `stage` (the oversized surface holding both
+        # the background image and the interactive_image overlay), not on `ii`.
+        stage.style(v.viewport.css())
         # snap/grab radii feel constant on screen regardless of zoom
         f = units.image_scale_factor(v.bg) / max(v.viewport.scale, 0.05)
         v.ctrl.snap_radius = 12.0 * f
@@ -1052,10 +1285,7 @@ def build_ui(viewer: Viewer, state: dict) -> None:
                 ui.notify("select an event zone in the Edit tool first", type="warning")
                 return
             if len(v.ctrl.selection) > 1:
-                # bulk edit is a v1 follow-up (PHASE3_UI_PLAN §8.2) — the
-                # floor is disabling single-zone Properties for a group
-                ui.notify("select exactly one zone for properties",
-                          type="warning")
+                bulk_zone_properties()  # ROADMAP Item 26
                 return
             si, zi = v.active_si, v.ctrl.selected
         zones = v.project.sensors[si].event_zones
@@ -1086,6 +1316,14 @@ def build_ui(viewer: Viewer, state: dict) -> None:
                                    min=0, precision=0).classes("w-20")
                 sensor_to = ui.select(sensor_opts, value=si,
                                       label="Sensor").classes("w-24")
+                cl_opts = {_CL_NONE: "— none —"}
+                cl_opts.update({i: v.centerline_label(i)
+                                for i in range(len(v.centerlines))})
+                cur_cl = v.membership_for(zone)
+                cl_to = ui.select(
+                    cl_opts,
+                    value=(v.centerlines.index(cur_cl) if cur_cl else _CL_NONE),
+                    label="Centerline").classes("w-32")
 
             ui.separator()
             cond_rows: list[dict] = []
@@ -1172,7 +1410,90 @@ def build_ui(viewer: Viewer, state: dict) -> None:
                     ui.notify(f"moved {zone.zone_name or 'zone'} to S{sensor_to.value + 1}")
                 else:
                     ui.notify(f"updated {zone.zone_name or 'zone'}")
+                # Centerline membership (Item 26): re-route only on an actual
+                # change so the message stays informative.
+                new_ci = int(cl_to.value if cl_to.value is not None else _CL_NONE)
+                cur = v.membership_for(zone)
+                cur_ci = v.centerlines.index(cur) if cur else _CL_NONE
+                if new_ci != cur_ci and not v.set_zone_membership(zone, new_ci):
+                    ui.notify("centerline has no geometry yet — not assigned",
+                              type="warning")
                 dialog.close()
+                refresh_overlay()
+                refresh_status()
+
+            with ui.row():
+                ui.button("Apply", on_click=apply)
+                ui.button("Cancel", on_click=dialog.close)
+        dialog.open()
+
+    # -- bulk zone edit (ROADMAP Item 26) --------------------------------------
+
+    def bulk_zone_properties():
+        """Edit a multi-zone selection at once (ROADMAP Item 26): reassign
+        sensor/phase/centerline and nudge outputs, leaving unnamed fields
+        alone. Sensor reassignment reuses the same cross-file move the
+        single-zone dialog does (`bulk_reassign` -> `insert_zone`)."""
+        if v.mode != "Edit" or v.draw_kind_name != "Event Zone":
+            ui.notify("select event zones in the Edit tool first", type="warning")
+            return
+        si = v.active_si
+        zones = v.active_zones()
+        sel = [i for i in v.ctrl.selection if 0 <= i < len(zones)
+               and not is_placeholder(zones[i])]
+        if len(sel) < 2:
+            ui.notify("select more than one zone for bulk edit", type="warning")
+            return
+        sensor_opts = {_SENSOR_UNCHANGED: "— unchanged —"}
+        sensor_opts.update({i: f"S{i + 1}" for i in range(len(v.project.sensors))})
+        cl_opts = {_CL_UNCHANGED: "— unchanged —", _CL_NONE: "— none (detach) —"}
+        cl_opts.update({i: v.centerline_label(i)
+                        for i in range(len(v.centerlines))})
+
+        with ui.dialog() as dialog, ui.card().style("min-width: 460px"):
+            ui.label(f"Bulk edit {len(sel)} zones").classes("text-lg")
+            with ui.row().classes("items-center gap-2"):
+                set_phase = ui.checkbox("Set phase")
+                phase = ui.number("Phase", value=0, min=0, precision=0).classes("w-24")
+            with ui.row().classes("items-center gap-2"):
+                ui.label("Output nudge")
+                out_nudge = ui.number(value=0, precision=0).classes("w-20")
+                ui.button("−1", on_click=lambda:
+                          out_nudge.set_value(int(out_nudge.value or 0) - 1)) \
+                    .props("flat dense")
+                ui.button("+1", on_click=lambda:
+                          out_nudge.set_value(int(out_nudge.value or 0) + 1)) \
+                    .props("flat dense")
+            with ui.row().classes("items-center gap-2"):
+                sensor_to = ui.select(sensor_opts, value=_SENSOR_UNCHANGED,
+                                      label="Sensor").classes("w-40")
+                cl_to = ui.select(cl_opts, value=_CL_UNCHANGED,
+                                  label="Centerline").classes("w-48")
+
+            def apply():
+                sv = sensor_to.value
+                target_zones = (v.project.sensors[sv].event_zones
+                                if sv is not None and sv >= 0 and sv != si else None)
+                edited = bulk_reassign(
+                    zones, sel,
+                    phase=int(phase.value or 0) if set_phase.value else None,
+                    output_delta=int(out_nudge.value or 0),
+                    target_zones=target_zones)
+                if cl_to.value != _CL_UNCHANGED:
+                    tci = int(cl_to.value if cl_to.value is not None else _CL_NONE)
+                    failed = sum(not v.set_zone_membership(z, tci) for z in edited)
+                    if failed:
+                        ui.notify("centerline has no geometry yet — "
+                                  "membership not assigned", type="warning")
+                dialog.close()
+                if target_zones is not None:
+                    # zones left the active sensor; follow them and re-select
+                    activate_sensor(sv)
+                    new = v.active_zones()
+                    ids = {id(z) for z in edited}
+                    v.ctrl.select_many([i for i, z in enumerate(new)
+                                        if id(z) in ids])
+                ui.notify(f"bulk-edited {len(edited)} zones")
                 refresh_overlay()
                 refresh_status()
 
@@ -1252,9 +1573,13 @@ def build_ui(viewer: Viewer, state: dict) -> None:
 
     def open_properties():
         """Route the Properties action (p / Enter / double-click / button) to
-        the dialog for the active Edit sub-type (ROADMAP Item 22)."""
+        the dialog for the active Edit sub-type (ROADMAP Item 22) — and to the
+        bulk editor for a multi-zone event-zone selection (ROADMAP Item 26)."""
         if v.mode == "Edit" and v.draw_kind_name == "Text Label":
             label_properties()
+        elif v.mode == "Edit" and v.draw_kind_name == "Event Zone" \
+                and len(v.ctrl.selection) > 1:
+            bulk_zone_properties()
         else:
             zone_properties()
 
@@ -1358,20 +1683,6 @@ def build_ui(viewer: Viewer, state: dict) -> None:
                 ui.button("Cancel", on_click=dialog.close)
         dialog.open()
 
-    def update_sensor_options():
-        sensor_sel.set_options(
-            {i: f"S{i + 1}" for i in range(len(v.project.sensors))},
-            value=v.active_si)
-
-    def change_active_sensor(e):
-        if e.value is None or e.value == v.active_si:
-            return
-        cancel_rotate()  # retarget clears the controller's selection
-        v.set_active_sensor(e.value)
-        update_owner_hint()  # "Active sensor" band tracks the active sensor
-        refresh_overlay()
-        refresh_status()
-
     def add_sensor():
         if len(v.project.sensors) >= MAX_SENSORS:
             ui.notify(f"max {MAX_SENSORS} sensors (two-file limit)", type="warning")
@@ -1381,8 +1692,8 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             v.bg, (v.image_w / 2, v.image_h / 2))
         v.project.sensors.append(s)
         v.set_active_sensor(len(v.project.sensors) - 1)
-        update_sensor_options()
-        tool.value = "Sensor"
+        tool.value = "Draw"
+        draw_kind_toggle.set_value("Sensor")  # Sensor sub-kind; rebuilds owner dropdown
         refresh_overlay()
         refresh_status()
         ui.notify(f"S{len(v.project.sensors)} placed at image center — drag to position")
@@ -1416,7 +1727,7 @@ def build_ui(viewer: Viewer, state: dict) -> None:
                     insert_zone(tgt.ignore_zones, z)
             v.project.sensors.pop(si)
             v.set_active_sensor(min(si, len(v.project.sensors) - 1))
-            update_sensor_options()
+            refresh_owner_sel()
             dialog.close()
             refresh_overlay()
             refresh_status()
@@ -1456,7 +1767,7 @@ def build_ui(viewer: Viewer, state: dict) -> None:
     def update_centerline_options():
         centerline_sel.set_options(centerline_options(), value=v.active_cli)
         centerline_name_in.value = v.centerline_ctrl.name
-        update_template_centerline_options()  # Item 19 dropdown uses the names
+        update_event_cl_options()  # Event-Zone CL dropdown uses the names
 
     def change_active_centerline(e):
         if e.value is None or e.value == v.active_cli:
@@ -1478,31 +1789,28 @@ def build_ui(viewer: Viewer, state: dict) -> None:
     def add_centerline():
         v.add_centerline()
         update_centerline_options()
-        tool.value = "Centerline"
+        tool.value = "Draw"
+        draw_kind_toggle.set_value("Centerline")  # Centerline sub-kind
         refresh_overlay()
         refresh_status()
         ui.notify(f"{v.centerline_label(len(v.centerlines) - 1)} ready — "
                   "click the stop bar to start it")
 
-    # -- template placement along centerlines (Item 19) ----------------------
+    # -- Event-Zone CL dropdown (Item 27: one control for template + membership)
 
-    def update_template_centerline_options():
-        """Options for the "along" dropdown: only centerlines with a usable
-        datum (a specific pick bypasses the nearest/threshold logic, so an
-        empty one would be a dead choice). Preserves the current pick when it
-        still resolves; otherwise clears back to auto/nearest."""
+    def update_event_cl_options():
+        """Options for the Event-Zone CL dropdown: only centerlines with a
+        usable datum — attaching a zone or placing along an empty centerline
+        would be a dead choice. Preserves the current pick when it still
+        resolves; otherwise clears back to blank (aim-upstream / no membership)."""
         opts = {i: v.centerline_label(i) for i in range(len(v.centerlines))
                 if v.centerlines[i].current() is not None}
-        keep = v.template_centerline_idx if v.template_centerline_idx in opts else None
-        v.template_centerline_idx = keep
-        template_cl_sel.set_options(opts, value=keep)
+        keep = v.event_cl_idx if v.event_cl_idx in opts else None
+        v.event_cl_idx = keep
+        event_cl_sel.set_options(opts, value=keep)
 
-    def toggle_template_follow(e):
-        v.template_follow_centerline = bool(e.value)
-        refresh_status()
-
-    def change_template_centerline(e):
-        v.template_centerline_idx = e.value  # int index, or None for auto/nearest
+    def change_event_cl(e):
+        v.event_cl_idx = e.value  # int index, or None for blank (aim upstream)
         refresh_status()
 
     # -- template placement ------------------------------------------------------
@@ -1592,7 +1900,7 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             refresh_overlay()
             refresh_status()
             return
-        cl_ctrl = v.template_target_centerline(pw)
+        cl_ctrl = v.template_target_centerline()
         try:
             if cl_ctrl is not None:
                 # curvilinear (Session 7.5): the click is the anchor reference;
@@ -1642,9 +1950,11 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         """path is always the _1_2 target for a multi-file (3-4 sensor)
         project — the single-file path otherwise (Item 9 §6)."""
         v.project.date = time.strftime("%Y_%m_%d_%H:%M:%S")
-        # refresh centerline-name labels (position/text/owner) before they are
-        # written out with the rest of the label pool (ROADMAP Item 22)
+        # refresh centerline-name (Item 22) and membership (Item 26) labels
+        # (position/text/owner) before they are written out with the rest of
+        # the label pool
         v.sync_centerline_labels()
+        v.sync_membership_labels()
         save_centerlines_owned(
             v.project, [(cl.owner, cl.points) for cl in v.centerlines])
         # after save_centerlines, so the endpoint-coincidence guard sees the
@@ -1664,7 +1974,8 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             save_iprj(v.project, path)
             v.source = path
             v.pair = None
-            title_label.set_text(f"iprj Designer — {path.name}")
+            title_label.set_text(path.name)
+            folder_tip.set_text(str(path))
             ui.notify(f"saved {path}")
             return
         primary, secondary = split_project(v.project)
@@ -1673,7 +1984,8 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         save_iprj(secondary, p34)
         v.pair = (p12, p34)
         v.source = p12
-        title_label.set_text(f"iprj Designer — {p12.name} + {p34.name}")
+        title_label.set_text(f"{p12.name} + {p34.name}")
+        folder_tip.set_text(str(p12))
         ui.notify(f"saved {p12.name} + {p34.name}")
 
     def save():
@@ -1901,6 +2213,7 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         png = units.decode_background_image(v.bg)
         with Image.open(io.BytesIO(png)) as im:  # header only, lazy
             v.image_w, v.image_h = im.size
+        v._recompute_canvas()  # Item 25: canvas tracks the new image size
         old_file = v.image_file
         fd, name = tempfile.mkstemp(prefix="iprj_bg_", suffix=".png")
         with os.fdopen(fd, "wb") as f:
@@ -1939,9 +2252,9 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         port = state["template_editor_port"]
         if proc is None or proc.poll() is not None:
             script = Path(__file__).with_name("templates_ui.py")
-            # if a template is currently picked in the Template tool, open
-            # straight to it instead of a blank form
-            current = template_sel.value if v.mode == "Template" else None
+            # if a template is currently picked (in the Event-Zone bar, Item 27),
+            # open straight to it instead of a blank form
+            current = template_sel.value or None
             cmd = [sys.executable, str(script)]
             if current:
                 cmd.append(current)
@@ -1978,14 +2291,15 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             status_label.set_text(v.ruler_status())
         elif v.mode == "Edit" and v.rotate_armed:
             status_label.set_text(rotate_status())
+        elif v.template_placement_active():
+            # a template picked in Draw › Event Zone (Item 27) — its own status
+            status_label.set_text(v.template_status())
         elif v.mode in ("Draw", "Edit"):
             status_label.set_text(v.ctrl.status())
         elif v.mode == "Sensor":
             status_label.set_text(
                 f"mode: sensor | S{v.active_si + 1} active | "
                 "drag a sensor to move it, click one for properties")
-        elif v.mode == "Template":
-            status_label.set_text(v.template_status())
         elif v.mode == "Centerline":
             status_label.set_text(f"C{v.active_cli + 1}/{len(v.centerlines)} | "
                                   f"{v.centerline_ctrl.status()}")
@@ -1998,9 +2312,11 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         snap_switch.set_value(v.ctrl.snap_enabled)  # no-op when already equal
         select_count_label.set_text(
             f"{len(v.ctrl.selection)} selected" if v.mode == "Edit" else "")
-        # bulk edit is out of scope for v1 (PHASE3_UI_PLAN §8.2) — the floor
-        # is disabling single-zone Properties once more than one is selected
-        properties_btn.set_enabled(len(v.ctrl.selection) <= 1)
+        # Properties is enabled for a single selection (any kind); a multi-zone
+        # event-zone selection routes to the bulk editor (ROADMAP Item 26).
+        properties_btn.set_enabled(
+            len(v.ctrl.selection) == 1
+            or (v.draw_kind_name == "Event Zone" and len(v.ctrl.selection) > 1))
         zones = v.active_zones()
         move_station_btn.set_enabled(
             v.mode == "Edit" and v.draw_kind_name == "Event Zone"
@@ -2016,12 +2332,15 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             for zi, z in enumerate(s.event_zones):
                 if is_placeholder(z):
                     continue
+                cl = v.membership_for(z)
                 rows.append({"key": f"{si}:{zi}", "sensor": f"S{si + 1}",
                              "on": "✓" if z.enable else "",
                              "name": z.zone_name or "",
                              "phase": z.phase_number or 0,
                              "output": z.output_number or 0,
-                             "type": z.zone_type or 0})
+                             "type": z.zone_type or 0,
+                             "cl": v.centerline_label(v.centerlines.index(cl))
+                             if cl else ""})
         return rows
 
     def refresh_zone_table():
@@ -2034,16 +2353,32 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         zone_table.selected = [r for r in rows if r["key"] in sel_keys]
         zone_table.update()
 
+    def activate_sensor(si: int):
+        """Make sensor `si` the active/edited one (Item 24): drives the unified
+        Owner/Sensor dropdown off the source-of-truth field. Clears the General
+        owner intent so the dropdown reflects the sensor."""
+        if si == v.active_si and not v.assign_general:
+            return
+        cancel_rotate()  # retarget clears the controller's selection
+        v.assign_general = False
+        v.set_active_sensor(si)
+        refresh_owner_sel()
+
+    def edit_zone_on_sensor(si: int):
+        """Table selection lands in Edit on Event Zone for sensor `si`."""
+        if draw_kind_toggle.value != "Event Zone":
+            draw_kind_toggle.set_value("Event Zone")  # retargets ctrl to zones
+        activate_sensor(si)
+        if v.mode != "Edit":
+            tool.value = "Edit"  # on_change syncs the controller mode
+        elif v.draw_kind_name != "Event Zone":
+            v.set_draw_kind("Event Zone")
+
     def select_zone_key(key: str):
         """Plain row click: select just this one zone (mirrors a plain
         canvas click), overriding whatever the checkbox column had set."""
         si, zi = (int(x) for x in key.split(":"))
-        if v.draw_kind_name != "Event Zone":
-            draw_kind_toggle.set_value("Event Zone")  # on_change retargets to Event Zone
-        if si != v.active_si:
-            sensor_sel.set_value(si)  # on_change retargets the controller
-        if v.mode != "Edit":
-            tool.value = "Edit"     # on_change syncs the controller mode
+        edit_zone_on_sensor(si)
         v.ctrl.selected = zi
         refresh_overlay()
         refresh_status()
@@ -2063,12 +2398,7 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             return
         si = int(keys[-1].split(":")[0])
         zis = [int(k.split(":")[1]) for k in keys if int(k.split(":")[0]) == si]
-        if v.draw_kind_name != "Event Zone":
-            draw_kind_toggle.set_value("Event Zone")
-        if si != v.active_si:
-            sensor_sel.set_value(si)
-        if v.mode != "Edit":
-            tool.value = "Edit"
+        edit_zone_on_sensor(si)
         v.ctrl.select_many(zis)
         refresh_overlay()
         refresh_status()
@@ -2158,10 +2488,16 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         refresh_overlay()
 
     def set_bg_visible(on: bool):
-        ii.classes(remove="bg-off") if on else ii.classes(add="bg-off")
+        # Item 25: the background is its own element now, so dim it directly
+        # (the interactive_image overlay stays fully opaque/interactive).
+        bg_img.style("opacity: 1" if on else "opacity: 0")
 
-    def toggle_zone_panel():
-        zone_panel.set_visibility(not zone_panel.visible)
+    def set_zone_panel_mode(mode: str):
+        """Item 24 (§5): Auto/On/Off for the zone table. Auto shows it only when
+        a zone kind is the active target; update_context_bar applies the rule."""
+        v.zone_panel_mode = mode
+        zone_panel_mode_btn.set_text(mode)
+        update_context_bar()
 
     def clear_ruler():
         v.ruler_start = None
@@ -2178,7 +2514,7 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         elif button == 0 and v.ruler_active:
             # overlay tool (Item 1): captures the click regardless of the
             # active main tool, same as pan above.
-            pw = units.image_to_world(v.bg, p)
+            pw = v.canvas_to_world(p)
             if v.ruler_start is None or not v.ruler_pending:
                 v.ruler_start = pw
                 v.ruler_end = pw
@@ -2189,27 +2525,46 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             refresh_overlay()
             refresh_status()
         elif button == 0 and v.mode == "Background":
-            v.cal_points.append(units.image_to_world(v.bg, p))
+            v.cal_points.append(v.canvas_to_world(p))
             refresh_overlay()
             if len(v.cal_points) == 2:
                 finish_two_point()
         elif button == 0 and v.mode == "Sensor":
-            pw = units.image_to_world(v.bg, p)
+            pw = v.canvas_to_world(p)
             si = v.sensor_at(pw)
             if si != -1:
                 s = v.project.sensors[si]
                 v.sensor_drag = {"si": si, "anchor": pw, "moved": False,
                                  "orig": (s.position_x, s.position_y)}
                 if si != v.active_si:
-                    sensor_sel.set_value(si)  # on_change retargets
+                    activate_sensor(si)  # unified dropdown follows the pick
+                    refresh_status()
+        elif button == 0 and v.template_placement_active():
+            # Item 27: a template picked in Draw › Event Zone turns the click
+            # into a template drop (was the standalone Template tool). With a
+            # picked centerline it places along it on one click; otherwise the
+            # ref-then-aim-upstream flow.
+            if missing_placeholders(v.template, v.template_context):
+                ui.notify("fill in the placement values first", type="warning")
+                edit_placement_values(auto=False)
+                return
+            pw = v.canvas_to_world(p)
+            if v.template_target_centerline() is not None:
+                place_template(pw)  # curvilinear: one click, no aim needed
+            elif v.template_ref is None:
+                v.template_ref = pw
+                refresh_overlay()
+                refresh_status()
+            else:
+                place_template(pw)
         elif button == 0 and v.mode == "Draw":
-            v.ctrl.mouse_down(units.image_to_world(v.bg, p),
+            v.ctrl.mouse_down(v.canvas_to_world(p),
                               ctrl=bool(e.args.get("ctrlKey")))
             notify_ctrl_warning()
             refresh_overlay()
             refresh_status()
         elif button == 0 and v.mode == "Edit" and v.rotate_armed:
-            pw = units.image_to_world(v.bg, p)
+            pw = v.canvas_to_world(p)
             if v.rotate_pivot is None:
                 v.rotate_pivot = pw  # click 1: place the pivot
             else:
@@ -2217,7 +2572,7 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             refresh_overlay()
             refresh_status()
         elif button == 0 and v.mode == "Edit":
-            pw = units.image_to_world(v.bg, p)
+            pw = v.canvas_to_world(p)
             shift = bool(e.args.get("shiftKey"))
             sel_before, anchor_before = list(v.ctrl.selection), v.ctrl.anchor
             v.ctrl.mouse_down(pw, ctrl=bool(e.args.get("ctrlKey")), shift=shift)
@@ -2232,32 +2587,15 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             notify_ctrl_warning()
             refresh_overlay()
             refresh_status()
-        elif button == 0 and v.mode == "Template":
-            if v.template is None:
-                ui.notify("pick a template first", type="warning")
-                return
-            if missing_placeholders(v.template, v.template_context):
-                ui.notify("fill in the placement values first", type="warning")
-                edit_placement_values(auto=False)
-                return
-            pw = units.image_to_world(v.bg, p)
-            if v.template_target_centerline(pw) is not None:
-                place_template(pw)  # curvilinear: one click, no aim needed
-            elif v.template_ref is None:
-                v.template_ref = pw
-                refresh_overlay()
-                refresh_status()
-            else:
-                place_template(pw)
         elif button == 0 and v.mode == "Centerline":
-            v.centerline_ctrl.mouse_down(units.image_to_world(v.bg, p))
+            v.centerline_ctrl.mouse_down(v.canvas_to_world(p))
             refresh_overlay()
             refresh_status()
 
     def on_move(e):
         p = (e.args["offsetX"], e.args["offsetY"])
         pos_label.set_text(v.describe(p))
-        pw = units.image_to_world(v.bg, p)
+        pw = v.canvas_to_world(p)
         if v.drag_anchor is not None and e.args.get("buttons", 0):
             v.viewport.drag_to(v.drag_anchor, p)
             apply_transform()
@@ -2273,6 +2611,11 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             if v.ruler_pending:
                 v.ruler_end = pw
                 refresh_overlay()
+        elif v.template_placement_active():
+            # cursor tracked from the first hover: with a centerline the
+            # preview follows the mouse before any click (Item 27)
+            v.template_cursor = pw
+            refresh_overlay()
         elif v.mode == "Draw":
             dragging = bool(e.args.get("buttons", 0) & 1)
             v.ctrl.mouse_move(pw, dragging)
@@ -2296,11 +2639,6 @@ def build_ui(viewer: Viewer, state: dict) -> None:
                 v.marquee_cursor = pw
             if dragging or v.ctrl.snap_enabled or v.marquee_anchor is not None:
                 refresh_overlay()
-        elif v.mode == "Template" and v.template is not None:
-            # cursor tracked from the first hover: with a centerline the
-            # preview follows the mouse before any click
-            v.template_cursor = pw
-            refresh_overlay()
         elif v.mode == "Centerline":
             dragging = bool(e.args.get("buttons", 0) & 1)
             v.centerline_ctrl.mouse_move(pw, dragging)
@@ -2310,7 +2648,7 @@ def build_ui(viewer: Viewer, state: dict) -> None:
     def on_up(e):
         v.drag_anchor = None
         p = (e.args["offsetX"], e.args["offsetY"])
-        pw = units.image_to_world(v.bg, p)
+        pw = v.canvas_to_world(p)
         if v.sensor_drag is not None:
             d, v.sensor_drag = v.sensor_drag, None
             if not d["moved"]:
@@ -2341,6 +2679,7 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         elif v.mode == "Centerline":
             v.centerline_ctrl.mouse_up(pw)
             v.sync_centerline_labels()  # name label follows the far end (Item 22)
+            update_event_cl_options()  # a new datum may now be pickable (Item 27)
             refresh_overlay()
             refresh_status()
 
@@ -2348,7 +2687,8 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         # the two mousedowns already selected the zone under the cursor
         if v.mode == "Edit":
             open_properties()
-        elif v.mode == "Draw" and v.ctrl.finish_polygon():
+        elif v.mode == "Draw" and not v.template_placement_active() \
+                and v.ctrl.finish_polygon():
             notify_ctrl_warning()
             refresh_overlay()
             refresh_status()
@@ -2361,10 +2701,14 @@ def build_ui(viewer: Viewer, state: dict) -> None:
     # edit-mode keys — click the tool toggle instead. `v` is no longer a
     # tool alias (ROADMAP Item 5) — it falls through to ctrl.key() below as
     # the Edit-tool insert-vertex action.
-    TOOL_KEYS = {"d": "Draw", "e": "Edit",
-                "t": "Template", "c": "Centerline", "s": "Sensor"}
+    # ROADMAP Item 24: only Draw/Edit are top-level tools now (Background stays
+    # click-only). Centerline (c) and Sensor (s) joined the Draw sub-kinds, so
+    # their keys moved into DRAW_SUBTYPE_KEYS. `t` (Template) is retired — Item
+    # 27 folded template placement into Draw › Event Zone (pick a template in
+    # the Event-Zone bar, reachable via `z`), so it needs no tool key.
+    TOOL_KEYS = {"d": "Draw", "e": "Edit"}
     DRAW_SUBTYPE_KEYS = {"z": "Event Zone", "l": "Lineal", "i": "Ignore Zone",
-                         "a": "Text Label"}
+                         "a": "Text Label", "c": "Centerline", "s": "Sensor"}
 
     async def on_key(e):
         name = e.key.name
@@ -2403,7 +2747,8 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             refresh_overlay()
             refresh_status()
             return
-        if name == "Escape" and v.mode == "Template" and v.template_ref is not None:
+        if name == "Escape" and v.template_placement_active() \
+                and v.template_ref is not None:
             v.template_ref = None
             v.template_cursor = None
             refresh_overlay()
@@ -2423,6 +2768,7 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             refresh_status()
         elif v.mode == "Centerline" and v.centerline_ctrl.key(name, e.modifiers.ctrl):
             v.sync_centerline_labels()  # delete/undo may move the far end (Item 22)
+            update_event_cl_options()  # a deleted datum drops from the picker
             refresh_overlay()
             refresh_status()
         elif v.mode == "Sensor" and name in ARROWS:
@@ -2430,31 +2776,54 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         elif v.mode == "Sensor" and name in ("Delete", "x"):
             delete_sensor()
 
-    def change_tool(e):
-        v.mode = e.value
-        if e.value == "Draw":
-            v.ctrl.set_mode("draw")
-        elif e.value == "Edit":
-            v.ctrl.set_mode("edit")
-        else:
-            v.ctrl.set_mode("draw")  # clears any pending loop/dimension entry
-        if e.value != "Template":
-            v.template_ref = None
-            v.template_cursor = None
-        if e.value != "Centerline":
+    # Re-entrancy guard: refresh_owner_sel() sets the dropdown programmatically,
+    # which fires its on_change; the lock makes change_owner ignore that echo so
+    # a mode-driven rebuild can't flip assign_general (Item 24, §8).
+    _owner_sel_lock = [False]
+
+    # ROADMAP Item 24: Sensor and Centerline are Draw sub-kinds, not top-level
+    # tools, so the effective mode the state machine branches on is derived from
+    # the tool toggle + Draw sub-kind by the module-level effective_mode().
+    def _enter_mode(new_mode: str):
+        """Apply an effective-mode transition: sync the controller mode and run
+        the same teardown change_tool used to do (exit the ruler, clear template
+        preview, end a centerline drag, cancel a rotate, drop the marquee)."""
+        v.mode = new_mode
+        v.ctrl.set_mode("edit" if new_mode == "Edit" else "draw")
+        # Selecting any tool / sub-kind exits the ruler overlay (owner's call):
+        # it captures clicks regardless of the active tool, so leaving it on
+        # would block the newly picked tool until explicitly toggled off.
+        if v.ruler_active:
+            set_ruler_active(False)
+        # Any mode/sub-kind transition drops a pending template drop (Item 27:
+        # Template is a mode of Event Zone now, not its own effective mode, so
+        # there's no mode to preserve it across).
+        v.template_ref = None
+        v.template_cursor = None
+        if new_mode != "Centerline":
             v.centerline_ctrl.end_drag()
-        if e.value != "Edit":
+        if new_mode != "Edit":
             cancel_rotate()
         v.marquee_anchor = None
         v.marquee_cursor = None
+
+    def change_tool(e):
+        kind = draw_kind_toggle.value
+        _enter_mode(effective_mode(e.value, kind))
         update_context_bar()
         refresh_overlay()
         refresh_status()
 
     def change_draw_kind(e):
         cancel_rotate()  # retarget clears the controller's selection
-        v.set_draw_kind(e.value)
-        update_context_bar()  # ownership control only shows for owned kinds
+        kind = e.value
+        _enter_mode(effective_mode(tool.value, kind))
+        if kind not in MODE_SUBKINDS:
+            # A real drawing kind: retarget the controller to its element list
+            # (also what Edit then operates on). Centerline/Sensor aren't
+            # controller kinds, so draw_kind_name keeps its last drawing value.
+            v.set_draw_kind(kind)
+        update_context_bar()  # owner options / zone panel key off mode + kind
         refresh_overlay()
         refresh_status()
 
@@ -2462,23 +2831,63 @@ def build_ui(viewer: Viewer, state: dict) -> None:
                         Owner.FILE1: "→ S1/2 (_1_2)",
                         Owner.FILE2: "→ S3/4 (_3_4)"}
 
-    def owner_controls_visible() -> bool:
-        return ((v.mode == "Draw" and v.draw_kind_name in OWNED_KINDS)
-                or v.mode == "Centerline")
+    def _general_ok() -> bool:
+        return general_offered(v.mode, v.draw_kind_name)
+
+    def effective_owner() -> Owner:
+        return resolve_owner(v.assign_general, v.active_si, _general_ok())
 
     def update_owner_hint():
-        owner_hint_label.set_text(_OWNER_BAND_TEXT[v.current_owner()])
+        owner_hint_label.set_text(_OWNER_BAND_TEXT[effective_owner()])
 
-    def change_assign_owner(e):
-        """ROADMAP Item 22: toggle new owned annotations between the GENERAL
-        band and the active sensor's file band. In Centerline mode it also
-        re-bands the active centerline (and its name label) live."""
-        v.assign_general = (e.value == "General")
+    def owner_sel_options() -> dict:
+        opts: dict = {}
+        if _general_ok():
+            opts[_GENERAL_KEY] = "General"
+        for i in range(len(v.project.sensors)):
+            opts[i] = f"S{i + 1}"
+        return opts
+
+    def owner_sel_value():
+        return _GENERAL_KEY if (_general_ok() and v.assign_general) else v.active_si
+
+    def refresh_owner_sel():
+        """Rebuild the unified Owner/Sensor dropdown's options + value from the
+        source-of-truth fields (active_si + assign_general). Guarded so the
+        programmatic set_options doesn't re-enter change_owner (§8)."""
+        _owner_sel_lock[0] = True
+        owner_sel.set_options(owner_sel_options(), value=owner_sel_value())
+        _owner_sel_lock[0] = False
+
+    def change_owner(e):
+        """User pick on the unified Owner/Sensor dropdown (Item 24, §3.3): one
+        widget drives both the active sensor and the General/sensor owner of
+        new owned annotations. General leaves active_si untouched so a later
+        zone kind still has a valid sensor; picking a sensor clears General."""
+        if _owner_sel_lock[0]:
+            return
+        val = e.value
+        if val is None:
+            return
+        if val == _GENERAL_KEY:
+            if v.assign_general:
+                return
+            v.assign_general = True
+        else:
+            if val == v.active_si and not v.assign_general:
+                return
+            v.assign_general = False
+            if val != v.active_si:
+                cancel_rotate()  # retarget clears the controller's selection
+                v.set_active_sensor(val)
         if v.mode == "Centerline":
             v.centerline_ctrl.owner = v.current_owner()
             v.sync_centerline_labels()
+        refresh_owner_sel()  # General may have just become (un)offered
         update_owner_hint()
         refresh_overlay()
+        refresh_status()
+        refresh_zone_table()  # active-sensor change rescopes table highlighting
 
     def read_label_draft(*_):
         """Draw-mode editor bar -> v.label_draft (ROADMAP Item 22 follow-up):
@@ -2509,38 +2918,56 @@ def build_ui(viewer: Viewer, state: dict) -> None:
     def toggle_ruler():
         set_ruler_active(not v.ruler_active)
 
+    def _zone_kind_active() -> bool:
+        """A zone kind is the active target (Item 24, §5) — Auto shows the zone
+        table exactly then. Edit reads draw_kind_name (the last-targeted kind)."""
+        return v.mode in ("Draw", "Edit") and \
+            v.draw_kind_name in ("Event Zone", "Ignore Zone")
+
     def update_context_bar():
-        """Row-2 context controls per tool (PHASE3_UI_PLAN §3): built once,
-        shown/hidden by visibility rather than rebuilt on every switch, so
-        widget state (selector values) survives a tool change."""
-        sensor_sel.set_visibility(v.mode in ("Draw", "Edit", "Sensor"))
+        """Row-2 context controls per tool + Draw sub-kind (ROADMAP Item 24;
+        PHASE3_UI_PLAN §3): built once, shown/hidden by visibility rather than
+        rebuilt, so widget state survives a switch. The unified Owner/Sensor
+        dropdown's *options* also change with the sub-kind (General offered or
+        not), so it is rebuilt here."""
+        tool_is_draw = tool.value == "Draw"
+        # Unified Owner/Sensor dropdown: everywhere but Background.
+        owner_sel.set_visibility(v.mode != "Background")
+        owner_hint_label.set_visibility(v.mode != "Background")
+        refresh_owner_sel()
+        update_owner_hint()
+        # Draw sub-kind toggle + the per-sub-kind extras.
+        draw_kind_toggle.set_visibility(tool_is_draw)
         add_sensor_btn.set_visibility(v.mode == "Sensor")
         delete_sensor_btn.set_visibility(v.mode == "Sensor")
-        draw_kind_toggle.set_visibility(v.mode == "Draw")
+        centerline_sel.set_visibility(v.mode == "Centerline")
+        add_centerline_btn.set_visibility(v.mode == "Centerline")
+        centerline_name_in.set_visibility(v.mode == "Centerline")
+        drafting = v.mode == "Draw" and v.draw_kind_name == "Text Label"
+        for _w in label_draft_widgets:
+            _w.set_visibility(drafting)
+        # Edit context.
         select_count_label.set_visibility(v.mode == "Edit")
         properties_btn.set_visibility(v.mode == "Edit")
         rotate_btn.set_visibility(v.mode == "Edit")
         move_station_btn.set_visibility(v.mode == "Edit")
         delete_btn.set_visibility(v.mode == "Edit")
+        # Background context.
         calibrate_size_btn.set_visibility(v.mode == "Background")
         upload_bg_btn.set_visibility(v.mode == "Background")
-        template_sel.set_visibility(v.mode == "Template")
-        template_values_btn.set_visibility(
-            v.mode == "Template" and v.template is not None)
-        template_editor_btn.set_visibility(v.mode == "Template")
-        template_follow_switch.set_visibility(v.mode == "Template")
-        template_cl_sel.set_visibility(v.mode == "Template")
-        if v.mode == "Template":  # refresh which centerlines are pickable
-            update_template_centerline_options()
-        centerline_sel.set_visibility(v.mode == "Centerline")
-        add_centerline_btn.set_visibility(v.mode == "Centerline")
-        centerline_name_in.set_visibility(v.mode == "Centerline")
-        assign_toggle.set_visibility(owner_controls_visible())
-        owner_hint_label.set_visibility(owner_controls_visible())
-        update_owner_hint()
-        drafting = v.mode == "Draw" and v.draw_kind_name == "Text Label"
-        for _w in label_draft_widgets:
-            _w.set_visibility(drafting)
+        # Template + CL controls (Item 27): folded into Draw › Event Zone. The
+        # template picker and the CL dropdown live in the Event-Zone context;
+        # the placement-values button only matters once a template is picked.
+        # (The template-editor button lives on Row 1 and is always visible.)
+        event_zone = v.mode == "Draw" and v.draw_kind_name == "Event Zone"
+        template_sel.set_visibility(event_zone)
+        event_cl_sel.set_visibility(event_zone)
+        template_values_btn.set_visibility(event_zone and v.template is not None)
+        # Zone-table panel (Item 24, §5): Auto shows it only when a zone kind is
+        # the active target; the three-state control itself is always on Row 2.
+        zone_panel.set_visibility(
+            v.zone_panel_mode == "On"
+            or (v.zone_panel_mode == "Auto" and _zone_kind_active()))
 
     def on_wheel(e):
         # The visual zoom already happened client-side (_WHEEL_ZOOM_JS); this
@@ -2562,41 +2989,47 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         size = await ui.run_javascript(
             "[document.getElementById('viewport').clientWidth,"
             " document.getElementById('viewport').clientHeight]")
-        v.viewport.fit((v.image_w, v.image_h), tuple(size))
+        # Frame the background (not the whole oversized canvas) so load/fit
+        # lands on the imagery, with the off-image margin reachable by panning.
+        v.viewport.fit((v.image_w, v.image_h), tuple(size),
+                       content_origin=(v.canvas_off_x, v.canvas_off_y))
         apply_transform()
         scale_label.set_text(status_scale())
 
     # -- layout ---------------------------------------------------------------
+    # Full-height flex column (height-budget fix, 2026-07-08): pin the page body
+    # to the viewport height and strip NiceGUI's default content padding/gap, so
+    # the two toolbar rows + the status bar sit at their natural heights and the
+    # canvas row (flex-1, below) absorbs exactly the leftover space. This
+    # replaces the old `calc(100vh - 120px)` magic constant, which budgeted only
+    # the *top* chrome and let the status bar overflow the window by ~one row on
+    # every machine (the batch's height goal). Robust to font/DPI/mode changes —
+    # no pixel constant to keep in sync with the toolbar heights.
+    ui.query(".nicegui-content").style(
+        "height: 100vh; padding: 0; gap: 0; overflow: hidden;")
+
     # Two-tier toolbar (PHASE3_UI_PLAN §3): row 1 is persistent chrome that
     # never depends on the active tool, so it never scrolls; row 2 is a
     # single context bar whose controls are built once and individually
     # shown/hidden per tool by update_context_bar() (visibility toggling,
     # not rebuilding, so selector state survives a tool switch).
 
+    # ROADMAP Item 24 (ITEM23_TOOLBAR_PLAN §3.1): Row 1 groups controls by type
+    # behind `|` separators — modes + always-on drawing tools left, the file
+    # cluster (template-editor · folder · filename · save) right. The product
+    # name is gone; the filename is a muted inline label beside the folder menu.
     with ui.row().classes("w-full items-center gap-2 px-2 no-wrap overflow-x-auto"):
-        _title = (f"{v.pair[0].name} + {v.pair[1].name}" if v.pair
-                  else v.source.name)
-        title_label = ui.label(f"iprj Designer — {_title}") \
-            .classes("text-lg text-white whitespace-nowrap")
-        with ui.button(icon="folder").props("flat dense"):
-            ui.tooltip("file")
-            with ui.menu():
-                ui.menu_item("New…", on_click=new_project)
-                ui.menu_item("Open…", on_click=open_existing)
-                ui.menu_item("Open second sensor-pair file (overlay)…",
-                             on_click=open_second_pair_file)
-                ui.separator()
-                ui.menu_item("Save", on_click=save)
-                ui.menu_item("Save As…", on_click=save_as)
-        ui.separator().props("vertical")
-        tool = ui.toggle(["Edit", "Draw", "Template", "Centerline", "Sensor",
-                          "Background"], value="Edit",
+        tool = ui.toggle(["Draw", "Edit", "Background"], value="Edit",
                          on_change=change_tool).props("dense")
         with tool:
-            ui.tooltip("accelerators: d draw · e edit · t template · "
-                       "c centerline · s sensor · space+drag / "
-                       "middle-drag pans · Esc cancel")
+            ui.tooltip("accelerators: d draw · e edit · space+drag / "
+                       "middle-drag pans · Esc cancel (Sensor & Centerline are "
+                       "Draw sub-kinds now)")
         ui.separator().props("vertical")
+        # Always-on drawing tools (apply in every mode).
+        snap_switch = ui.switch("snap", on_change=toggle_snap).props("dense")
+        with snap_switch:
+            ui.tooltip("vertex/midpoint snapping (g)")
         ruler_btn = ui.button(icon="straighten", on_click=toggle_ruler) \
             .props("flat dense")
         with ruler_btn:
@@ -2605,10 +3038,6 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         with ui.button(icon="clear", on_click=clear_ruler) \
                 .props("flat dense"):
             ui.tooltip("clear ruler")
-        ui.space()
-        snap_switch = ui.switch("snap", on_change=toggle_snap).props("dense")
-        with snap_switch:
-            ui.tooltip("vertex/midpoint snapping (g)")
         with ui.button(icon="undo", on_click=do_undo).props("flat dense"):
             ui.tooltip("undo (u / Ctrl-Z)")
         with ui.button(icon="layers").props("flat dense"):
@@ -2625,17 +3054,57 @@ def build_ui(viewer: Viewer, state: dict) -> None:
                               set_layer("show_sensors", e.value)).props("dense")
         with ui.button(icon="fit_screen", on_click=fit_view).props("flat dense"):
             ui.tooltip("fit image to window (f)")
+        ui.space()
+        ui.separator().props("vertical")
+        # File cluster (right-justified): template-editor · folder · filename · save.
+        with ui.button(icon="edit_square", on_click=open_template_editor) \
+                .props("flat dense"):
+            ui.tooltip("open the template editor (new tab)")
+        with ui.button(icon="folder").props("flat dense"):
+            folder_tip = ui.tooltip("file")
+            with ui.menu():
+                ui.menu_item("New…", on_click=new_project)
+                ui.menu_item("Open…", on_click=open_existing)
+                ui.menu_item("Open second sensor-pair file (overlay)…",
+                             on_click=open_second_pair_file)
+                ui.separator()
+                ui.menu_item("Save", on_click=save)
+                ui.menu_item("Save As…", on_click=save_as)
+        _title = (f"{v.pair[0].name} + {v.pair[1].name}" if v.pair
+                  else v.source.name)
+        title_label = ui.label(_title) \
+            .classes("text-sm text-gray-300 whitespace-nowrap")
+        folder_tip.set_text(str(v.pair[0] if v.pair else v.source))
         with ui.button(icon="save", on_click=save).props("flat dense"):
             ui.tooltip("save (Ctrl-S)")
-        with ui.button(icon="view_sidebar", on_click=toggle_zone_panel) \
-                .props("flat dense"):
-            ui.tooltip("show/hide the zone table")
 
     with ui.row().classes("w-full items-center gap-2 px-2 no-wrap overflow-x-auto"):
-        sensor_sel = ui.select(
-            {i: f"S{i + 1}" for i in range(len(v.project.sensors))},
-            value=v.active_si, label="sensor",
-            on_change=change_active_sensor).classes("w-24").props("dense")
+        # Draw sub-kind toggle (Item 24): Sensor and Centerline joined Event
+        # Zone / Ignore Zone / Lineal / Text Label as Draw sub-kinds.
+        draw_kind_toggle = ui.toggle(
+            ["Event Zone", "Ignore Zone", "Lineal", "Text Label",
+             "Centerline", "Sensor"],
+            value="Event Zone",
+            on_change=change_draw_kind).props("dense")
+        with draw_kind_toggle:
+            ui.tooltip("draw sub-kind: z Event Zone · i Ignore Zone · l Lineal "
+                       "· a Text Label · c Centerline · s Sensor — also picks "
+                       "what Edit operates on")
+        ui.separator().props("vertical")
+
+        # Unified Owner/Sensor dropdown (Item 24, §3.3): replaces the active-
+        # sensor selector *and* the General/Active-sensor toggle. Options are
+        # General (where offered) + S1…Sn; General is suppressed for zone/sensor
+        # sub-kinds. Rebuilt by update_context_bar() as the sub-kind changes.
+        owner_sel = ui.select(
+            owner_sel_options(), value=owner_sel_value(), label="owner",
+            on_change=change_owner).classes("w-28").props("dense")
+        with owner_sel:
+            ui.tooltip("active sensor + owner of new lineals/labels/centerlines: "
+                       "General = both files; a sensor = its file band "
+                       "(S1/2 → _1_2, S3/4 → _3_4). General is hidden for zones "
+                       "and sensor editing.")
+        owner_hint_label = ui.label("").classes("text-white font-mono text-xs")
         add_sensor_btn = ui.button(icon="add_circle", on_click=add_sensor) \
             .props("flat dense")
         with add_sensor_btn:
@@ -2645,27 +3114,6 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         with delete_sensor_btn:
             ui.tooltip("delete active sensor (x / Del) — prompts to reassign "
                        "or delete its zones")
-
-        draw_kind_toggle = ui.toggle(
-            ["Event Zone", "Ignore Zone", "Lineal", "Text Label"],
-            value="Event Zone",
-            on_change=change_draw_kind).props("dense")
-        with draw_kind_toggle:
-            ui.tooltip("draw sub-type: z Event Zone · l Lineal · i Ignore Zone "
-                       "· a Text Label — also picks what Edit operates on")
-
-        # Ownership assignment (ROADMAP Item 22): which file band a newly drawn
-        # lineal / text label / centerline lands in. General -> both files;
-        # Active sensor -> the active sensor's file (S1/2 -> _1_2, S3/4 -> _3_4).
-        assign_toggle = ui.toggle(
-            ["General", "Active sensor"],
-            value="General" if v.assign_general else "Active sensor",
-            on_change=change_assign_owner).props("dense")
-        with assign_toggle:
-            ui.tooltip("which file a new lineal/label/centerline belongs to: "
-                       "General = both files; Active sensor = the active "
-                       "sensor's file (S1/2 → _1_2, S3/4 → _3_4)")
-        owner_hint_label = ui.label("").classes("text-white font-mono text-xs")
 
         # Text Label draw-time editor bar (ROADMAP Item 22 follow-up): the same
         # fields as the properties dialog, inline; a click places a copy of
@@ -2725,38 +3173,33 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             ui.tooltip("upload a new background image (keeps zones/sensors/"
                        "centerlines)")
 
+        # Item 27: Template folded into Draw › Event Zone. Pick a template to
+        # drop it on click; leave it blank for plain free-draw event zones.
         template_sel = ui.select(template_files(), label="template",
                                  on_change=change_template) \
             .classes("w-48").props("dense clearable")
         with template_sel:
-            ui.tooltip("approach template to place (click the anchor point "
-                       "— stop bar at the LT/thru lane line — follows the "
-                       "nearest centerline, or a second aim click without "
-                       "one)")
+            ui.tooltip("approach template to drop on click (anchor at the stop "
+                       "bar / LT-thru lane line); blank = free-draw an event "
+                       "zone. Pick a centerline at right to place along it.")
         template_values_btn = ui.button(
             icon="edit_note", on_click=lambda: edit_placement_values(auto=False)) \
             .props("flat dense")
         with template_values_btn:
             ui.tooltip("placement values — direction, thru/LT phase, "
                        "Base Output")
-        template_editor_btn = ui.button(
-            icon="edit_square", on_click=open_template_editor).props("flat dense")
-        with template_editor_btn:
-            ui.tooltip("open the template editor (new tab)")
-        template_follow_switch = ui.switch(
-            "along CL", value=v.template_follow_centerline,
-            on_change=toggle_template_follow).props("dense")
-        with template_follow_switch:
-            ui.tooltip(f"place along the nearest centerline within "
-                       f"{CENTERLINE_SNAP_FT:.0f} ft of the anchor click; "
-                       "off = always aim upstream with a second click")
-        template_cl_sel = ui.select(
-            {}, label="pick CL", on_change=change_template_centerline) \
+        # (template-editor button moved to the Row-1 file cluster in Item 24)
+        # One CL dropdown (Item 27) replacing the Item-19 follow-switch +
+        # pick-select: it drives *every* event zone drawn here. Chosen ⇒ a
+        # template places along it and a plain zone joins its membership group
+        # (Item 26); blank ⇒ aim-upstream template placement / no membership.
+        event_cl_sel = ui.select(
+            {}, label="along CL", on_change=change_event_cl) \
             .classes("w-28").props("dense clearable")
-        with template_cl_sel:
-            ui.tooltip("place along one specific centerline instead of the "
-                       "nearest (blank = nearest); ignores the distance "
-                       "threshold")
+        with event_cl_sel:
+            ui.tooltip("centerline for the zones drawn here: a template places "
+                       "along it and a drawn zone joins its group (Item 26); "
+                       "blank = aim upstream / no group")
 
         centerline_sel = ui.select(
             centerline_options(),
@@ -2774,29 +3217,70 @@ def build_ui(viewer: Viewer, state: dict) -> None:
                        "approach); shown in the pickers and saved as a label "
                        "at the far end")
 
-    update_context_bar()
+        # Zone-table three-state control (Item 24, §5): right-justified at the
+        # end of the context bar, directly above the table it governs.
+        ui.space()
+        ui.separator().props("vertical")
+        zone_panel_mode_btn = ui.button(
+            v.zone_panel_mode, icon="view_sidebar").props("flat dense")
+        with zone_panel_mode_btn:
+            ui.tooltip("zone table: Auto (only in a zone kind) · On · Off")
+            with ui.menu():
+                ui.menu_item("Auto", on_click=lambda: set_zone_panel_mode("Auto"))
+                ui.menu_item("On", on_click=lambda: set_zone_panel_mode("On"))
+                ui.menu_item("Off", on_click=lambda: set_zone_panel_mode("Off"))
 
     ui.keyboard(on_key=on_key)  # ignores keys typed into dialogs/inputs
 
-    with ui.row().classes("w-full no-wrap gap-0"):
+    # flex-1 + min-h-0: this row grows to fill whatever the toolbars and status
+    # bar leave, and min-height:0 lets it actually shrink so the status bar below
+    # always stays on screen (height-budget fix).
+    with ui.row().classes("w-full no-wrap gap-0 flex-1 min-h-0"):
         with ui.element("div").props("id=viewport").classes("grow overflow-hidden") \
-                .style("height: calc(100vh - 120px); position: relative; "
+                .style("height: 100%; position: relative; "
                        "background: #111; cursor: crosshair;"):
-            ii = ui.interactive_image(v.image_file, content=v.svg(), cross="#00e5ff")
-            ii.style(f"width: {v.image_w}px; height: {v.image_h}px; "
-                     f"max-width: none; position: absolute;")
-            ii.on("mousedown", on_down,
-                  ["offsetX", "offsetY", "button", "buttons", "ctrlKey", "shiftKey"])
-            ii.on("mousemove", on_move, ["offsetX", "offsetY", "buttons"],
-                  throttle=0.03)
-            ii.on("mouseup", on_up, ["offsetX", "offsetY"])
-            ii.on("dblclick", on_dblclick, ["offsetX", "offsetY"])
-            # js_handler zooms locally every tick; the emit (throttled, so it
-            # can't flood the socket) syncs absolute viewport state to on_wheel.
-            ii.on("wheel.prevent", on_wheel, args=None,
-                  js_handler=_WHEEL_ZOOM_JS, throttle=0.05)
-        with ui.column().classes("w-96 px-1 overflow-y-auto") \
-                .style("height: calc(100vh - 120px);") as zone_panel:
+            # Item 25: `stage` is the oversized (2x each way) drawing surface;
+            # pan/zoom transform it. The background is a static <img> centered
+            # inside it via the canvas offset; the interactive_image is a
+            # transparent, full-canvas overlay that owns the SVG and the mouse
+            # events (offsetX/Y are canvas px, 1:1 with its natural size). Both
+            # ride `stage`'s transform, so they pan/zoom together and objects
+            # can be drawn/dragged into the off-image margin.
+            stage = ui.element("div").style(
+                f"position: absolute; top: 0; left: 0; "
+                f"width: {v.canvas_w}px; height: {v.canvas_h}px; "
+                f"transform-origin: 0 0;")
+            with stage:
+                bg_img = ui.image(v.image_file).style(
+                    f"position: absolute; left: {v.canvas_off_x}px; "
+                    f"top: {v.canvas_off_y}px; width: {v.image_w}px; "
+                    f"height: {v.image_h}px; pointer-events: none;")
+                # No source -> a transparent, bitmap-free overlay sized to the
+                # whole canvas (its SVG viewBox comes from `size`); keeps the bg
+                # bitmap at natural size instead of quadrupling it.
+                ii = ui.interactive_image(
+                    content=v.svg(), size=(v.canvas_w, v.canvas_h), cross="#00e5ff")
+                ii.style(f"position: absolute; top: 0; left: 0; "
+                         f"width: {v.canvas_w}px; height: {v.canvas_h}px; "
+                         f"max-width: none;")
+                ii.on("mousedown", on_down,
+                      ["offsetX", "offsetY", "button", "buttons", "ctrlKey", "shiftKey"])
+                ii.on("mousemove", on_move, ["offsetX", "offsetY", "buttons"],
+                      throttle=0.03)
+                ii.on("mouseup", on_up, ["offsetX", "offsetY"])
+                ii.on("dblclick", on_dblclick, ["offsetX", "offsetY"])
+                # js_handler zooms `stage` locally every tick; the emit
+                # (throttled, so it can't flood the socket) syncs absolute
+                # viewport state to on_wheel. Bound to `stage` so the JS reads/
+                # writes the same element the server transforms.
+                stage.on("wheel.prevent", on_wheel, args=None,
+                         js_handler=_WHEEL_ZOOM_JS, throttle=0.05)
+        # w-[32rem] (512px): wide enough for the 7-column table (S · On · Name ·
+        # Ph · Out · Type · CL + the multi-select checkbox ≈ 466px of content) to
+        # fit without Quasar's internal horizontal scrollbar. Trades a little
+        # canvas width for a table that reads at a glance (owner's call).
+        with ui.column().classes("w-[32rem] px-1 overflow-y-auto") \
+                .style("height: 100%;") as zone_panel:
             zone_table = ui.table(
                 columns=[
                     {"name": "sensor", "label": "S", "field": "sensor",
@@ -2810,6 +3294,8 @@ def build_ui(viewer: Viewer, state: dict) -> None:
                      "align": "right", "sortable": True},
                     {"name": "type", "label": "Type", "field": "type",
                      "align": "right", "sortable": True},
+                    {"name": "cl", "label": "CL", "field": "cl",
+                     "align": "left", "sortable": True},
                 ],
                 rows=zone_rows(), row_key="key", selection="multiple",
                 on_select=on_table_select, pagination=0) \
@@ -2819,6 +3305,11 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             ui.label("click: select one · checkbox: multi-select · "
                      "double-click: properties") \
                 .classes("text-xs text-gray-500 px-1")
+
+    # Set initial per-mode visibility after zone_panel exists (the context bar
+    # now governs the zone table too, so this must run once it's built).
+    update_context_bar()
+    update_event_cl_options()  # populate the Event-Zone CL dropdown from load
 
     with ui.row().classes("w-full justify-between px-2"):
         status_label = ui.label("mode: edit").classes("text-white font-mono")

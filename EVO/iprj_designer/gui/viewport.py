@@ -46,15 +46,26 @@ class Viewport:
         self.tx += self.scale * (image_point[0] - anchor[0])
         self.ty += self.scale * (image_point[1] - anchor[1])
 
-    def fit(self, image_size: Point, viewport_size: Point, margin: float = 0.98) -> None:
-        """Scale and center the whole image inside the viewport."""
+    def fit(self, image_size: Point, viewport_size: Point,
+            content_origin: Point = (0.0, 0.0), margin: float = 0.98) -> None:
+        """Scale and center an `image_size` box inside the viewport.
+
+        `content_origin` is where that box's top-left sits in the transformed
+        surface's own coordinates. It's (0, 0) when the surface *is* the image;
+        with the oversized canvas (Item 25) the background is offset inside a
+        larger stage, so passing the canvas offset frames the background rather
+        than the whole (mostly empty) canvas.
+        """
         iw, ih = image_size
         vw, vh = viewport_size
+        ox, oy = content_origin
         if iw <= 0 or ih <= 0 or vw <= 0 or vh <= 0:
             return
         self.scale = min(MAX_SCALE, max(MIN_SCALE, margin * min(vw / iw, vh / ih)))
-        self.tx = (vw - self.scale * iw) / 2.0
-        self.ty = (vh - self.scale * ih) / 2.0
+        # screen = t + scale * surface_point; put surface point `content_origin`
+        # where a top-left-centered box would start.
+        self.tx = (vw - self.scale * iw) / 2.0 - self.scale * ox
+        self.ty = (vh - self.scale * ih) / 2.0 - self.scale * oy
 
     def image_to_viewport(self, p: Point) -> Point:
         return (self.tx + self.scale * p[0], self.ty + self.scale * p[1])

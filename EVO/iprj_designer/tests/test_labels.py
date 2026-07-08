@@ -167,3 +167,37 @@ def test_match_is_one_to_one_and_nearest_wins():
 
 def test_match_skips_centerline_without_geometry():
     assert match_name_labels([None, (5.0, 5.0)], [named("X", 5.0, 5.0)]) == {1: 0}
+
+
+# ---------------------------------------------------------------------------
+# Membership labels (ROADMAP Item 26)
+# ---------------------------------------------------------------------------
+
+from model.labels import format_membership_label, parse_membership_label
+
+
+def test_membership_label_roundtrip():
+    slots = [(2, 7), (2, 5), (3, 1), (2, 5)]  # unsorted + dup
+    text = format_membership_label("N_CL", slots)
+    assert text == "N_CL: 2_5, 2_7, 3_1"
+    assert parse_membership_label(text) == ("N_CL", [(2, 5), (2, 7), (3, 1)])
+
+
+def test_parse_membership_rejects_non_membership_text():
+    for text in ("", "N_CL", "N_CL:", "N_CL: ", "Speed: 45 mph",
+                 "N_CL: 5", "N_CL: 2_", "N_CL: _5", "N_CL: 2_5_1",
+                 ": 2_5", "just a note"):
+        assert parse_membership_label(text) is None, text
+
+
+def test_membership_label_is_not_a_name_label():
+    # a membership label sits un-rotated too, but its "name: slots" text
+    # keeps it out of the name-label matcher (Item 26)
+    memb = named("N_CL: 2_5, 2_7", 100.0, 50.0)
+    assert is_name_label(memb) is False
+
+
+def test_match_name_labels_ignores_a_membership_label_at_a_far_end():
+    far_ends = [(100.0, 50.0)]
+    labels = [named("N_CL: 2_5, 2_7", 100.0, 50.0)]  # sitting right on the end
+    assert match_name_labels(far_ends, labels) == {}

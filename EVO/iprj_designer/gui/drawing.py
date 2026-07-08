@@ -74,6 +74,35 @@ def insert_zone(zones: list[EventZone], zone: EventZone) -> int:
     return len(zones) - 1
 
 
+def bulk_reassign(source_zones: list, selection, *, phase: int | None = None,
+                  output_delta: int = 0, target_zones: list | None = None) -> list:
+    """Apply a bulk edit to the zones at *selection* indices of *source_zones*
+    (ROADMAP Item 26); returns the edited zone objects in selection order so
+    the caller can re-select them (their indices may shift after a move).
+
+    - *phase*: set every selected zone's ``phase_number`` (None leaves it).
+    - *output_delta*: add to each zone's ``output_number``, clamped at 0 — a
+      relative nudge (+1 / -1), never a set-to-N.
+    - *target_zones*: when given and not *source_zones*, move each selected
+      zone into it (identity-pop from source + `insert_zone`), which routes a
+      sensor change between the _1_2/_3_4 files exactly as the single-zone
+      Properties move does. Fields not named are left untouched."""
+    edited = [source_zones[i] for i in selection if 0 <= i < len(source_zones)]
+    for z in edited:
+        if phase is not None:
+            z.phase_number = int(phase)
+        if output_delta:
+            z.output_number = max(0, (z.output_number or 0) + output_delta)
+    if target_zones is not None and target_zones is not source_zones:
+        for z in edited:
+            for i, s in enumerate(source_zones):
+                if s is z:
+                    del source_zones[i]
+                    break
+            insert_zone(target_zones, z)
+    return edited
+
+
 def next_output_number(zone_lists) -> int:
     """Next free OutputNumber across every sensor's zones (outputs are
     detector-rack channels, shared project-wide)."""
@@ -209,7 +238,8 @@ class DrawingController:
                  next_output: Callable[[], int] | None = None,
                  kind: DrawKind = LOOP_KIND,
                  owner_supplier: Callable[[], Owner] | None = None,
-                 label_draft: Callable[[], TextLabel] | None = None):
+                 label_draft: Callable[[], TextLabel] | None = None,
+                 on_commit: Callable[[object], None] | None = None):
         self.zones = zones
         self.ft_per_px = ft_per_px
         self.next_output = next_output
@@ -221,6 +251,12 @@ class DrawingController:
         # placing a text label (the Draw-mode editor bar); the clicked point
         # is the anchor. None -> the kind's own `make` default is kept.
         self.label_draft = label_draft
+        # Called with each freshly committed element after it lands in the list
+        # (ROADMAP Item 27): the GUI uses it to give a drawn event zone the
+        # centerline membership picked in the CL dropdown. Bulk placements
+        # (`insert_many`) and Edit-mode copies bypass it — they own their own
+        # membership handling.
+        self.on_commit = on_commit
 
         self.mode = "draw"            # "draw" | "edit"
         self.snap_enabled = False
@@ -337,6 +373,8 @@ class DrawingController:
         name = getattr(el, "zone_name", "") or self.kind.name
         out = getattr(el, "output_number", 0)
         self.message = f"placed {name}" + (f" (output {out})" if out else "")
+        if self.on_commit is not None:
+            self.on_commit(el)
 
     def _insert(self, el) -> int:
         """Insert via the kind's slot-else-append helper, recording the undo
@@ -1015,12 +1053,19 @@ def derive_attachments(centerlines, zone_lists) -> int:
     certainly placed along it — and a user who drew one that precisely by
     hand gets the re-stationing they would expect anyway. A zone matching
     several centerlines (e.g. parallel datums) attaches to the laterally
-    nearest. Returns the number of zones attached."""
+    nearest. Returns the number of zones attached.
+
+    ROADMAP Item 26 makes membership explicit and persisted (membership
+    labels), so this geometric derivation is now a backward-compat fallback:
+    zones already attached (by a membership label re-parse) are skipped, and
+    the GUI only runs this at all when the loaded project carries no
+    membership labels (a pre-Item-26 file)."""
     datums = [(cl, cl.current()) for cl in centerlines]
+    already = {k for cl in centerlines for k in cl.attached}
     n = 0
     for zones in zone_lists:
         for z in zones:
-            if is_placeholder(z) or not z.enable:
+            if is_placeholder(z) or not z.enable or id(z) in already:
                 continue
             best = None
             for cl, datum in datums:
@@ -1059,10 +1104,14 @@ class CenterlineController:
     curve as it is reshaped — including through undo, since zone points are
     purely derived from (points, attachment coords). The GUI calls
     `reproject` after manual zone edits so a hand-adjusted zone keeps its
-    adjusted station/offset instead of snapping back. Attachments are
-    session-local — the `.iprj` format has nowhere to carry them — but on
-    project open `derive_attachments` reconstructs them for zones that
-    still look engine-placed (see `station_offset_rectangle`).
+    adjusted station/offset instead of snapping back. Which zones are attached
+    (the membership) is persisted explicitly since ROADMAP Item 26 — as a
+    `"name: slots"` text label (each member's (sensor, zone-index) slot)
+    re-parsed on load and re-attached by projection, no geometry matching. The
+    per-corner station/offset itself is not stored: it is re-derived from the
+    live geometry on load. `derive_attachments`
+    (geometric guessing) survives only as a fallback for pre-Item-26 files with
+    no membership label.
     """
 
     def __init__(self, ft_per_px: Callable[[], float | None]):
@@ -1076,6 +1125,11 @@ class CenterlineController:
         # (ROADMAP Item 22), or None until the centerline is named. Its band
         # follows `owner`; the GUI keeps its text/position in sync.
         self.name_label: "TextLabel | None" = None
+        # The managed centerline-membership TextLabel (ROADMAP Item 26): a
+        # top-left "name: slots" label persisting which zones belong to this
+        # centerline, or None until it has a name and members. Band follows
+        # `owner` like the name label; the GUI syncs its text before save.
+        self.membership_label: "TextLabel | None" = None
         # File band this centerline (and its name label) is written to on the
         # two-file split (ROADMAP Item 21/22): GENERAL -> both files.
         self.owner: Owner = Owner.GENERAL
@@ -1115,6 +1169,31 @@ class CenterlineController:
         """Register *zone* as placed at *corners_so* (per-corner
         station/offset, world px) so centerline edits re-station it."""
         self.attached[id(zone)] = (zone, [tuple(c) for c in corners_so])
+
+    def attach_projected(self, zone: EventZone) -> bool:
+        """Make *zone* a member of this centerline (ROADMAP Item 26),
+        deriving its per-corner station/offset from the current datum by
+        projection — the explicit-membership equivalent of the geometric
+        `derive_attachments`, but it accepts any zone shape, not only an exact
+        station/offset rectangle. Returns False (no change) when there is no
+        valid datum yet."""
+        c = self.current()
+        if c is None:
+            return False
+        self.attach(zone, [c.project(p) for p in zone.points])
+        return True
+
+    def detach(self, zone: EventZone) -> bool:
+        """Drop *zone*'s membership if present; returns whether it was a
+        member (ROADMAP Item 26)."""
+        return self.attached.pop(id(zone), None) is not None
+
+    def member_zones(self) -> list[EventZone]:
+        """The zones currently attached to this centerline (ROADMAP Item 26).
+        Membership is persisted by each zone's (sensor, zone-index) slot, which
+        only the project knows, so the slot lookup lives in the GUI
+        (`Viewer.member_slots`); the controller just owns the set."""
+        return [zone for zone, _ in self.attached.values()]
 
     def restation(self) -> None:
         """Recompute every attached zone's points from its stored

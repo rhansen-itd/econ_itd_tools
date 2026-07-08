@@ -113,8 +113,11 @@ def save_labels(project: Project, labels: Sequence[TextLabel]) -> list[TextLabel
 
 def is_name_label(label: TextLabel) -> bool:
     """The shape a centerline-name label takes: an enabled, un-rotated text
-    label (a rotated label is decorative, never a name)."""
-    return bool(label.enable) and abs(label.rotation_angle or 0.0) < 1e-6
+    label (a rotated label is decorative, never a name) that is not a
+    membership label (ROADMAP Item 26 — those also sit un-rotated but carry a
+    ``name: outputs`` list and belong to `parse_membership_label`)."""
+    return (bool(label.enable) and abs(label.rotation_angle or 0.0) < 1e-6
+            and parse_membership_label(label.text or "") is None)
 
 
 def match_name_labels(
@@ -151,3 +154,68 @@ def match_name_labels(
         result[ci] = li
         used_labels.add(li)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Centerline-membership labels (ROADMAP Item 26)
+# ---------------------------------------------------------------------------
+#
+# A zone's tie to a centerline (which detectors belong to which approach) is
+# geometric and implicit today — re-derived on load by
+# gui/drawing.derive_attachments. Item 26 makes it explicit and persisted, the
+# same no-format-extension way centerline names are (above): a per-centerline
+# text label whose Text reads ``"[centerline name]: [zone slots]"`` — e.g.
+# ``"N_CL: 2_5, 2_7, 3_1"``. Each member is named by its **(sensor index, zone
+# index) slot** — the vendor stores zones in fixed per-sensor slots that persist
+# by index across a save/reload (the same property model/bands.py exploits for
+# Lineals/Textlabels), so the slot is a unique, round-trip-stable identifier —
+# unlike OutputNumber, which real projects reuse across zones. On load the label
+# is re-parsed and each listed slot re-attached, with no recourse to geometry —
+# see gui/app.ViewportState._derive_membership.
+#
+# The sensor index is written in **absolute (merged-project) space** (sensors
+# 0-3). On the two-file split the _3_4 half's sensors are renumbered to 0/1, so
+# the reader offsets file-local indices back to absolute using the file's pair
+# role (`_derive_membership`); this keeps a bare _3_4 half resolvable, not only
+# the merged overlay. The label sits top-left (cosmetic — the tie is re-derived
+# from its Text, not its position) and lives in the centerline's owner band, so
+# a sensor-owned group's membership label travels to the right file on the split.
+
+
+def format_membership_label(name: str,
+                            slots: Sequence[tuple[int, int]]) -> str:
+    """Render a centerline's membership as label Text (ROADMAP Item 26):
+    ``"[name]: [slots]"`` with each ``(sensor_index, zone_index)`` slot written
+    ``sensor_zone``, sorted and de-duplicated — e.g.
+    ``format_membership_label("N_CL", [(2, 7), (2, 5)])`` -> ``"N_CL: 2_5, 2_7"``."""
+    keys = sorted({(int(si), int(zi)) for si, zi in slots})
+    return f"{name}: {', '.join(f'{si}_{zi}' for si, zi in keys)}"
+
+
+def parse_membership_label(text: str) -> tuple[str, list[tuple[int, int]]] | None:
+    """Inverse of `format_membership_label`: ``"N_CL: 2_5, 2_7"`` ->
+    ``("N_CL", [(2, 5), (2, 7)])`` (ROADMAP Item 26). Returns None for anything
+    that is not a ``name: <comma-separated sensor_zone slots>`` shape — a bare
+    name, an empty name, or any token that is not two underscore-joined
+    non-negative integers — so ordinary text labels are never mistaken for
+    membership labels. The caller further requires the parsed name to match a
+    real centerline before adopting it."""
+    s = (text or "").strip()
+    if ":" not in s:
+        return None
+    name, _, rest = s.partition(":")
+    name, rest = name.strip(), rest.strip()
+    if not name or not rest:
+        return None
+    slots: list[tuple[int, int]] = []
+    for tok in rest.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        parts = tok.split("_")
+        if len(parts) != 2 or not (parts[0].isdigit() and parts[1].isdigit()):
+            return None
+        slots.append((int(parts[0]), int(parts[1])))
+    if not slots:
+        return None
+    return name, slots

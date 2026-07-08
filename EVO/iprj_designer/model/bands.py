@@ -65,6 +65,23 @@ def sensor_owner(si: int) -> Owner:
     return Owner.FILE1 if si < 2 else Owner.FILE2
 
 
+def resolve_owner(assign_general: bool, active_si: int, general_ok: bool) -> Owner:
+    """Owner a newly drawn annotation resolves to under the unified
+    Owner/Sensor dropdown (ROADMAP Item 24, §3.3 of ITEM23_TOOLBAR_PLAN).
+
+    The dropdown projects two internal fields through one widget: `assign_general`
+    (was the General/Active-sensor toggle) and `active_si` (was the sensor
+    selector). General is only a *valid* choice in some contexts (`general_ok`
+    — owned annotations, centerlines, Edit; never for zones or sensor picking),
+    so it resolves to GENERAL only when General is both offered and selected;
+    otherwise the annotation follows the active sensor's file band. This keeps
+    zones (which never offer General) routed by sensor even if `assign_general`
+    still carries a stale True from an earlier owned-kind selection."""
+    if general_ok and assign_general:
+        return Owner.GENERAL
+    return sensor_owner(active_si)
+
+
 def allocate(
     slots: list,
     owner: Owner,

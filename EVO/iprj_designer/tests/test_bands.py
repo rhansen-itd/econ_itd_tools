@@ -10,6 +10,7 @@ from model.bands import (
     allocate,
     band_for,
     owner_of_index,
+    resolve_owner,
     sensor_owner,
 )
 
@@ -55,6 +56,28 @@ def test_sensor_owner_matches_split_boundary():
     assert sensor_owner(1) == Owner.FILE1  # S2
     assert sensor_owner(2) == Owner.FILE2  # S3
     assert sensor_owner(3) == Owner.FILE2  # S4
+
+
+# ---------------------------------------------------------------------------
+# resolve_owner — unified Owner/Sensor dropdown projection (ROADMAP Item 24)
+# ---------------------------------------------------------------------------
+
+def test_resolve_owner_general_when_offered_and_selected():
+    assert resolve_owner(assign_general=True, active_si=1, general_ok=True) \
+        == Owner.GENERAL
+
+
+@pytest.mark.parametrize("si,owner", [
+    (0, Owner.FILE1), (1, Owner.FILE1), (2, Owner.FILE2), (3, Owner.FILE2)])
+def test_resolve_owner_follows_sensor_when_not_general(si, owner):
+    assert resolve_owner(assign_general=False, active_si=si, general_ok=True) == owner
+
+
+def test_resolve_owner_ignores_stale_general_where_not_offered():
+    # A zone kind never offers General: a leftover assign_general=True must not
+    # leak GENERAL onto a sensor-scoped annotation.
+    assert resolve_owner(assign_general=True, active_si=2, general_ok=False) \
+        == Owner.FILE2
 
 
 # ---------------------------------------------------------------------------

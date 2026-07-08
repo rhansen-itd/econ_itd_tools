@@ -1345,3 +1345,64 @@ def test_label_draft_applied_on_placement_keeps_anchor():
     # the placed label is independent of the draft prototype
     placed.text = "changed"
     assert draft.text == "STOP BAR"
+
+
+# -- bulk reassign + explicit membership (ROADMAP Item 26) ---------------------
+
+from gui.drawing import bulk_reassign
+
+
+def test_bulk_reassign_sets_phase_and_nudges_output():
+    zones = [square(name="A"), square(name="B"), square(name="C")]
+    for z, out in zip(zones, (10, 11, 0)):
+        z.output_number = out
+    edited = bulk_reassign(zones, [0, 2], phase=4, output_delta=1)
+    assert edited == [zones[0], zones[2]]
+    assert [z.phase_number for z in zones] == [4, 0, 4]  # only 0 and 2 set
+    assert zones[0].output_number == 11
+    assert zones[2].output_number == 1   # 0 -> 1
+    assert zones[1].output_number == 11  # untouched
+
+
+def test_bulk_reassign_output_nudge_clamps_at_zero():
+    z = square(); z.output_number = 0
+    bulk_reassign([z], [0], output_delta=-1)
+    assert z.output_number == 0  # clamped, never negative
+
+
+def test_bulk_reassign_moves_between_sensor_lists():
+    src = [square(name="A"), square(name="B"), square(name="C")]
+    dst = []
+    edited = bulk_reassign(src, [0, 2], target_zones=dst)
+    assert [z.zone_name for z in src] == ["B"]      # popped by identity
+    assert [z.zone_name for z in dst] == ["A", "C"]  # inserted (slot-else-append)
+    assert edited == dst
+
+
+def test_derive_attachments_skips_already_attached_zone():
+    ctrl = make_cl()
+    ctrl.points = [(0.0, 0.0), (0.0, -800.0)]
+    zone = EventZone(enable=1, points=[(20, -100), (32, -100),
+                                       (32, -140), (20, -140)])
+    ctrl.attach(zone, [(0.0, 0.0)])  # pre-attached (explicit membership)
+    # a second geometric pass must not re-count / re-attach it
+    assert derive_attachments([ctrl], [[zone]]) == 0
+
+
+def test_attach_projected_accepts_any_shape_and_tracks_members():
+    ctrl = make_cl()
+    ctrl.points = [(0.0, 0.0), (0.0, -800.0)]
+    tri = EventZone(enable=1, points=[(0, -50), (40, -50), (20, -90)])
+    quad = EventZone(enable=1, points=[(0, -200), (40, -200),
+                                       (40, -240), (0, -240)])
+    assert ctrl.attach_projected(tri) is True   # non-rectangular is fine
+    assert ctrl.attach_projected(quad) is True
+    assert set(map(id, ctrl.member_zones())) == {id(tri), id(quad)}
+    assert ctrl.detach(tri) is True
+    assert [id(z) for z in ctrl.member_zones()] == [id(quad)]
+
+
+def test_attach_projected_needs_a_datum():
+    ctrl = make_cl()
+    ctrl.points = [(0.0, 0.0)]  # single point -> no datum
+    assert ctrl.attach_projected(square()) is False

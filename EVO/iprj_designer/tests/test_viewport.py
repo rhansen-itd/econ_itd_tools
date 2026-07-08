@@ -50,6 +50,24 @@ def test_fit_centers_and_contains():
     assert vp.ty == pytest.approx(0.0)
 
 
+def test_fit_frames_offset_content():
+    # Item 25: with the oversized canvas the background sits at an offset inside
+    # the transformed surface; fit must center the *background*, so the offset
+    # shifts the translation by scale*origin relative to the origin-at-0 case.
+    vp_base = Viewport()
+    vp_base.fit((2000.0, 4800.0), (1000.0, 800.0), margin=1.0)
+    vp_off = Viewport()
+    vp_off.fit((2000.0, 4800.0), (1000.0, 800.0),
+               content_origin=(1000.0, 2400.0), margin=1.0)
+    assert vp_off.scale == pytest.approx(vp_base.scale)
+    assert vp_off.tx == pytest.approx(vp_base.tx - vp_off.scale * 1000.0)
+    assert vp_off.ty == pytest.approx(vp_base.ty - vp_off.scale * 2400.0)
+    # the background's top-left (surface point == content_origin) lands exactly
+    # where the origin-at-0 case put the image's top-left.
+    assert vp_off.image_to_viewport((1000.0, 2400.0)) == \
+        pytest.approx(vp_base.image_to_viewport((0.0, 0.0)))
+
+
 def test_css_roundtrips_transform():
     vp = Viewport(scale=1.25, tx=-3.5, ty=7.0)
     assert vp.css() == ("transform-origin: 0 0; "
