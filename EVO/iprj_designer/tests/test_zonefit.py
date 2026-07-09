@@ -19,9 +19,9 @@ from model.iprj_io import Background, EventZone, IgnoreZone, Project, Sensor, lo
 from model.replay import LiveAligner, load_recording, parse_recording
 from model.zonefit import RawZone, ZoneFit, fit, match_slots, parse_zline
 
-SITES = Path(__file__).resolve().parents[3] / "sites"
-BANKS_REC = SITES / "Banks" / "10_37_23_201_EVO_1783582697.txt"
-US95_REC = SITES / "86_US95&SH8" / "10_37_2_86_EVO_1770311735.txt"
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+BANKS_REC = FIXTURES / "10_37_23_201_EVO_1783582697.txt"
+US95_REC = FIXTURES / "10_37_2_86_EVO_1770311735.txt"
 
 
 # --- synthetic site: map zones + a known EVO->world similarity ---------------
@@ -246,13 +246,13 @@ def test_live_aligner_switches_on_z_line():
 # --- real-site integration (read-only fixtures) ---------------------------------
 
 @pytest.mark.skipif(not BANKS_REC.is_file() or
-                    not (SITES / "Banks" / "banks_1_2.iprj").is_file(),
+                    not (FIXTURES / "banks_1_2.iprj").is_file(),
                     reason="Banks fixtures not present")
 def test_banks_1_2_rotation_recovered():
     """The broken site: the fit must find the ≈ −34° rotation the manual
     long-baseline calibration established, with residuals at map hand-
     placement accuracy (investigation §4: manual estimate −33.7°)."""
-    proj = load_iprj(SITES / "Banks" / "banks_1_2.iprj")
+    proj = load_iprj(FIXTURES / "banks_1_2.iprj")
     rec = load_recording(proj, BANKS_REC)
     zf = rec.zone_fit
     assert zf is not None
@@ -263,13 +263,13 @@ def test_banks_1_2_rotation_recovered():
 
 
 @pytest.mark.skipif(not BANKS_REC.is_file() or
-                    not (SITES / "Banks" / "banks_3_4.iprj").is_file(),
+                    not (FIXTURES / "banks_3_4.iprj").is_file(),
                     reason="Banks fixtures not present")
 def test_banks_3_4_identifies_slot_3_exactly():
     """The split project holding only stream slot 3's sensor: signature
     matching must identify it (not slot 0), and the per-sensor fit is exact
     — the vendor generated one side from the other (investigation §2b)."""
-    proj = load_iprj(SITES / "Banks" / "banks_3_4.iprj")
+    proj = load_iprj(FIXTURES / "banks_3_4.iprj")
     rec = load_recording(proj, BANKS_REC)
     zf = rec.zone_fit
     assert zf is not None
@@ -287,7 +287,7 @@ def test_banks_3_4_identifies_slot_3_exactly():
 def test_us95_stays_near_identity():
     """The previously-correct site: the fit must be ≈ identity so the fix
     cannot regress it (what killed the reverted H3 attempt)."""
-    proj = load_iprj(SITES / "86_US95&SH8" / "us95&sh8.iprj")
+    proj = load_iprj(FIXTURES / "us95&sh8.iprj")
     rec = load_recording(proj, US95_REC)
     zf = rec.zone_fit
     assert zf is not None

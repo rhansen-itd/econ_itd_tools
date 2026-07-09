@@ -12,12 +12,17 @@ __pycache__/
 sites/Banks/sensors1_2.txt
 sites/Banks/sensors3_4.txt
 
-# Exceptions: keep small EVO captures as tracked samples. The Banks capture
-# is a fixture: it carries the Z; zone line the overlay-rotation fix and the
-# tests/test_zonefit.py integration tests align against.
-!sites/86_US95&SH8/10_37_2_86_EVO_1770311735.txt
-!sites/201_SH55&BanksLowmanRd/10_37_23_201_EVO_1770686257.txt
-!sites/Banks/10_37_23_201_EVO_1783582697.txt
+# .iprj files that are also test fixtures: tracked copies live in
+# EVO/iprj_designer/tests/fixtures/, so the site-folder originals don't
+# need to be tracked too.
+sites/Banks/banks_1_2.iprj
+sites/Banks/banks_3_4.iprj
+sites/86_US95&SH8/us95&sh8.iprj
+
+# Exception: tests/fixtures/ holds tracked copies of the above (and the EVO
+# capture .txt files) despite the *EVO*.txt / *iprj.txt rules above.
+!EVO/iprj_designer/tests/fixtures/*.txt
+!EVO/iprj_designer/tests/fixtures/*.iprj
 
 # iprj Designer generated test output (overlay PNGs, generated .iprj files)
 EVO/iprj_designer/tests/out/
