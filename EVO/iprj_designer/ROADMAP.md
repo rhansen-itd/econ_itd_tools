@@ -413,6 +413,53 @@ Suggested prompt:
 
 ---
 
+## 36 — Zone-Fit Robustness: Partial Matching + Outlier Rejection (Target: Opus)
+
+Slotted for the next improvements batch (owner, 2026-07-09). The overlay-
+rotation fix (`model/zonefit.py`) matches a project sensor to its `Z;` stream
+slot only when the sensor's **entire** ordered zone signature matches — so an
+iprj that isn't exactly concurrent with the capture degrades per-sensor,
+all-or-nothing: a zone *moved* (same phase/output/vertex-count) still matches
+but silently pollutes the fit, while a zone *added/deleted/re-assigned/
+re-shaped* drops that whole sensor's correspondences. Upgrade the matcher to
+survive a partially edited iprj — find the zones that still correspond, fit
+on those, and reject the rest — while keeping the current refuse-don't-guess
+character: a fit should still return `None` before it returns a confidently
+wrong transform.
+
+Scope:
+- [ ] Per-zone matching when a sensor's full-signature match fails: pair
+      zones by unique (kind, phase, output, vertex-count) keys within the
+      sensor; align remaining ambiguous zones greedily (e.g. longest common
+      ordered subsequence over the signature), never by coordinates alone.
+- [ ] Residual-based outlier rejection before the final fit (iterative
+      trimming or RANSAC-lite): fit, drop correspondences whose residual is a
+      clear outlier (moved loops), refit; cap how many may be dropped so a
+      mostly-wrong match still fails the gates rather than "converging".
+- [ ] Keep the exact-signature path as the untouched fast path, and keep the
+      existing gates (`MIN_ZONES`, `MIN_SPREAD_FT`, `MAX_MEAN_RESIDUAL_FT`)
+      as the final arbiter; surface how many zones matched/dropped on
+      `ZoneFit` so the GUI/status can report fit quality.
+- [ ] pytest coverage over synthetic perturbations of the Banks fixtures
+      (generated copies to `tests/out/`/scratchpad, never edits under
+      `sites/`): one loop moved, a loop added, a loop deleted, an output
+      re-assigned, several combined — asserting the recovered transform stays
+      within tolerance of the clean fit — plus an all-sensors-mangled case
+      asserting the fit refuses (translation fallback).
+- [ ] Update `zonefit.py`'s module docstring + the OVERLAY_ROTATION brief's
+      closure note; DESIGN_HISTORY entry; check off this item.
+
+Suggested prompt:
+> [Opus] In EVO/iprj_designer, do Item 36 of ROADMAP.md: make the Z;-zone
+> similarity fit robust to a stale/edited iprj — per-zone matching by unique
+> signature keys when a sensor's full signature no longer matches, plus
+> residual-based outlier rejection with a drop cap, keeping the existing
+> refuse-don't-guess gates and the exact-match fast path. pytest it over
+> perturbed copies of the Banks fixtures; land the docs + DESIGN_HISTORY
+> entry.
+
+---
+
 ## 10 — Webserver Deployment (Target: Opus)
 
 Carried over unchanged from the earlier "Phase 5" round (not started, not
@@ -458,6 +505,7 @@ Suggested prompt:
   session entry in DESIGN_HISTORY.md. The manual 2-point line-up idea is
   superseded for recordings/live with `Z;`; it only remains potentially useful
   for legacy captures that never recorded one (fold into the `calibrate.py`
-  item below only if that case ever matters).
+  item below only if that case ever matters). Robustness to a stale/edited
+  iprj (partial zone matching + outlier rejection) is scoped as Item 36 above.
 - Integrate the line-up/calibrate workflow (see
   `~/pyatspm/src/atspm/video/calibrate.py`) more directly into the app.
