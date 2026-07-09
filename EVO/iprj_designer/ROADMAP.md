@@ -413,6 +413,52 @@ Suggested prompt:
 
 ---
 
+## 36 — Overlay Alignment: Rotation + Scale Fit (Target: Opus) — DONE 2026-07-09
+
+Verification of Items 32–35 against real captures (owner, 2026-07-09) found the
+overlay **rotated** for some sites: the Banks recording + live feed were skewed
+~27° (a southbound vehicle rendered as a top-right→bottom-left diagonal instead
+of tracking straight down through the Ph6/Ph2 detectors), while US95&SH8 looked
+correct. Root cause: the RPP §1b / LIVE_OVERLAY §7 **no-rotation** assumption —
+alignment was a single-anchor *pure translation*, which left in the EVO fused
+frame's rotation relative to the map (≈27° at Banks, ≈4.5° at US95&SH8, so US95
+"looked fine") plus a few-percent EVO-metre-vs-calibrated-scale gap.
+
+The `C;` line already reports **every** sensor's EVO-frame position (groups of
+three per slot, absent sensors `?`, then a trailing lon/lat/apikey), and the
+Project stores those same sensors' map positions — so ≥2 sensors pin down
+orientation *and* scale.
+
+Scope:
+- [x] `model/replay.py`: `_parse_ref_all` (all `C;` sensor slots, 4-slot cap so
+      the trailing lon/lat isn't read as a sensor); `AlignTransform` +
+      `_fit_similarity` (Umeyama) + `build_align_transform` — a 2D similarity
+      (rotation + scale + translation) fit over the sensor correspondences, the
+      single seam `_align_frame` applies. <2 references (or a degenerate fit)
+      falls back to the historical pure translation anchored to `sensor_index`,
+      so single-reference behaviour and its tests are unchanged.
+- [x] Both the batch parser and the streaming `LiveAligner` build the transform
+      through the one `build_align_transform` (no second copy of the math); the
+      frame-for-frame equivalence test still holds.
+- [x] GUI: the load notify + Live status surface the solved rotation/scale/ref
+      count; the anchor-sensor pick is documented as the <2-ref fallback.
+- [x] pytest: Banks two-sensor fit (rotation ≈ −27°, scale ≈ 0.91, each
+      reference sensor lands exactly on its map anchor), US95&SH8 no-regression
+      (≈ −4.5°), single-reference + degenerate fallbacks, the lon/lat-not-a-
+      -sensor guard, and streaming↔batch equivalence on a multi-sensor `C;`.
+      Verified end-to-end on the real Banks recording (the SB diagonal becomes a
+      straight-down track). Full suite 546 pass.
+- [x] Docs: LIVE_OVERLAY_PLAN §7 marked resolved; DESIGN_HISTORY entry;
+      IPRJ_FORMAT `C;`-line note.
+
+**Known limitation / possible follow-up:** a single-sensor site/recording (e.g.
+Banks `sensor_3_w_fail.iprj` on its own) has only one reference, so rotation is
+undetermined and it still falls back to translation. A future item could
+recover single-sensor orientation from the sensor `AzimuthAngle` + the `C;`
+lat/long georeference.
+
+---
+
 ## 10 — Webserver Deployment (Target: Opus)
 
 Carried over unchanged from the earlier "Phase 5" round (not started, not

@@ -250,15 +250,22 @@ actually flowing?" is answerable without watching the canvas.
 | **35** Live mode + render | Opus | §4 read-only "Live" canvas mode sharing the Record panel's auth/`RecordingSession`; §3 single "latest aligned frame" slot written by the §1 subscriber (running the §2 aligner) and read by a fixed-cadence `ui.timer` that rewrites only the marker layer (reuse Item 30's `replay_layer` + `replay_point_to_canvas`); §5 guardrails (stale timeout, per-frame cap, error surfacing, timer inactive off-Live); optional `save=True` record-while-overlaying handing to the Item 30 loader. |
 
 ### Open items explicitly handed forward
-- **y-sign / no-rotation, on live data.** RPP §7 flagged that no real recording
-  survives on disk, so the batch engine (Item 29) proved alignment only against a
-  *synthetic* recording + an equivalence test to `evo_replay.align`. The first
-  **live** connection (Item 35) is the first time real EVO data flows end-to-end —
-  it is the real confirmation of the y-down sign and the axis-aligned (no per-sensor
-  `azimuth` rotation) assumption. If a live track is visibly mirrored or rotated
-  against the map, the fix is a one-place sign/orientation change in the shared
-  transform (which Item 33's equivalence test then re-pins), **not** a live-path
-  hack.
+- **y-sign / no-rotation, on live data.** — **RESOLVED, Item 36 (2026-07-09).**
+  RPP §7 flagged that no real recording survived on disk, so Items 29/33 proved
+  alignment only against a *synthetic* recording + an equivalence test to
+  `evo_replay.align`. The first real captures (Banks + US95&SH8, verified against
+  recordings and one live feed) confirmed the **y-down sign is correct** but the
+  **no-rotation assumption was wrong**: the EVO fused frame is rotated ~27° from
+  the Banks map (and ~4.5° from US95&SH8), plus a few-percent scale gap between
+  EVO metres and the map's calibrated scale. Because a `C;` line reports *every*
+  sensor's EVO-frame position and the Project stores those same sensors' map
+  positions, the transform is now a **2D similarity fit** over ≥2 sensor
+  correspondences (`build_align_transform` / `AlignTransform` in `model/replay.py`)
+  rather than a single-anchor pure translation — the "one-place change in the
+  shared transform" this item anticipated, and Item 33's equivalence test re-pins
+  it on the streaming path. Single-reference recordings (one sensor named, or a
+  single-sensor site) can't determine rotation and still fall back to translation.
+  See DESIGN_HISTORY "Item 36".
 - **Auto-reconnect** is out of scope for the first cut (§5) — user re-initiates.
 - **Multi-host live overlay.** §1's per-session subscriber generalizes (one
   `LiveAligner` per host/sensor, each writing its own slot or a merged slot), but

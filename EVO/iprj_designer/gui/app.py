@@ -3194,8 +3194,14 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         _set_play_icon()
         refresh_marker_layer()
         refresh_status()
+        tf = rec.transform
+        if tf.n_refs >= 2:
+            how = (f"aligned via {tf.n_refs} sensors: "
+                   f"rot {tf.rotation_deg:+.1f}°, scale {tf.scale:.3f}")
+        else:
+            how = f"anchored to S{rec.sensor_index + 1} (translation only)"
         ui.notify(f"loaded {n} frame{'s' if n != 1 else ''} from {path.name} "
-                  f"(anchored to S{rec.sensor_index + 1})")
+                  f"({how})")
 
     def load_replay_recording(preset_path: Path | None = None,
                                preset_sensor: int | None = None):
@@ -3217,8 +3223,9 @@ def build_ui(viewer: Viewer, state: dict) -> None:
                 value=min(default_sensor, n_sensors - 1),
                 label="anchor sensor").classes("w-full").props("dense")
             with sensor_sel:
-                ui.tooltip("the sensor this recording's stream belongs to — "
-                           "its C; reference aligns to this sensor (plan §1c)")
+                ui.tooltip("fallback anchor when the C; line names fewer than "
+                           "two sensors — with ≥2 the overlay is fit (rotation "
+                           "+ scale) to all of them and this choice is moot")
             found = recording_files()
             if found:
                 ui.select(found, label="found recordings",
