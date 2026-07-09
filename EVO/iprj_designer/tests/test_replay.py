@@ -19,10 +19,8 @@ from model import units
 from model.iprj_io import Background, Project, Sensor, load_iprj
 from model.replay import (
     SENSOR_COLORS,
-    AlignTransform,
     LiveAligner,
     anchor_world_ft,
-    build_align_transform,
     load_recording,
     marker_color,
     parse_recording,
@@ -445,109 +443,6 @@ def test_short_id_takes_trailing_digits():
     assert short_id(1234567, 2) == "67"
     assert short_id(5) == "5"                  # shorter than the window
     assert short_id(42, 0) == ""               # 0 disables the label
-
-
-# --- multi-sensor similarity fit: rotation + scale (LIVE_OVERLAY_PLAN §7) -----
-
-# Real EVO-frame sensor positions (meters), taken off each site's recording C;
-# line, paired against the same sensors' map positions the .iprj stores. Two
-# references pin orientation + scale, so build_align_transform fits a similarity
-# instead of the single-anchor pure translation that left the overlay rotated.
-BANKS_IPRJ = SITES / "Banks" / "sensors_1&2_w_fail.iprj"
-BANKS_EVO = {0: (23.375100, 4.695800), 1: (49.231500, -10.892200)}
-US95_EVO = {0: (-1.520230, -25.330200), 1: (6.770230, 24.330200)}
-
-
-def _two_sensor_recording(evo):
-    """A format-faithful recording whose C; names two sensors and whose one F;
-    frame drops a track point (oid 100+si) exactly on each sensor's EVO
-    position — so an exact fit lands each point on that sensor's map anchor."""
-    c = f"C;{evo[0][0]},{evo[0][1]},0.9,{evo[1][0]},{evo[1][1]},0.9"
-    ents = ";".join(f"{100 + si},7,{evo[si][0]},{evo[si][1]},0.0" for si in (0, 1))
-    return f"10:00:00.000\n{c}\n10:00:00.100\nF;0;1;2;3;{ents}\n"
-
-
-def _anchor_ft(project, si):
-    emp = units.effective_meter_per_pixel(project.background)
-    s = project.sensors[si]
-    return (units.px_to_ft(s.position_x, emp), units.px_to_ft(s.position_y, emp))
-
-
-def test_banks_two_sensor_fit_is_rotated_and_lands_exactly():
-    """The Banks regression: the EVO frame is rotated ~27° from the map, so a
-    single-anchor translation skewed the overlay. With both sensors referenced
-    the similarity fit recovers the rotation + scale and lands each reference
-    sensor's point exactly on its map anchor."""
-    proj = load_iprj(BANKS_IPRJ)
-    rec = parse_recording(proj, _two_sensor_recording(BANKS_EVO))
-    tf = rec.transform
-    assert tf.n_refs == 2
-    assert tf.rotation_deg == pytest.approx(-26.9, abs=0.5)  # not ~0: the bug
-    assert tf.scale == pytest.approx(0.912, abs=0.01)
-    pts = {p.oid: p for p in rec.frames[0].points}
-    for si in (0, 1):
-        ax, ay = _anchor_ft(proj, si)
-        assert pts[100 + si].x_ft == pytest.approx(ax, abs=1e-6)
-        assert pts[100 + si].y_ft == pytest.approx(ay, abs=1e-6)
-
-
-def test_us95_two_sensor_fit_small_rotation_no_regression():
-    """US95&SH8 already looked right under translation — its EVO→map rotation is
-    only ~4.5° — so the fit stays near-identity there (a tiny correction, no
-    regression) while still landing both sensors exactly."""
-    proj = load_iprj(SITES / "86_US95&SH8" / "us95&sh8.iprj")
-    rec = parse_recording(proj, _two_sensor_recording(US95_EVO))
-    tf = rec.transform
-    assert tf.n_refs == 2
-    assert tf.rotation_deg == pytest.approx(-4.5, abs=1.0)
-    for si in (0, 1):
-        p = next(p for p in rec.frames[0].points if p.oid == 100 + si)
-        ax, ay = _anchor_ft(proj, si)
-        assert p.x_ft == pytest.approx(ax, abs=1e-6)
-        assert p.y_ft == pytest.approx(ay, abs=1e-6)
-
-
-def test_single_reference_falls_back_to_translation(site):
-    """A C; naming only one sensor can't determine rotation/scale, so the
-    transform stays the historical pure translation (a=1, b=0) anchored to the
-    chosen sensor — the pre-fit contract every earlier test locks in."""
-    tf = parse_recording(site, RECORDING, sensor_index=0).transform
-    assert tf.n_refs < 2
-    assert (tf.a, tf.b, tf.rotation_deg, tf.scale) == (1.0, 0.0, 0.0, 1.0)
-
-
-def test_degenerate_coincident_refs_fall_back_to_translation(site):
-    """Two references at the *same* EVO point give no baseline, so the fit is
-    declined and the transform falls back to translation rather than dividing
-    by zero."""
-    evo = {0: (5.0, 5.0), 1: (5.0, 5.0)}
-    slots = {0: evo[0], 1: evo[1]}
-    tf = build_align_transform(site, slots, sensor_index=0, ref=evo[0])
-    assert (tf.a, tf.b, tf.scale) == (1.0, 0.0, 1.0)
-
-
-def test_c_line_lonlat_apikey_not_read_as_extra_sensor():
-    """A full C; line ends with longitude,latitude,apikey after the sensor
-    slots; the 4-slot cap must not read that trailing pair as a 5th sensor."""
-    from model.replay import _parse_ref_all
-    line = ("C;23.3751,4.6958,0.99,49.2315,-10.8922,0.47,?,?,?,"
-            "52.8679,-6.93397,0.77,-116.115,44.0846,AIzaKEY")
-    slots = _parse_ref_all(line)
-    assert set(slots) == {0, 1, 3}  # slot 2 is '?', lon/lat dropped by the cap
-    assert slots[0] == pytest.approx((23.3751, 4.6958))
-    assert slots[3] == pytest.approx((52.8679, -6.93397))
-
-
-def test_streamed_two_sensor_fit_matches_batch():
-    """The streaming path shares build_align_transform, so LiveAligner must
-    reproduce the batch similarity fit frame-for-frame on a multi-sensor C;."""
-    proj = load_iprj(BANKS_IPRJ)
-    text = _two_sensor_recording(BANKS_EVO)
-    batch = parse_recording(proj, text)
-    aligner = LiveAligner(proj)
-    assert _stream(aligner, text) == batch.frames
-    assert aligner.transform == batch.transform
-    assert isinstance(aligner.transform, AlignTransform)
 
 
 # --- notebook convenience -----------------------------------------------------

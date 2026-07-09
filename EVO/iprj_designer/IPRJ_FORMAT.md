@@ -164,18 +164,6 @@ two-point calibration across the image's top edge (`units.calibrate_image_width`
 `RoadGradientAngle`, `InstallationHeight`, `RainInterferenceThreshold`,
 `HighwayMode`, `MaxStopTime`, `FrequencyChannel`, `Gps_lat`, `Gps_lng`
 
-> **Recording overlay alignment (Item 36).** `Position_X/Y` (world pixels) are
-> the map anchors the EVO-recording overlay aligns to. An EVO recording's `C;`
-> line reports every sensor's position in the *EVO frame* (metres) — groups of
-> three `x,y,confidence` per sensor slot 0-3, absent sensors written `?`, then a
-> trailing `longitude,latitude,apikey`. With ≥2 sensors present in both, the
-> overlay fits a 2D similarity (rotation + scale + translation) from these
-> correspondences (`model/replay.build_align_transform`); the EVO frame is
-> rotated a site-dependent amount from the map (≈27° at Banks), so a single-
-> anchor translation is not enough. `AzimuthAngle` (sensor boresight heading) is
-> *not* currently used for alignment — the multi-sensor fit supersedes it — but
-> is the likely lever for a future single-sensor orientation recovery.
-
 ### Event zones (the loops)
 
 `Radarsensor_{i}_EventZone_{j}_…`:

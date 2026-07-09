@@ -2591,55 +2591,39 @@ Suggested prompt:
     hand per the plan. Checked off Item 35 in ROADMAP.md — the live-overlay
     batch (32–35) is complete.
 
-- 2026-07-09 — **ROADMAP Item 36: Overlay alignment rotation + scale fit
-  (Opus)** — the correctness fix from verifying Items 32–35 against the first
-  real captures. Owner found the overlay **rotated** for Banks (recording +
-  live feed) while US95&SH8 was correct: a southbound vehicle rendered as a
-  top-right→bottom-left diagonal instead of tracking straight down through the
-  Ph6/Ph2 detectors.
-  - **Root cause.** The alignment was a single-anchor **pure translation**
-    (RPP §1b, the LIVE_OVERLAY §7 "no-rotation" assumption). That left in the
-    EVO fused frame's rotation relative to the map — measured **≈−26.9° at
-    Banks, ≈−4.5° at US95&SH8**, which is why US95 "looked fine" and Banks
-    didn't — plus a few-percent gap between EVO metres and the map's calibrated
-    scale (Banks fit scale 0.912, US95 1.052).
-  - **Decision.** A `C;` line already carries **every** sensor's EVO-frame
-    position (groups of three `x,y,confidence` per slot, absent `?`, then a
-    trailing lon/lat/apikey), and the Project stores those same sensors' map
-    positions. So ≥2 sensors pin orientation *and* scale: alignment is now a
-    **2D similarity fit** (Umeyama rotation + uniform scale + translation) over
-    the sensor correspondences, not a translation. This is the "one-place
-    change in the shared transform" LIVE_OVERLAY §7 anticipated. Chose
-    similarity over rigid (scale-1) because the real inter-sensor distances
-    disagree by a few percent — the fitted scale lands each reference sensor
-    *exactly* on its map anchor (rigid left a ~4 ft residual, ~a lane width,
-    which matters for "along the left of Ph2 vs through it"). Chose empirical
-    scale over trusting `m_to_ft`-only: that RPP §1b reasoning held only for a
-    *single* reference where no second point exists; with ≥2 the fit is
-    strictly better.
-  - **Implementation.** `model/replay.py`: `_parse_ref_all` (all `C;` slots,
-    4-slot cap so lon/lat isn't read as a sensor), `AlignTransform` (frozen,
-    `apply` = the one seam), `_fit_similarity`, `build_align_transform`.
-    `_align_frame` now applies the transform; **both** the batch parser and the
-    streaming `LiveAligner` build it through the one `build_align_transform`
-    (no second copy of the coordinate math), so the frame-for-frame equivalence
-    test still holds. <2 references, or a degenerate (coincident) fit, falls
-    back to the historical translation anchored to `sensor_index` (`a=1,b=0`) —
-    so every single-reference test is unchanged. GUI: the load notify + Live
-    status surface the solved rotation/scale/ref-count; the anchor-sensor pick
-    is now documented as the <2-ref fallback.
-  - **Verification.** 6 new tests (Banks fit rotation/scale + exact landing,
-    US95 no-regression, single-reference + degenerate fallbacks, lon/lat-not-a-
-    sensor guard, streaming↔batch equivalence on a multi-sensor `C;`). Full
-    suite **546 pass**. End-to-end on the real Banks recording: the busiest
-    track's start→end went from `(650,−65)→(306,622)` (the reported
-    top-right→bottom-left diagonal) under the old translation to
-    `(288,−94)→(292,606)` — a clean straight-down SB track — under the fit.
-  - **Known limitation.** A single-sensor site/recording (e.g. Banks
-    `sensor_3_w_fail.iprj` alone) has one reference, so rotation is
-    undetermined and it still falls back to translation; a future item could
-    recover single-sensor orientation from `AzimuthAngle` + the `C;`
-    lat/long georeference (noted on ROADMAP Item 36).
+- 2026-07-09 — **Item 36 (overlay rotation fit) attempted and REVERTED.** Owner
+  verified the overlay against real captures and found Banks visibly rotated
+  (~27–45°) while US95&SH8 was correct. First fix (commit 0a45371) replaced the
+  single-anchor translation with a 2D **similarity fit** (Umeyama rotation +
+  scale + translation) over the `C;`-line sensor positions ↔ the `.iprj` sensor
+  map positions. **It regressed US95&SH8** (owner: was correct under translation,
+  now "noticeably off") and only partly helped Banks (still "significantly off"),
+  so it was reverted (files restored to 66aaf52).
+  - **Why it failed — the real finding.** Deriving rotation from 2–3 sensor
+    correspondences is **noise-limited and not viable**. The map sensor positions
+    are hand-placed icons; over US95's ~259 px baseline a ~4 m placement slop is
+    ~4.5°, and the fit "found" exactly that −4.5° where the true rotation is **0**
+    (owner-confirmed: translation was correct there). So the method injects
+    several degrees of spurious rotation into *well-configured* sites to partly
+    help a misconfigured one — a losing trade. `BackgroundImageRotation` is 0 at
+    both sites; sensor `AzimuthAngle` yields no clean rotation formula either
+    (US95 az0 −170.56, Banks az0 −54.17 don't map to 0°/~27° by any constant).
+  - **What's actually true.** (a) The `C;` line *does* carry every sensor's
+    EVO-frame position (groups of three, absent `?`, then trailing lon/lat/apikey)
+    — that decoding stands and is worth keeping for a future attempt. (b) The
+    EVO→map relationship is genuinely a *pure translation for a correctly-set-up
+    site* (US95); a rotated overlay (Banks) means the site's EVO frame and its
+    background image were set up with a real angular offset — most likely a
+    **data/config problem at the specific site**, not a universal transform the
+    designer should synthesize from noisy anchors.
+  - **Path forward (for owner to choose, not yet scoped).** Options: (1) leave
+    translation as the default and add an **optional per-site/per-recording manual
+    rotation (+ scale) override** the user eyeballs against the map — robust, no
+    noisy inference; (2) fix the Banks site config upstream so its EVO frame and
+    image agree (if that's the real defect); (3) a georeferenced fit only if a
+    *long-baseline, precise* correspondence exists (precise sensor GPS or ≥3
+    well-separated points) — the short 2-sensor baseline here cannot support it.
+    Reopened as ROADMAP "Overlay rotation (reopened)".
 
 ## Appendix — example template (acceptance case, revised for Items 15/17/18)
 
