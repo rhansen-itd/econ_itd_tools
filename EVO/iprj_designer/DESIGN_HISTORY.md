@@ -2610,20 +2610,44 @@ Suggested prompt:
     (US95 az0 −170.56, Banks az0 −54.17 don't map to 0°/~27° by any constant).
   - **What's actually true.** (a) The `C;` line *does* carry every sensor's
     EVO-frame position (groups of three, absent `?`, then trailing lon/lat/apikey)
-    — that decoding stands and is worth keeping for a future attempt. (b) The
-    EVO→map relationship is genuinely a *pure translation for a correctly-set-up
-    site* (US95); a rotated overlay (Banks) means the site's EVO frame and its
-    background image were set up with a real angular offset — most likely a
-    **data/config problem at the specific site**, not a universal transform the
-    designer should synthesize from noisy anchors.
-  - **Path forward (for owner to choose, not yet scoped).** Options: (1) leave
-    translation as the default and add an **optional per-site/per-recording manual
-    rotation (+ scale) override** the user eyeballs against the map — robust, no
-    noisy inference; (2) fix the Banks site config upstream so its EVO frame and
-    image agree (if that's the real defect); (3) a georeferenced fit only if a
-    *long-baseline, precise* correspondence exists (precise sensor GPS or ≥3
-    well-separated points) — the short 2-sensor baseline here cannot support it.
-    Reopened as ROADMAP "Overlay rotation (reopened)".
+    — that decoding stands and is worth keeping. (b) The EVO→map relationship is
+    genuinely a *pure translation for a correctly-set-up site* (US95, true
+    rotation ~0); a rotated overlay (Banks) is a **real angular offset** between
+    that site's EVO fused frame and its background image.
+
+  - **Diagnosis pass (owner asked to "diagnose Banks config first").** Grounded
+    against the Banks detector layout + owner's description (the SB vehicle should
+    thread `1: Ph 6 SB` (279,535 ft) then run along the **left** of the Ph 2
+    string `Ph2 SB`(291,687)→`Adv1`(257,880)→`Adv2`(216,1003)→`Adv3`(162,1121)),
+    using the real recording `10_37_23_201_EVO_1783582697.txt`:
+    - The Banks EVO→map rotation is **consistent (~−23° to −27°) across all 13
+      Banks `.iprj` variants** measured from the `C;`↔sensor positions — so the
+      offset is a *real, stable property of the site*, not a wrong-file or pure-
+      noise artifact. US95 is ~−4.5° (i.e. ~0 + noise).
+    - **A single similarity transform DOES fit the whole Banks corridor** — it is
+      **not** a nonlinear / hopeless mismatch. Calibrated on the long baseline
+      (the vehicle's own ~600 ft path, mapping its Ph6-pass and Ph2Adv3-pass
+      points onto those detectors) the fit is **rotation −33.7°, scale 1.229**,
+      landing every detector within **0–32 ft** and the track consistently just
+      to one side — exactly "along the left of Ph 2."
+    - **The reverted fix failed purely on calibration source.** The 99 ft sensor
+      pair implied rotation −26.9° / scale **0.91**, but the true long-baseline
+      answer is −33.7° / **1.23** (scale even inverted in direction). Extrapolated
+      ~6× down the 600 ft corridor, that error is the 16 ft→91 ft progressive
+      drift owner saw ("closer but still off"). A 2-sensor, ~99 ft, hand-placed
+      baseline simply cannot resolve rotation/scale to the <~1° / <~2 % precision
+      the far end needs.
+
+  - **Conclusion + path forward.** The transform must be calibrated from a **long
+    baseline**, which in practice means a **human lining the overlay up against
+    the map**, not auto-fitting from the sensors. Recommended: a per-site **2-point
+    "line-up" alignment** (pick a point on a known track, say where it belongs on
+    the map, twice over a long baseline → solve rotation+scale+translation),
+    defaulting to identity so US95 and every already-correct site are untouched.
+    This dovetails with the already-planned "integrate the line-up/calibrate
+    workflow (`~/pyatspm/.../calibrate.py`)" future item. Auto-fitting from sensor
+    positions is a dead end at this precision and should not be retried. Reopened
+    as ROADMAP "Overlay rotation (reopened)".
 
 ## Appendix — example template (acceptance case, revised for Items 15/17/18)
 

@@ -445,15 +445,20 @@ Suggested prompt:
 - (Now scoped as Items 32–35 above: display objects from a **live** stream in
   the canvas, real-time, reusing the record/playback feed.)
 - **Overlay rotation (reopened).** Some sites (Banks) render the recording/live
-  overlay visibly rotated (~27–45°) while others (US95&SH8) are correct under the
+  overlay visibly rotated (~25–34°) while others (US95&SH8) are correct under the
   current pure translation. An automatic 2D-similarity fit over the `C;`-line ↔
-  `.iprj` sensor positions was tried and **reverted** (commit 0a45371): a 2–3
-  sensor baseline is too noise-limited to recover rotation — it injected a
-  spurious ~4.5° into US95 (true rotation 0) while only partly helping Banks.
-  See the 2026-07-09 DESIGN_HISTORY entry for the full finding. Needs a design
-  decision before any code: likely an **optional per-site manual rotation/scale
-  override** (eyeballed against the map), or fixing the Banks site config
-  upstream, rather than synthesizing the transform from noisy anchors. The `C;`
-  multi-sensor decode from the reverted attempt is worth reusing.
+  `.iprj` sensor positions was tried and **reverted** (commit 0a45371). The
+  2026-07-09 diagnosis pass (DESIGN_HISTORY) settled it: a single
+  rotation+scale+translation **does** align the whole Banks corridor (every
+  detector within 0–32 ft when calibrated on the vehicle's ~600 ft path →
+  −33.7°, scale 1.23), so it's not a nonlinear/data-defect problem — but the
+  ~99 ft, hand-placed **2-sensor baseline is too short to recover those params**
+  (it gave −26.9° / 0.91, drifting to 91 ft at the far end). **Do not retry
+  sensor auto-fit.** The transform must be calibrated on a long baseline, i.e. a
+  human line-up. Scope this as a per-site **2-point "line-up" alignment** (pick a
+  track point, place it on the map, twice → solve rotation+scale+translation),
+  identity by default so already-correct sites are untouched; fold in with the
+  `calibrate.py` line-up workflow future item below. The `C;` multi-sensor decode
+  from the reverted attempt is worth reusing for a suggested starting guess.
 - Integrate the line-up/calibrate workflow (see
   `~/pyatspm/src/atspm/video/calibrate.py`) more directly into the app.
