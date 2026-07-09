@@ -200,9 +200,12 @@ from model.multifile import (MAX_SENSORS, BackgroundMismatch,
                              check_background_match, is_multifile,
                              is_valid_pair, merge_pair, pair_paths,
                              pair_role, split_project)
+from model.replay import (Recording, load_recording, marker_color, short_id)
 from model.templates import (DIRECTIONS, PlacementContext, expand_and_place,
                              expand_and_place_on_centerline, load_template,
                              missing_placeholders)
+from capture.hosts import known_hosts
+from capture.recorder import RecordingSession
 
 REPO = Path(__file__).resolve().parents[3]
 TEMPLATES_DIR = Path(__file__).resolve().parents[1] / "templates"
@@ -258,6 +261,8 @@ def effective_mode(tool_val: str, kind_val: str) -> str:
         return "Edit"
     if tool_val == "Background":
         return "Background"
+    if tool_val == "Replay":
+        return "Replay"  # read-only playback mode (ROADMAP Item 30)
     if kind_val == "Centerline":
         return "Centerline"
     if kind_val == "Sensor":
@@ -442,6 +447,24 @@ class Viewer:
         self.ruler_start: tuple[float, float] | None = None  # world px
         self.ruler_end: tuple[float, float] | None = None    # world px
         self.ruler_pending = False
+        # Replay (ROADMAP Item 30): a loaded EVO Recording animated over the
+        # overlay in the read-only "Replay" mode (plan §4). The engine (Item 29)
+        # emits world-feet; the marker layer renders them through the same
+        # feet -> world-px -> canvas path as every other overlay object, so they
+        # register against the background at any zoom/pan. `replay_pos` is a
+        # fractional frame accumulator so sub-1x speeds advance smoothly.
+        self.replay: Recording | None = None
+        self.replay_path: Path | None = None
+        self.replay_frame = 0
+        self.replay_pos = 0.0
+        self.replay_playing = False
+        self.replay_speed = 1.0
+        self.replay_labels = True
+        # Record (ROADMAP Item 31, plan §5): live capture sessions keyed by
+        # host, so the Record dialog can be reopened to check on / stop a
+        # capture started earlier without losing it. Single-host minimum
+        # per plan §5; nothing stops a second host running concurrently.
+        self.record_sessions: dict[str, RecordingSession] = {}
         # Generic (non-chain) Lineals: a project-wide pool the Lineal draw
         # kind targets, round-tripped via model/centerline.py's
         # load_lineals/save_lineals (PHASE3_UI_PLAN §4.3). Each carries its
@@ -846,6 +869,17 @@ class Viewer:
         return units.image_to_world(
             self.bg, (c[0] - self.canvas_off_x, c[1] - self.canvas_off_y))
 
+    def replay_point_to_canvas(self, x_ft, y_ft):
+        """A replay track point's world-feet position -> canvas px (Item 30).
+
+        The Item 29 engine emits canonical world-feet; convert back to world px
+        with the *same* calibrated scale the anchor used (so the round-trip is
+        exact), then reuse world_to_canvas — the one feet->viewport path all
+        overlay objects share, so markers register with the background."""
+        emp = units.effective_meter_per_pixel(self.bg)
+        return self.world_to_canvas(
+            (units.ft_to_px(x_ft, emp), units.ft_to_px(y_ft, emp)))
+
     def describe(self, canvas_point) -> str:
         wx, wy = self.canvas_to_world(canvas_point)
         fpp = self.ft_per_px()
@@ -1151,6 +1185,38 @@ class Viewer:
                                       stroke_dasharray=f"{3 * lw} {2 * lw}"))
         return "".join(parts)
 
+    def replay_marker_svg(self) -> str:
+        """SVG for the current replay frame's track markers (ROADMAP Item 30).
+
+        Built as its own string for the separate marker layer (plan §4): the
+        static zone/centerline overlay from svg() renders beneath, untouched,
+        while this is the only content rewritten each ui.timer tick. Colors and
+        id labels mirror evo_replay (model.marker_color / short_id). Returns ""
+        when no recording is loaded, so the layer is simply empty off-Replay.
+        """
+        rec = self.replay
+        if rec is None or not rec.frames:
+            return ""
+        i = max(0, min(self.replay_frame, len(rec.frames) - 1))
+        lw = self.overlay_px / max(self.viewport.scale, 0.05)
+        r = 4 * lw
+        font = 7 * lw
+        parts = []
+        for pt in rec.frames[i].points:
+            cx, cy = self.replay_point_to_canvas(pt.x_ft, pt.y_ft)
+            color = marker_color(pt.sensor)
+            parts.append(f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{r:.1f}" '
+                         f'fill="{color}" fill-opacity="0.9" stroke="black" '
+                         f'stroke-width="{lw / 2:.2f}"/>')
+            if self.replay_labels:
+                label = escape(short_id(pt.oid))
+                parts.append(
+                    f'<text x="{cx:.1f}" y="{cy - r - lw:.1f}" fill="white" '
+                    f'font-size="{font:.1f}" text-anchor="middle" '
+                    f'paint-order="stroke" stroke="black" '
+                    f'stroke-width="{font / 8:.2f}">{label}</text>')
+        return "".join(parts)
+
 
 # ---------------------------------------------------------------------------
 # App
@@ -1218,6 +1284,7 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         for cl in v.centerlines:
             cl.handle_radius = 10.0 * f
         refresh_overlay()  # stroke widths track zoom level
+        refresh_replay_layer()  # marker sizes track zoom too (Item 30)
 
     def status_scale() -> str:
         fpp = v.ft_per_px()
@@ -2307,6 +2374,17 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             status_label.set_text(
                 "mode: calibrate 2-pt | click two reference points, "
                 "then enter the known distance")
+        elif v.mode == "Replay":
+            if v.replay is None:
+                status_label.set_text(
+                    "mode: replay | load an EVO recording (video icon at right)")
+            else:
+                n = len(v.replay.frames)
+                f = v.replay.frames[v.replay_frame]
+                status_label.set_text(
+                    f"mode: replay | frame {v.replay_frame + 1}/{n} | {f.t} | "
+                    f"{len(f.points)} track{'s' if len(f.points) != 1 else ''} | "
+                    f"{'playing' if v.replay_playing else 'paused'}")
         else:
             status_label.set_text(f"mode: {v.mode.lower()}")
         snap_switch.set_value(v.ctrl.snap_enabled)  # no-op when already equal
@@ -2806,12 +2884,17 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             cancel_rotate()
         v.marquee_anchor = None
         v.marquee_cursor = None
+        # Leaving Replay stops the animation; the marker layer is refreshed by
+        # the caller (change_tool) which clears it when mode != "Replay".
+        if new_mode != "Replay":
+            _pause_replay()
 
     def change_tool(e):
         kind = draw_kind_toggle.value
         _enter_mode(effective_mode(e.value, kind))
         update_context_bar()
         refresh_overlay()
+        refresh_replay_layer()  # show markers entering Replay, clear them leaving
         refresh_status()
 
     def change_draw_kind(e):
@@ -2924,6 +3007,299 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         return v.mode in ("Draw", "Edit") and \
             v.draw_kind_name in ("Event Zone", "Ignore Zone")
 
+    # -- replay (ROADMAP Item 30) --------------------------------------------
+    # Guards a programmatic scrubber set (in set_replay_frame) so it doesn't
+    # re-enter on_replay_scrub, the same pattern as _owner_sel_lock above.
+    _replay_scrub_lock = [False]
+
+    def refresh_replay_layer():
+        """Rewrite the separate marker layer (plan §4). Empty off-Replay, so the
+        overlay above the static svg() layer simply clears when leaving the mode.
+        Called on every zoom/pan (via apply_transform) so marker sizes track the
+        zoom, and on each timer tick / scrub."""
+        replay_layer.content = (
+            v.replay_marker_svg() if v.mode == "Replay" else "")
+
+    def _set_play_icon():
+        replay_play_btn.props(
+            f"icon={'pause' if v.replay_playing else 'play_arrow'}")
+
+    def _pause_replay():
+        if v.replay_playing:
+            v.replay_playing = False
+        replay_timer.active = False
+        _set_play_icon()
+
+    def set_replay_frame(i, *, from_slider=False):
+        """Jump to frame *i* (clamped): the single seam every transport control
+        and the timer route through, so the scrubber, marker layer, and status
+        line stay in lockstep."""
+        rec = v.replay
+        if rec is None or not rec.frames:
+            return
+        i = max(0, min(int(i), len(rec.frames) - 1))
+        v.replay_frame = i
+        v.replay_pos = float(i)
+        if not from_slider:
+            _replay_scrub_lock[0] = True
+            replay_slider.value = i
+            _replay_scrub_lock[0] = False
+        refresh_replay_layer()
+        refresh_status()
+
+    def replay_tick():
+        """10 fps cadence (plan §6): advance replay_pos by the speed multiplier
+        so sub-1x speeds still animate; stop (don't loop) at the last frame."""
+        rec = v.replay
+        if rec is None or not v.replay_playing:
+            return
+        v.replay_pos += v.replay_speed
+        frame = int(v.replay_pos)
+        if frame >= len(rec.frames) - 1:
+            set_replay_frame(len(rec.frames) - 1)
+            _pause_replay()
+            return
+        set_replay_frame(frame)
+
+    def toggle_replay_play():
+        if v.replay is None:
+            ui.notify("load a recording first (video icon)", type="warning")
+            return
+        if v.replay_playing:
+            _pause_replay()
+            return
+        if v.replay_frame >= len(v.replay.frames) - 1:
+            set_replay_frame(0)  # replay from the top when parked at the end
+        v.replay_playing = True
+        replay_timer.active = True
+        _set_play_icon()
+
+    def replay_step(delta):
+        if v.replay is None:
+            return
+        _pause_replay()
+        set_replay_frame(v.replay_frame + delta)
+
+    def on_replay_scrub(e):
+        if _replay_scrub_lock[0]:
+            return
+        _pause_replay()  # scrubbing takes manual control
+        set_replay_frame(int(e.value or 0), from_slider=True)
+
+    def change_replay_speed(e):
+        try:
+            v.replay_speed = float(e.value)
+        except (TypeError, ValueError):
+            v.replay_speed = 1.0
+
+    def toggle_replay_labels(e):
+        v.replay_labels = bool(e.value)
+        refresh_replay_layer()
+
+    def recording_files() -> dict:
+        """EVO recordings discoverable near the loaded project — the site
+        folder and its `recordings/` subfolder (Item 28's file convention).
+        Keyed by absolute path, valued by filename for the picker."""
+        found: dict[str, str] = {}
+        if v.source:
+            for root in (v.source.parent, v.source.parent / "recordings"):
+                try:
+                    for f in sorted(root.glob("*EVO*.txt")):
+                        found[str(f)] = f.name
+                except OSError:
+                    pass
+        return found
+
+    def set_recording(rec: Recording, path: Path):
+        """Adopt a freshly loaded Recording: reset transport state and size the
+        scrubber to its frame count."""
+        v.replay = rec
+        v.replay_path = path
+        v.replay_playing = False
+        v.replay_frame = 0
+        v.replay_pos = 0.0
+        replay_timer.active = False
+        n = len(rec.frames)
+        _replay_scrub_lock[0] = True
+        replay_slider.props(f"max={max(n - 1, 1)}")
+        replay_slider.value = 0
+        _replay_scrub_lock[0] = False
+        _set_play_icon()
+        refresh_replay_layer()
+        refresh_status()
+        ui.notify(f"loaded {n} frame{'s' if n != 1 else ''} from {path.name} "
+                  f"(anchored to S{rec.sensor_index + 1})")
+
+    def load_replay_recording(preset_path: Path | None = None,
+                               preset_sensor: int | None = None):
+        """Recording picker (plan §4): pick a file + the sensor its stream
+        anchors to, load it through the Item 29 engine, and hand it to the
+        transport. `preset_path`/`preset_sensor` let the Item 31 Record panel
+        hand a just-finished capture straight in (plan §5's "hand a finished
+        recording straight to the Item 30 playback loader")."""
+        if v.ft_per_px() is None:
+            ui.notify("calibrate the background first — playback needs the "
+                      "meters-per-pixel scale", type="warning")
+            return
+        with ui.dialog() as dialog, ui.card().style("min-width: 480px"):
+            ui.label("Load EVO recording").classes("text-lg")
+            n_sensors = len(v.project.sensors)
+            default_sensor = preset_sensor if preset_sensor is not None else v.active_si
+            sensor_sel = ui.select(
+                {i: f"S{i + 1}" for i in range(n_sensors)},
+                value=min(default_sensor, n_sensors - 1),
+                label="anchor sensor").classes("w-full").props("dense")
+            with sensor_sel:
+                ui.tooltip("the sensor this recording's stream belongs to — "
+                           "its C; reference aligns to this sensor (plan §1c)")
+            found = recording_files()
+            if found:
+                ui.select(found, label="found recordings",
+                          on_change=lambda e: path_in.set_value(e.value)) \
+                    .classes("w-full").props("dense clearable")
+            path_in = ui.input(
+                "path to recording .txt",
+                value=str(preset_path) if preset_path else "").classes("w-full")
+            downs = ui.number("downsample (keep every Nth frame)", value=1,
+                              min=1, precision=0).classes("w-full").props("dense")
+
+            def apply():
+                p = Path(path_in.value or "").expanduser()
+                if not p.is_file():
+                    ui.notify(f"not found: {p}", type="negative")
+                    return
+                try:
+                    rec = load_recording(
+                        v.project, p, sensor_index=int(sensor_sel.value),
+                        downsample_rate=int(downs.value or 1))
+                except Exception as exc:  # noqa: BLE001 — surface any parse error
+                    ui.notify(f"failed to load {p.name}: {exc}", type="negative")
+                    return
+                dialog.close()
+                set_recording(rec, p)
+
+            with ui.row():
+                ui.button("Load", on_click=apply)
+                ui.button("Cancel", on_click=dialog.close)
+        dialog.open()
+
+    def open_record_panel():
+        """Record panel (ROADMAP Item 31, plan §5): host/credentials form,
+        start/stop over the existing evo_recorder websocket logic (now
+        capture/recorder.py), live frame-count status, and a one-click hand-
+        off of the finished file into the Item 30 loader above. The session
+        lives on `v.record_sessions` (keyed by host), not the dialog, so
+        reopening the panel finds an in-progress or just-finished capture
+        instead of losing track of it."""
+        hosts = known_hosts()
+        first_host = next(iter(hosts), "")
+        default_user, default_pass = hosts.get(first_host, ("evo", "root"))
+
+        with ui.dialog() as dialog, ui.card().style("min-width: 420px"):
+            ui.label("Record EVO capture").classes("text-lg")
+
+            def pick_known_host(host):
+                u, p = hosts.get(host, ("evo", "root"))
+                host_in.set_value(host)
+                user_in.set_value(u)
+                pass_in.set_value(p)
+
+            host_in = ui.input("host (IP)", value=first_host) \
+                .classes("w-full").props("dense")
+            if hosts:
+                # Known-hosts picker writes into host_in, mirroring the
+                # "found recordings" select's relationship to path_in above.
+                ui.select({h: h for h in hosts}, label="known hosts",
+                          on_change=lambda e: pick_known_host(e.value)) \
+                    .classes("w-full").props("dense clearable")
+            user_in = ui.input("username", value=default_user) \
+                .classes("w-full").props("dense")
+            pass_in = ui.input("password", value=default_pass, password=True) \
+                .classes("w-full").props("dense")
+
+            status_label = ui.label("idle").classes("font-mono text-sm")
+
+            def current_session() -> RecordingSession | None:
+                return v.record_sessions.get(host_in.value)
+
+            def refresh_record_status():
+                s = current_session()
+                if s is None:
+                    status_label.text = "idle"
+                    start_btn.set_visibility(True)
+                    stop_btn.set_visibility(False)
+                    load_btn.set_visibility(False)
+                    return
+                st = s.status
+                if st.error:
+                    status_label.text = f"error: {st.error}"
+                elif st.connected:
+                    status_label.text = f"recording — {st.frames} frames"
+                elif s.running:
+                    status_label.text = "connecting…"
+                elif st.stopped:
+                    name = st.path.name if st.path else "?"
+                    status_label.text = f"stopped — {st.frames} frames → {name}"
+                else:
+                    status_label.text = "idle"
+                start_btn.set_visibility(not s.running)
+                stop_btn.set_visibility(s.running)
+                load_btn.set_visibility(
+                    st.path is not None and st.frames > 0 and not s.running)
+
+            def start():
+                host = host_in.value
+                if not host:
+                    ui.notify("enter a host", type="warning")
+                    return
+                existing = v.record_sessions.get(host)
+                if existing is not None and existing.running:
+                    ui.notify("already recording", type="warning")
+                    return
+                out_dir = v.source.parent / "recordings"  # plan §5 file convention
+                session = RecordingSession(
+                    host, user_in.value or "evo", pass_in.value or "root", out_dir)
+                v.record_sessions[host] = session
+                session.start()
+                refresh_record_status()
+
+            async def stop():
+                s = current_session()
+                if s is None:
+                    return
+                await s.stop()
+                refresh_record_status()
+
+            def load_into_replay():
+                s = current_session()
+                if s is None or s.status.path is None:
+                    return
+                dialog.close()
+                record_timer.active = False
+                load_replay_recording(preset_path=s.status.path)
+
+            with ui.row():
+                start_btn = ui.button(
+                    "Start", icon="fiber_manual_record", color="red",
+                    on_click=start).props("dense")
+                stop_btn = ui.button(
+                    "Stop", icon="stop", on_click=stop).props("dense")
+                load_btn = ui.button(
+                    "Load into Replay", icon="video_file",
+                    on_click=load_into_replay).props("dense")
+            ui.button("Close", on_click=dialog.close).props("flat dense")
+
+            # Polls session.status while the dialog is open; the session
+            # itself keeps running (on the server's own loop) if the dialog
+            # is closed without Stop — same "close ≠ stop" model as leaving
+            # evo_recorder.py running in a terminal.
+            record_timer = ui.timer(0.5, refresh_record_status)
+            dialog.on("hide", lambda: setattr(record_timer, "active", False))
+            dialog.on("show", lambda: setattr(record_timer, "active", True))
+
+        refresh_record_status()
+        dialog.open()
+
     def update_context_bar():
         """Row-2 context controls per tool + Draw sub-kind (ROADMAP Item 24;
         PHASE3_UI_PLAN §3): built once, shown/hidden by visibility rather than
@@ -2931,9 +3307,10 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         dropdown's *options* also change with the sub-kind (General offered or
         not), so it is rebuilt here."""
         tool_is_draw = tool.value == "Draw"
-        # Unified Owner/Sensor dropdown: everywhere but Background.
-        owner_sel.set_visibility(v.mode != "Background")
-        owner_hint_label.set_visibility(v.mode != "Background")
+        # Unified Owner/Sensor dropdown: everywhere but Background and Replay
+        # (Replay is read-only, so it owns nothing — Item 30).
+        owner_sel.set_visibility(v.mode not in ("Background", "Replay"))
+        owner_hint_label.set_visibility(v.mode not in ("Background", "Replay"))
         refresh_owner_sel()
         update_owner_hint()
         # Draw sub-kind toggle + the per-sub-kind extras.
@@ -2963,6 +3340,9 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         template_sel.set_visibility(event_zone)
         event_cl_sel.set_visibility(event_zone)
         template_values_btn.set_visibility(event_zone and v.template is not None)
+        # Replay transport (Item 30): the whole cluster shows only in Replay.
+        for _rw in replay_widgets:
+            _rw.set_visibility(v.mode == "Replay")
         # Zone-table panel (Item 24, §5): Auto shows it only when a zone kind is
         # the active target; the three-state control itself is always on Row 2.
         zone_panel.set_visibility(
@@ -3019,12 +3399,12 @@ def build_ui(viewer: Viewer, state: dict) -> None:
     # cluster (template-editor · folder · filename · save) right. The product
     # name is gone; the filename is a muted inline label beside the folder menu.
     with ui.row().classes("w-full items-center gap-2 px-2 no-wrap overflow-x-auto"):
-        tool = ui.toggle(["Draw", "Edit", "Background"], value="Edit",
+        tool = ui.toggle(["Draw", "Edit", "Background", "Replay"], value="Edit",
                          on_change=change_tool).props("dense")
         with tool:
             ui.tooltip("accelerators: d draw · e edit · space+drag / "
                        "middle-drag pans · Esc cancel (Sensor & Centerline are "
-                       "Draw sub-kinds now)")
+                       "Draw sub-kinds now). Replay: read-only EVO playback.")
         ui.separator().props("vertical")
         # Always-on drawing tools (apply in every mode).
         snap_switch = ui.switch("snap", on_change=toggle_snap).props("dense")
@@ -3217,6 +3597,50 @@ def build_ui(viewer: Viewer, state: dict) -> None:
                        "approach); shown in the pickers and saved as a label "
                        "at the far end")
 
+        # Replay transport (ROADMAP Item 30): a load-recording picker plus
+        # play/pause, frame-step, speed, a timeline scrubber, and an id-label
+        # toggle. Shown only in Replay mode by update_context_bar().
+        replay_load_btn = ui.button(
+            icon="video_file", on_click=load_replay_recording).props("flat dense")
+        with replay_load_btn:
+            ui.tooltip("load an EVO recording to play back")
+        # Record panel (ROADMAP Item 31): capture straight from a live EVO
+        # host and hand the finished file into the loader above.
+        record_btn = ui.button(
+            icon="fiber_manual_record", on_click=open_record_panel) \
+            .props("flat dense").classes("text-red-5")
+        with record_btn:
+            ui.tooltip("record a live EVO capture (Record panel)")
+        replay_step_back_btn = ui.button(
+            icon="skip_previous", on_click=lambda: replay_step(-1)).props("flat dense")
+        with replay_step_back_btn:
+            ui.tooltip("step back one frame")
+        replay_play_btn = ui.button(
+            icon="play_arrow", on_click=toggle_replay_play).props("flat dense")
+        with replay_play_btn:
+            ui.tooltip("play / pause")
+        replay_step_fwd_btn = ui.button(
+            icon="skip_next", on_click=lambda: replay_step(1)).props("flat dense")
+        with replay_step_fwd_btn:
+            ui.tooltip("step forward one frame")
+        replay_speed_sel = ui.select(
+            {0.5: "0.5×", 1.0: "1×", 2.0: "2×", 4.0: "4×"}, value=1.0,
+            label="speed", on_change=change_replay_speed).classes("w-20").props("dense")
+        with replay_speed_sel:
+            ui.tooltip("playback speed (relative to the 10 fps base cadence)")
+        replay_slider = ui.slider(
+            min=0, max=1, value=0, on_change=on_replay_scrub) \
+            .classes("w-64").props("dense label")
+        with replay_slider:
+            ui.tooltip("timeline — drag to scrub to any frame")
+        replay_labels_switch = ui.switch(
+            "ids", value=True, on_change=toggle_replay_labels).props("dense")
+        with replay_labels_switch:
+            ui.tooltip("show the abbreviated track id over each marker")
+        replay_widgets = [replay_load_btn, record_btn, replay_step_back_btn,
+                          replay_play_btn, replay_step_fwd_btn, replay_speed_sel,
+                          replay_slider, replay_labels_switch]
+
         # Zone-table three-state control (Item 24, §5): right-justified at the
         # end of the context bar, directly above the table it governs.
         ui.space()
@@ -3269,6 +3693,16 @@ def build_ui(viewer: Viewer, state: dict) -> None:
                       throttle=0.03)
                 ii.on("mouseup", on_up, ["offsetX", "offsetY"])
                 ii.on("dblclick", on_dblclick, ["offsetX", "offsetY"])
+                # Replay marker layer (Item 30, plan §4): a second full-canvas
+                # overlay stacked *above* ii so the animated markers sit over
+                # the static zone/centerline overlay. pointer-events:none lets
+                # every mouse event fall through to ii beneath; only this layer's
+                # content is rewritten each ui.timer tick, never the full svg().
+                replay_layer = ui.interactive_image(
+                    content="", size=(v.canvas_w, v.canvas_h))
+                replay_layer.style(f"position: absolute; top: 0; left: 0; "
+                                   f"width: {v.canvas_w}px; height: {v.canvas_h}px; "
+                                   f"max-width: none; pointer-events: none;")
                 # js_handler zooms `stage` locally every tick; the emit
                 # (throttled, so it can't flood the socket) syncs absolute
                 # viewport state to on_wheel. Bound to `stage` so the JS reads/
@@ -3317,6 +3751,9 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         scale_label = ui.label(status_scale()).classes("text-white font-mono")
 
     refresh_status()
+    # Replay animation clock (Item 30): a fixed 10 fps cadence (plan §6),
+    # inactive until playback starts so it costs nothing off-Replay.
+    replay_timer = ui.timer(0.1, replay_tick, active=False)
     ui.timer(0.3, fit_view, once=True)
     if v.derived_attachments:
         ui.timer(0.8, lambda: ui.notify(

@@ -2199,6 +2199,189 @@ Suggested prompt:
     with `r` → select Edit → off; re-arm → switch sub-kind to Lineal → off.
   - 492 pytest still pass (GUI-handler/layout only); no console/page errors.
 
+- 2026-07-08 — **ROADMAP Item 28: Record/Playback architecture & coordinate
+  reconciliation (Opus)** — decision document only, no code. Full write-up in
+  [RECORD_PLAYBACK_PLAN.md]; key resolutions:
+  - **No coordinate-space conflict — it's a units multiply.** Audited against
+    the real `86_US95&SH8` site: after `normalize_origin`, the designer's
+    `sensor[0]` = (855.95, 313.82) px is *exactly* evo_replay's
+    `(s0_px − Background_Pos)`. Both tools share one frame (background top-left
+    origin, y-down, no rotation); evo_replay just expresses it in meters, the
+    designer in world px / feet. The "meters vs feet" gap Item 28 flagged is a
+    unit conversion, not two frames.
+  - **`units.py` is not the flagged bug — it's *more* accurate than evo_replay.**
+    Swept all 29 `sites/**/*.iprj`: `effective_meter_per_pixel` re-derives the
+    calibrated scale from the reference pair (e.g. Banks 0.0762 vs vendor-rounded
+    0.08 = 4.75%; divergence 0.87–4.75% across sites) and correctly falls back to
+    stored only for the stale pair (ex27bg2). evo_replay uses the *rounded*
+    stored value, so it carries up to ~4.75% error. **Decision:** playback reuses
+    the loaded `Project` + `effective_meter_per_pixel`, never a second regex
+    parse or evo_replay's scale — designer playback is therefore more accurate
+    than evo_replay itself.
+  - **The transform (EVO → world-feet):** `anchor_ft = px_to_ft(sensor[n].pos,
+    emp)`; `world_ft = anchor_ft + m_to_ft(p_m − ref_m)`. The metric offset is
+    *true meters* → `m_to_ft` only; `emp`/mpp touches **only** the pixel anchor.
+    Scaling the offset by mpp is the tempting bug (re-adds the 2% error, worse
+    with distance) — handed to Item 29 as the bug-prone line.
+  - **Anchor is per-sensor, not global sensor-0** (one recording = one host =
+    one sensor); reduces to sensor-0 for single-sensor sites, one anchor per
+    recording for the 2-file/multi-sensor split.
+  - **Module placement:** pure `model/replay.py` (parse + align, no pandas — a
+    plain frame-indexed `Recording`/`Frame`/`TrackPoint`, since `model/` has zero
+    pandas and the UI needs O(1) scrub-by-index); new sibling `capture/` package
+    for the side-effectful async websocket recorder (can't live in pure `model/`
+    or render-only `gui/`); `gui/` for the Replay mode + Record panel.
+  - **Playback UX:** read-only Replay mode, no editing during playback, animated
+    markers on a *separate* SVG layer driven by `ui.timer` reusing the existing
+    feet→viewport transform; precompute+downsample all frames at load (Item 20
+    zoom-freeze lesson).
+  - **Recording:** `asyncio.create_task` on NiceGUI's own loop (never
+    `asyncio.run`); files to `sites/<site>/recordings/`; credentials in a local,
+    uncommitted config; single-host minimum for Item 31, multi-host optional.
+  - Left `units.py`'s absolute-0.005 tolerance as a documented smell (not an
+    action item — classifies every current site correctly). Checked off Item 28's
+    boxes in ROADMAP.md.
+
+- 2026-07-08 — **ROADMAP Item 29: Playback engine in `model/` (Fable)** — the
+  pure `model/replay.py` engine, exactly per RECORD_PLAYBACK_PLAN.md.
+  - **Shape:** frozen `TrackPoint` / `Frame` / `Recording` dataclasses (plan §3,
+    no pandas — verified at import time that `model.replay` pulls in no
+    pandas/numpy/PIL/GUI modules); `Recording.frames[i]` gives O(1) timeline
+    scrub. Added `ref_seen` and `anchor_ft` beyond the plan's minimum fields —
+    the GUI status line and the alignment tests both want them.
+    `Recording.to_dataframe()` imports pandas lazily inside the method for
+    notebook use. Public seam: `load_recording(project, path, sensor_index=…)` /
+    `parse_recording(project, text, …)` + `anchor_world_ft`, re-exported from
+    `model/__init__`.
+  - **Transform implemented as §1b dictates:** `emp` (via
+    `effective_meter_per_pixel`) touches only the pixel-space sensor anchor;
+    the track offset from the `C;` reference converts with `m_to_ft` alone. A
+    dedicated test asserts +10 m east = +32.8084 ft from the anchor and guards
+    that the wrong (mpp-scaled) formula is distinguishable on the real site.
+  - **Parse mirrors `evo_replay.parse_evo_data`** (timestamp / `F;` / `C;`
+    lines, first `C;` wins, whole file scanned before aligning so a late `C;`
+    still anchors; unparseable lines/entities skipped), plus it also captures
+    `class` from the entity tuple. One deliberate divergence: an `F;` line with
+    zero entities becomes an *empty Frame* rather than vanishing — an empty
+    intersection is a real playback moment the timeline should keep.
+  - **Guardrails (plan §6):** `downsample_rate`, `max_frames` (default 5000)
+    and a new `max_points_per_frame` backstop (default 200) applied at load;
+    `None` lifts a cap.
+  - **No real recording exists to test against** — evo_replay's `DEFAULT_DATA`
+    (`10_37_2_86_EVO_1770311735.txt`) is gone from disk and was never in git.
+    The tests therefore run a format-faithful synthetic recording (built to
+    `evo_recorder.py`'s exact output grammar) against the **real**
+    `86_US95&SH8` site fixture: a point at the `C;` reference lands exactly on
+    `sensor[0]`'s world-feet anchor, and an equivalence test pins our
+    translation semantics to legacy `evo_replay.align()` on identical input.
+    Consequence: plan §7's two open items (no-rotation and y-sign against a
+    *live* stream) remain formally open — they are verified against
+    evo_replay's behavior, which "works in practice," but the first real
+    capture loaded in Item 30 is the true confirmation; a misalignment there
+    means flip/rotate in exactly one place (`parse_recording`'s two transform
+    lines).
+  - Per-sensor anchoring (§1c) tested by re-anchoring the same stream to
+    sensor 1 and asserting a rigid shift by the anchor delta. 508 pytest pass
+    (16 new in `tests/test_replay.py`).
+
+- 2026-07-08 — **ROADMAP Item 30: Playback UI — timeline + animated overlay
+  (Opus, one session)** — wired the Item 29 engine into a read-only "Replay"
+  mode in the NiceGUI shell, per RECORD_PLAYBACK_PLAN.md §4/§6.
+  - **Replay as a fourth top-level tool** (`Draw/Edit/Background/Replay`).
+    `effective_mode` returns `"Replay"`; the existing mouse handlers gate on
+    `v.mode`, so drawing/editing is inactive with no per-branch guard needed
+    while pan (space/middle-drag) still works — read-only for free. Entering
+    the mode reuses `_enter_mode`'s teardown (drops the ruler / active draw
+    tool); leaving it pauses playback. Loading a recording never mutates the
+    `Project`.
+  - **Separate marker layer (plan §4).** A second full-canvas
+    `interactive_image` is stacked *above* the static `ii` overlay inside
+    `stage` with `pointer-events:none`, so it rides the same pan/zoom transform
+    and mouse events fall through to `ii` beneath. Only this layer's `content`
+    is rewritten each tick (`refresh_replay_layer`), never the full `svg()` —
+    the static zone/centerline overlay renders untouched below. Off-Replay the
+    layer is `""` (invisible, inert).
+  - **Coordinate path reuses the one seam.** `Viewer.replay_point_to_canvas`
+    converts the engine's world-feet back to world-px with the *same*
+    calibrated `effective_meter_per_pixel` the anchor used (exact round-trip),
+    then `world_to_canvas` — the feet→viewport path every overlay object shares.
+    Verified headless on the real `86_US95&SH8` site + the synthetic recording:
+    a track point on the `C;` reference renders exactly on sensor-0's canvas
+    position (this is the live-alignment confirmation plan §7 handed forward
+    from Item 29 — no rotation/sign flip needed).
+  - **Transport.** Load dialog (file picker seeded from the site folder +
+    `recordings/`, an anchoring-sensor select, and a downsample knob) →
+    `load_recording`. Play/pause, 0.5/1/2/4× speed, ±1 frame step, and a
+    timeline scrubber, all funnelled through one `set_replay_frame(i)` seam so
+    the slider, marker layer, and status line never drift. A `replay_pos` float
+    accumulator lets sub-1× speeds animate; playback stops (doesn't loop) at the
+    last frame and restarts from 0 on the next play.
+  - **Guardrails (plan §6).** Fixed 10 fps `ui.timer`, `active=False` until
+    play so it costs nothing off-Replay; per-tick work is O(markers in frame)
+    on a small string; the engine's load-time downsample/frame-cap keep a long
+    capture from animating 50k frames — carrying forward the Item 20
+    zoom-freeze lesson.
+  - **Marker styling** mirrors `evo_replay`: color by sensor (`oid % 10` →
+    cyan/yellow/lime/magenta/orange/deepskyblue, white fallback) with the
+    trailing-4-digit id over each marker. Those two are pure helpers
+    (`model.replay.marker_color` / `short_id`) so they're headless-testable and
+    the GUI SVG builder just consumes them. 511 pytest pass (3 new render-helper
+    tests); GUI wiring exercised by hand + the headless alignment check, and the
+    page confirmed to server-render with the Replay tool present.
+
+- 2026-07-08 — **ROADMAP Item 31: Live Recording Integration (Sonnet, one
+  session)** — folded `../evo_recorder.py`'s websocket auth + raw-stream
+  capture into a "Record" panel, per RECORD_PLAYBACK_PLAN.md §5.
+  - **New sibling package `capture/`** (peer of `model/`/`gui/`, plan §2):
+    `capture/recorder.py`'s `RecordingSession` ports `evo_recorder`'s login +
+    `async for message in websocket` loop unchanged, wrapped so `start()` is
+    `asyncio.create_task` on NiceGUI's own *running* loop (never
+    `asyncio.run`, which would collide with uvicorn's) and `stop()` cancels
+    the task and awaits it so the `with open(...)` block closes the file.
+    The blocking login POST runs through `asyncio.to_thread` so it can't
+    stall the event loop other sessions/the GUI share. `capture/hosts.py`
+    seeds the panel from `evo_recorder_multi.py`'s host list, layered with a
+    gitignored `hosts.local.json` override (plan §5's "never commit new
+    credentials" — device defaults already public in the committed scripts).
+  - **Session lives on `Viewer.record_sessions` (keyed by host), not the
+    dialog.** Closing the Record panel without Stop leaves the capture
+    running server-side — the same "close ≠ stop" model as leaving
+    `evo_recorder.py` running in a terminal — and reopening the panel finds
+    it again via `current_session()`. Verified by hand: started a capture
+    against an unreachable host, closed the dialog mid-connect, reopened it,
+    and the in-flight session (then its login-timeout error) was still there.
+  - **File placement** follows plan §5: `sites/<site>/recordings/`
+    (`v.source.parent / "recordings"`), filename
+    `{host_underscored}_EVO_{epoch}.txt` matching `evo_recorder`'s own
+    convention — already covered by the repo's `*EVO*.txt` gitignore rule.
+  - **Hand-off to Item 30.** `load_replay_recording` grew optional
+    `preset_path`/`preset_sensor` params (both defaulted, so the existing
+    `on_click=load_replay_recording` toolbar wiring is untouched — NiceGUI's
+    `expects_arguments` only passes the click event to handlers with a
+    required parameter). The panel's "Load into Replay" button closes the
+    Record dialog and reopens the Item 30 load dialog with the finished
+    file's path pre-filled; the user still picks the anchor sensor there
+    rather than duplicating that control in both dialogs.
+  - **Single-host minimum (plan §5)**, multi-host left out of scope — nothing
+    stops two `RecordingSession`s (different hosts) running concurrently
+    since they're keyed independently in `record_sessions`.
+  - **Bug caught in manual testing, fixed before landing:** the status label
+    read `s.running` to mean "recording," so it showed "recording — 0
+    frames" during the auth handshake, before the websocket ever connected.
+    Reordered the branch to check `st.connected` first, `s.running` second
+    (→ "connecting…"), confirmed against a real login-timeout run (screenshot
+    showed "connecting…" during auth, then "error: login failed" once the
+    unreachable sandbox host timed out, Start reappearing correctly).
+  - 6 new tests in `tests/test_capture.py` — no real device/network:
+    `RecordingSession._run` driven against a fake async-iterable websocket
+    (finite stream write-out, mid-stream cancellation, double-start no-op,
+    login-failure status) plus `hosts.known_hosts` default/override merging.
+    517 pytest pass (511 prior + 6 new). GUI exercised by hand via Playwright
+    against the running NiceGUI server (Record dialog open, Start against an
+    unreachable host, status transitions through connecting → error, dialog
+    close/reopen preserving session state) — no browser console errors at
+    any point.
+
 ## Appendix — example template (acceptance case, revised for Items 15/17/18)
 
 45 mph approach, lanes `12' L | 12' T | 12' T | 12' R`, count loops, starting

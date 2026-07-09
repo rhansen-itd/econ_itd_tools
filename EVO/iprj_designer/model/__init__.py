@@ -42,6 +42,17 @@ from .iprj_io import (
     load_iprj,
     save_iprj,
 )
+from .replay import (
+    SENSOR_COLORS,
+    Frame,
+    Recording,
+    TrackPoint,
+    anchor_world_ft,
+    load_recording,
+    marker_color,
+    parse_recording,
+    short_id,
+)
 from .multifile import (
     BackgroundMatch,
     BackgroundMismatch,
@@ -78,6 +89,15 @@ __all__ = [
     "load_iprj",
     "normalize_origin",
     "save_iprj",
+    "SENSOR_COLORS",
+    "Frame",
+    "Recording",
+    "TrackPoint",
+    "anchor_world_ft",
+    "load_recording",
+    "marker_color",
+    "parse_recording",
+    "short_id",
     "BackgroundMatch",
     "BackgroundMismatch",
     "check_background_match",

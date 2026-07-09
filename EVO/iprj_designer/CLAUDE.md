@@ -58,6 +58,15 @@ entry.
 
 ## Model routing / division of labor
 
+> **Temporary override (2026-07-08, time-boxed to the next few days):** while
+> the owner has Pro Fable access, ROADMAP Items 28–31 (record/playback) use an
+> inverted per-model split — **Fable for the hardest item, Sonnet for the
+> routine one, Opus for the architecture session**. This is deliberate and
+> expires when that Fable access lapses or its limits are hit; at that point
+> revert to the standing rule below for any item not yet started, and drop
+> this note. The rule below is the default whenever the override is not in
+> force.
+
 **Default to Opus, run whole items end-to-end in one session** —
 architectural decision, model-layer implementation, GUI wiring, tests, and
 the doc/checkbox finishing pass all together. The owner is not

@@ -18,3 +18,6 @@ sites/Banks/sensors3_4.txt
 
 # iprj Designer generated test output (overlay PNGs, generated .iprj files)
 EVO/iprj_designer/tests/out/
+
+# iprj Designer Record panel: local host/credential overrides (ROADMAP Item 31)
+EVO/iprj_designer/capture/hosts.local.json
