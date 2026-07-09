@@ -460,5 +460,9 @@ Suggested prompt:
   identity by default so already-correct sites are untouched; fold in with the
   `calibrate.py` line-up workflow future item below. The `C;` multi-sensor decode
   from the reverted attempt is worth reusing for a suggested starting guess.
+  **Full handoff brief for a Fable diagnosis session:**
+  [OVERLAY_ROTATION_INVESTIGATION.md](OVERLAY_ROTATION_INVESTIGATION.md) (the
+  "wrong iprj" theory was since ruled out on hardware — concurrent iprjs still
+  render rotated).
 - Integrate the line-up/calibrate workflow (see
   `~/pyatspm/src/atspm/video/calibrate.py`) more directly into the app.
