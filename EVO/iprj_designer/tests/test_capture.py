@@ -7,10 +7,17 @@ pytest's `tmp_path`, never under `sites/`.
 """
 
 import asyncio
+import gzip
 import json
 
 from capture.hosts import DEFAULT_HOSTS, known_hosts
 from capture.recorder import RecordingSession
+
+
+def _read(path):
+    """Recorded output is gzip now; decode it back to text for assertions."""
+    with gzip.open(path, "rt") as f:
+        return f.read()
 
 
 class FakeWebSocket:
@@ -76,7 +83,7 @@ def test_finite_stream_writes_all_frames(tmp_path, monkeypatch):
     assert session.status.error is None
     path = session.status.path
     assert path is not None and path.parent == tmp_path
-    lines = path.read_text().splitlines()
+    lines = _read(path).splitlines()
     assert len(lines) == 6  # timestamp + message per frame
     assert lines[1] == "F;0;1;2;3;1,7,1.0,2.0,90.0"
 
@@ -152,7 +159,7 @@ def test_subscribers_receive_every_message_alongside_disk_write(tmp_path, monkey
     # disk write still happens (save defaults True) alongside the fan-out
     assert session.status.frames == 5
     assert session.status.path is not None
-    assert len(session.status.path.read_text().splitlines()) == 10
+    assert len(_read(session.status.path).splitlines()) == 10
 
 
 def test_unsubscribe_stops_delivery(tmp_path, monkeypatch):

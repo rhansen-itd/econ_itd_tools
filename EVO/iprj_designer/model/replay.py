@@ -43,7 +43,9 @@ over the whole file vs. instance attributes across ``feed`` calls.
 
 from __future__ import annotations
 
+import gzip
 import re
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -51,6 +53,8 @@ from . import zonefit
 from .iprj_io import Project
 from .units import effective_meter_per_pixel, m_to_ft, px_to_ft
 from .zonefit import ZoneFit
+
+_GZIP_MAGIC = b"\x1f\x8b"
 
 # Load-time guardrails (plan §6): a long capture can't animate 50k frames.
 # Pass None to lift a cap; the GUI exposes the knobs.
@@ -163,8 +167,12 @@ def load_recording(
     max_frames: int | None = DEFAULT_MAX_FRAMES,
     max_points_per_frame: int | None = DEFAULT_MAX_POINTS_PER_FRAME,
 ) -> Recording:
-    """Read a recording file and align it to *project*'s *sensor_index*."""
-    text = Path(path).read_text(encoding="utf-8", errors="ignore")
+    """Read a recording file and align it to *project*'s *sensor_index*.
+
+    Transparently reads gzip-compressed recordings (``capture/recorder.py``
+    writes ``.txt.gz``) alongside plain ``.txt`` ones — detected by magic
+    bytes, not extension, so a renamed file still loads."""
+    text = _read_recording_text(path)
     return parse_recording(
         project, text,
         sensor_index=sensor_index,
@@ -172,6 +180,26 @@ def load_recording(
         max_frames=max_frames,
         max_points_per_frame=max_points_per_frame,
     )
+
+
+def _read_recording_text(path: str | Path) -> str:
+    """Decode a recording file, gzip or plain, sniffed by magic bytes.
+
+    The recorder flushes a zlib sync point after every message
+    (``gzip.GzipFile.flush()``), so a capture killed mid-write (crash, power
+    loss) leaves a gzip stream with no end-of-stream marker but every
+    fully-written message still intact. A strict ``gzip.decompress`` raises
+    ``EOFError`` on that stream and would discard the whole file, so this
+    falls back to a raw ``zlib`` decompressor on that error, which recovers
+    everything up to the truncation instead of nothing."""
+    raw = Path(path).read_bytes()
+    if raw[:2] != _GZIP_MAGIC:
+        return raw.decode("utf-8", errors="ignore")
+    try:
+        data = gzip.decompress(raw)
+    except EOFError:
+        data = zlib.decompressobj(zlib.MAX_WBITS | 16).decompress(raw)
+    return data.decode("utf-8", errors="ignore")
 
 
 def parse_recording(

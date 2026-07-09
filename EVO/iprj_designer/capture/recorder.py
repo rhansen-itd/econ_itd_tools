@@ -6,7 +6,12 @@ safe to drive from inside NiceGUI's already-running event loop:
 ``RecordingSession.start()`` schedules ``asyncio.create_task`` on the
 *running* loop — never ``asyncio.run``, which would collide with the
 uvicorn server loop already driving it. ``stop()`` cancels the task and lets
-the ``with open(...)`` block close the file handle on the way out.
+the ``with gzip.open(...)`` block close the file handle on the way out.
+
+Output is gzip-compressed (``<host>_EVO_<epoch>.txt.gz``, ~3-4x smaller than
+plain text) but otherwise the same line-based grammar; ``model/replay.py``
+reads it back transparently (magic-byte sniffed, so a plain ``.txt`` from an
+older capture or the standalone ``evo_recorder.py`` still loads too).
 
 The blocking login POST (``requests``) is pushed through
 ``asyncio.to_thread`` so it never stalls the event loop other sessions and
@@ -25,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import gzip
 import ssl
 import time
 from collections import deque
@@ -148,7 +154,7 @@ class RecordingSession:
         path: Path | None = None
         if self.save:
             self.out_dir.mkdir(parents=True, exist_ok=True)
-            path = self.out_dir / f"{self.host.replace('.', '_')}_EVO_{int(time.time())}.txt"
+            path = self.out_dir / f"{self.host.replace('.', '_')}_EVO_{int(time.time())}.txt.gz"
             self.status.path = path
 
         try:
@@ -159,7 +165,12 @@ class RecordingSession:
             ) as websocket:
                 self.status.connected = True
                 await websocket.send("GetCfg")
-                file_cm = open(path, "w", encoding="utf-8") if self.save \
+                # gzip, not plain text (~3-4x smaller): flush() emits a zlib
+                # sync point after every message, so a crash mid-capture still
+                # leaves every fully-written message recoverable (see
+                # model.replay._read_recording_text) even without a clean
+                # close().
+                file_cm = gzip.open(path, "wt", encoding="utf-8") if self.save \
                     else contextlib.nullcontext()
                 with file_cm as f:
                     async for message in websocket:

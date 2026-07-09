@@ -3171,8 +3171,9 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         if v.source:
             for root in (v.source.parent, v.source.parent / "recordings"):
                 try:
-                    for f in sorted(root.glob("*EVO*.txt")):
-                        found[str(f)] = f.name
+                    for pattern in ("*EVO*.txt.gz", "*EVO*.txt"):
+                        for f in sorted(root.glob(pattern)):
+                            found[str(f)] = f.name
                 except OSError:
                     pass
         return found
@@ -3231,7 +3232,7 @@ def build_ui(viewer: Viewer, state: dict) -> None:
                           on_change=lambda e: path_in.set_value(e.value)) \
                     .classes("w-full").props("dense clearable")
             path_in = ui.input(
-                "path to recording .txt",
+                "path to recording .txt/.txt.gz",
                 value=str(preset_path) if preset_path else "").classes("w-full")
             downs = ui.number("downsample (keep every Nth frame)", value=1,
                               min=1, precision=0).classes("w-full").props("dense")

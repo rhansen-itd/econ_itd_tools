@@ -195,6 +195,42 @@ def test_load_recording_reads_file(site, tmp_path):
     assert len(rec.frames) == 3
 
 
+def test_load_recording_reads_gzip(site, tmp_path):
+    """capture/recorder.py's actual output format: gzip, sniffed by magic
+    bytes rather than the ``.txt.gz`` extension (a renamed file still loads)."""
+    import gzip
+
+    path = tmp_path / "10_37_2_86_EVO_1770000000.txt.gz"
+    with gzip.open(path, "wt") as f:
+        f.write(RECORDING)
+    rec = load_recording(site, path, sensor_index=0)
+    assert len(rec.frames) == 3
+
+
+def test_load_recording_salvages_truncated_gzip(site, tmp_path):
+    """A capture killed mid-write (crash/power loss) leaves a gzip stream
+    with no end-of-stream marker. load_recording must still recover every
+    message that was fully written and flushed before the truncation,
+    rather than raising or discarding the whole file."""
+    import gzip
+
+    path = tmp_path / "10_37_2_86_EVO_1770000001.txt.gz"
+    with gzip.open(path, "wt") as f:
+        # flush() after each write, exactly as RecordingSession._run does,
+        # so each message is its own zlib sync point.
+        for line in RECORDING.splitlines(keepends=True):
+            f.write(line)
+            f.flush()
+
+    # Simulate an unclean kill: truncate off the final end-of-stream marker.
+    complete = path.read_bytes()
+    path.write_bytes(complete[:-8])
+    assert len(path.read_bytes()) < len(complete)
+
+    rec = load_recording(site, path, sensor_index=0)
+    assert len(rec.frames) == 3  # every frame written before the "crash" survives
+
+
 # --- guardrails (plan §6) ----------------------------------------------------
 
 def _many_frames(n: int, points_per_frame: int = 3) -> str:
