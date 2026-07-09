@@ -444,25 +444,20 @@ Suggested prompt:
 
 - (Now scoped as Items 32–35 above: display objects from a **live** stream in
   the canvas, real-time, reusing the record/playback feed.)
-- **Overlay rotation (reopened).** Some sites (Banks) render the recording/live
-  overlay visibly rotated (~25–34°) while others (US95&SH8) are correct under the
-  current pure translation. An automatic 2D-similarity fit over the `C;`-line ↔
-  `.iprj` sensor positions was tried and **reverted** (commit 0a45371). The
-  2026-07-09 diagnosis pass (DESIGN_HISTORY) settled it: a single
-  rotation+scale+translation **does** align the whole Banks corridor (every
-  detector within 0–32 ft when calibrated on the vehicle's ~600 ft path →
-  −33.7°, scale 1.23), so it's not a nonlinear/data-defect problem — but the
-  ~99 ft, hand-placed **2-sensor baseline is too short to recover those params**
-  (it gave −26.9° / 0.91, drifting to 91 ft at the far end). **Do not retry
-  sensor auto-fit.** The transform must be calibrated on a long baseline, i.e. a
-  human line-up. Scope this as a per-site **2-point "line-up" alignment** (pick a
-  track point, place it on the map, twice → solve rotation+scale+translation),
-  identity by default so already-correct sites are untouched; fold in with the
-  `calibrate.py` line-up workflow future item below. The `C;` multi-sensor decode
-  from the reverted attempt is worth reusing for a suggested starting guess.
-  **Full handoff brief for a Fable diagnosis session:**
-  [OVERLAY_ROTATION_INVESTIGATION.md](OVERLAY_ROTATION_INVESTIGATION.md) (the
-  "wrong iprj" theory was since ruled out on hardware — concurrent iprjs still
-  render rotated).
+- **Overlay rotation — RESOLVED 2026-07-09 (Fable session).** Fixed
+  automatically, no human line-up needed: the stream's `Z;` GetCfg line carries
+  every configured zone in the EVO frame, each project sensor is identified to
+  its stream slot by an ordered zone signature, and a least-squares similarity
+  over the matched zone centroids recovers rotation+scale+translation exactly
+  (per-sensor fits are numerically exact — the vendor generated one side from
+  the other). Banks now aligns at −34.9° / 5.6 ft mean residual; US95&SH8 fits
+  ≈identity so correct sites are untouched. Lives in `model/zonefit.py`, wired
+  through `parse_recording` + `LiveAligner` with the old translation as
+  fallback whenever no usable `Z;` exists. Details + closure notes:
+  [OVERLAY_ROTATION_INVESTIGATION.md](OVERLAY_ROTATION_INVESTIGATION.md);
+  session entry in DESIGN_HISTORY.md. The manual 2-point line-up idea is
+  superseded for recordings/live with `Z;`; it only remains potentially useful
+  for legacy captures that never recorded one (fold into the `calibrate.py`
+  item below only if that case ever matters).
 - Integrate the line-up/calibrate workflow (see
   `~/pyatspm/src/atspm/video/calibrate.py`) more directly into the app.

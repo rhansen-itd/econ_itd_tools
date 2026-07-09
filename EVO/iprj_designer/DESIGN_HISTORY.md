@@ -2649,6 +2649,49 @@ Suggested prompt:
     positions is a dead end at this precision and should not be retried. Reopened
     as ROADMAP "Overlay rotation (reopened)".
 
+- 2026-07-09 — **Overlay rotation RESOLVED (Fable escalation session).** The
+  fix is fully automatic — no manual line-up needed. Working from the fresh
+  concurrent `banks_1_2.iprj`/`banks_3_4.iprj` + the `Z;`-bearing recording:
+  - **`Z;` header decoded**: each zone is `sensor_slot, is_ignore, phase,
+    output` + flattened x,y vertices (EVO meters), zones arriving per slot in
+    iprj slot order, event zones before ignore zones. Banks: 36 zones = exactly
+    the nonempty EZ/IZ counts of slots 0/1/3 across the two fresh iprjs.
+  - **Slot identification needs no host/IP decode**: a project sensor's ordered
+    zone *signature* — the (kind, phase, output, vertex-count) sequence —
+    uniquely matches its stream slot (banks_3_4's lone sensor matches slot 3
+    and nothing else). Ambiguous/unmatched signatures contribute nothing, so a
+    wrong pairing can't poison the fit.
+  - **The smoking gun (§6 Q2 answered)**: per-sensor similarity fits over
+    matched zone centroids are **numerically exact (0.0 ft residual)** — the
+    vendor tool generated the sensor's EVO-frame zones from the drawn map zones
+    (or vice versa) with exactly a per-sensor rotate+translate. The fitted
+    scale is exactly `effective_mpp / stored_mpp` (0.9525 at Banks = 0.0762/0.08),
+    i.e. scale 1.0 in the vendor's own stored-MeterPerPixel convention — the
+    plan-§1a rounding, recovered. The earlier manual corridor estimate (−33.7°,
+    scale 1.23) was directionally right but biased by its track-point anchors
+    and the older `sensors_1&2_w_fail.iprj` geometry.
+  - **Fit quality**: Banks (slots 0+1, 30 zones) −34.9°, 5.6/7.4 ft mean/max
+    residual (pure inter-sensor map-placement inconsistency); the SB vehicle
+    threads Ph 6 at 8.5 ft and runs 10–17 ft left of the whole Ph 2 string —
+    the owner's described ground truth. US95&SH8 fits +1.5°, scale 1.017,
+    5.6 ft mean — ≈identity, so the previously-correct site stays correct
+    (what killed the reverted H3 attempt).
+  - **Implementation**: new pure `model/zonefit.py` (parse `Z;`, signature
+    matching, complex least-squares similarity — cannot express a reflection;
+    fallback gates: ≥3 zones, ≥50 ft spread, ≤30 ft mean residual). Wired into
+    the single `_align_frame` transform copy: `parse_recording` fits from the
+    file's `Z;` line (`Recording.zone_fit`), `LiveAligner` picks the fit up
+    when the GetCfg `Z;` arrives on the wire (first usable one wins, like
+    `C;`); everything falls back to the plan-§1b translation when no usable
+    `Z;` exists. Load notify reports "zone-aligned: −34.9°, ×0.951 over 30
+    zones" vs the anchor fallback. Tests: `tests/test_zonefit.py` (exact
+    synthetic similarity recovery, signature matching/ambiguity, fallback
+    gates, batch+live wiring, and real-site integration pins for Banks
+    −36°<rot<−33° / banks_3_4 slot-3 exactness / US95 ≈identity). Suite:
+    559 passed. `evo_recorder_full.py` (previous session) guarantees future
+    captures carry `Z;`; a follow-up could port the same fit to the standalone
+    `evo_replay.py`, which remains translation-only.
+
 ## Appendix — example template (acceptance case, revised for Items 15/17/18)
 
 45 mph approach, lanes `12' L | 12' T | 12' T | 12' R`, count loops, starting

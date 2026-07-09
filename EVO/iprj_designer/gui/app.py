@@ -3194,8 +3194,14 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         _set_play_icon()
         refresh_marker_layer()
         refresh_status()
+        if rec.zone_fit is not None:
+            align_note = (f"zone-aligned: {rec.zone_fit.rotation_deg:+.1f}°, "
+                          f"×{rec.zone_fit.scale:.3f} over "
+                          f"{rec.zone_fit.n_zones} zones")
+        else:
+            align_note = f"anchored to S{rec.sensor_index + 1}"
         ui.notify(f"loaded {n} frame{'s' if n != 1 else ''} from {path.name} "
-                  f"(anchored to S{rec.sensor_index + 1})")
+                  f"({align_note})")
 
     def load_replay_recording(preset_path: Path | None = None,
                                preset_sensor: int | None = None):

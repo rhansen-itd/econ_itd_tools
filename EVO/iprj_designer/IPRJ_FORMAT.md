@@ -234,6 +234,20 @@ Survey of the enabled ignore zones in the wild (48 across the site files):
 `0`. `model/domain.new_ignore_zone` defaults to `1` accordingly. What
 exactly a `0` zone still ignores **(open — needs vendor software)**.
 
+### Zones ↔ the sensor's EVO frame (2026-07-09 finding)
+
+The zones the sensor actually runs (reported in the EVO stream's `Z;` GetCfg
+line, meters, fused frame) are an **exact per-sensor similarity image** of
+the iprj's zone polygons — the vendor tool converts px↔m with the *stored*
+2-decimal `MeterPerPixel` plus a per-sensor rotation+translation (fits are
+exact to float precision; the residual scale vs our calibrated conversion is
+precisely `effective_mpp / stored_mpp`). Zones stream per slot in the iprj's
+slot order, event zones before ignore zones, each headed by
+`slot, is_ignore, PhaseNumber, OutputNumber`. This makes the iprj zones the
+authoritative EVO→map alignment record; `model/zonefit.py` exploits it to
+recover the overlay similarity automatically (see
+OVERLAY_ROTATION_INVESTIGATION.md §10).
+
 ### Annotations
 
 - `Lineals_{i}_…`: `Enable`, `Point_0_X/Y`, `Point_1_X/Y`

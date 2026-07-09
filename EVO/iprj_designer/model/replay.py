@@ -17,10 +17,15 @@ the sensor anchor, which the Project stores in world *pixels*, goes through
 
 Scaling the metric offset by mpp would bake in the stored value's rounding
 error (up to ~5% on real sites, plan §1a) and grow it with distance from the
-anchor. Alignment is a pure translation in a y-down frame, matching
-evo_replay's behavior; plan §7 flags confirming the no-rotation and y-sign
-assumptions against a live recording as still open (no real recording
-survives on disk to pin them here).
+anchor.
+
+Plan §7's no-rotation assumption turned out WRONG for some sites (Banks is
+rotated ~−34°; see OVERLAY_ROTATION_INVESTIGATION.md). When the recording
+carries the ``Z;`` GetCfg line — the configured zones in the EVO frame —
+``model.zonefit`` recovers the full similarity (rotation+scale+translation)
+from matched zone centroids and that transform supersedes the translation;
+the anchor/reference translation above remains the fallback whenever the
+``Z;`` fit is unavailable, which keeps every previously-correct behavior.
 
 The anchor is per-sensor (plan §1c): each recording is one host's stream, so
 it is tagged with its owning sensor index and aligns to that sensor — never a
@@ -42,8 +47,10 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import zonefit
 from .iprj_io import Project
 from .units import effective_meter_per_pixel, m_to_ft, px_to_ft
+from .zonefit import ZoneFit
 
 # Load-time guardrails (plan §6): a long capture can't animate 50k frames.
 # Pass None to lift a cap; the GUI exposes the knobs.
@@ -106,6 +113,9 @@ class Recording:
     ref_seen: bool
     anchor_ft: tuple[float, float]  # sensor[sensor_index] in world feet
     frames: list[Frame]  # frames[i] is frame i -> O(1) timeline scrub
+    # Similarity recovered from the recording's Z; zones (rotation fix);
+    # None = no usable Z; line, frames used the translation fallback.
+    zone_fit: ZoneFit | None = None
 
     def to_dataframe(self):
         """Flatten to a tidy pandas DataFrame (notebook convenience only).
@@ -181,7 +191,7 @@ def parse_recording(
     at all. Downsampling keeps every ``downsample_rate``-th frame, then
     ``max_frames`` caps the total (plan §6).
     """
-    ref, ref_seen, raw_frames = _parse_lines(text)
+    ref, ref_seen, raw_frames, zline = _parse_lines(text)
     if not raw_frames:
         raise ValueError("no F; track frames found in recording")
 
@@ -189,9 +199,10 @@ def parse_recording(
     if max_frames is not None:
         raw_frames = raw_frames[:max_frames]
 
+    fit = zonefit.fit(project, zonefit.parse_zline(zline)) if zline else None
     anchor = anchor_world_ft(project, sensor_index)
     frames = [
-        _align_frame(t, entities, anchor, ref, max_points_per_frame)
+        _align_frame(t, entities, anchor, ref, max_points_per_frame, fit)
         for t, entities in raw_frames
     ]
 
@@ -201,6 +212,7 @@ def parse_recording(
         ref_seen=ref_seen,
         anchor_ft=anchor,
         frames=frames,
+        zone_fit=fit,
     )
 
 
@@ -225,11 +237,13 @@ class LiveAligner:
     this class remains pure and deterministic.
 
     One documented divergence from the batch path: ``parse_recording`` scans
-    the whole file, so a ``C;`` arriving *after* some frames still anchors
-    them retroactively; a stream cannot rewrite frames it already emitted, so
-    frames fed before any reference use the same ``(0, 0)`` fallback as the
-    batch default and keep it. The real feed sends ``C;`` up front, so the
-    two paths agree frame-for-frame on any well-formed stream.
+    the whole file, so a ``C;``/``Z;`` arriving *after* some frames still
+    anchors them retroactively; a stream cannot rewrite frames it already
+    emitted, so frames fed before any reference use the same ``(0, 0)``
+    fallback as the batch default and keep it, and frames fed before the
+    ``Z;`` zones stay translation-aligned. The real feed sends the GetCfg
+    reply (``C;`` + ``Z;``) up front, so the two paths agree frame-for-frame
+    on any well-formed stream.
 
     ``feed`` never raises on message content (the batch parser's
     skip-on-``ValueError`` discipline); only the constructor validates, the
@@ -246,8 +260,10 @@ class LiveAligner:
         self.sensor_index = sensor_index
         self.anchor_ft = anchor_world_ft(project, sensor_index)
         self.max_points_per_frame = max_points_per_frame
+        self._project = project  # kept for the Z; zone fit
         self._ref = (0.0, 0.0)
         self._ref_seen = False
+        self._zone_fit: ZoneFit | None = None
         self._t = "00:00:00.000"
 
     @property
@@ -257,6 +273,10 @@ class LiveAligner:
     @property
     def ref_seen(self) -> bool:
         return self._ref_seen
+
+    @property
+    def zone_fit(self) -> ZoneFit | None:
+        return self._zone_fit
 
     def feed(self, message: str, t: str | None = None) -> Frame | None:
         """Ingest one raw message; return the aligned ``Frame`` it carries.
@@ -281,6 +301,12 @@ class LiveAligner:
                         self._ref, self._ref_seen = ref, True
                 continue
 
+            if line.startswith("Z;"):
+                if self._zone_fit is None:  # first usable Z; wins, like C;
+                    self._zone_fit = zonefit.fit(
+                        self._project, zonefit.parse_zline(line))
+                continue
+
             if _TIME_RE.match(line):
                 self._t = line
                 continue
@@ -288,7 +314,8 @@ class LiveAligner:
             if line.startswith("F;"):
                 frame = _align_frame(
                     self._t, _parse_frame_entities(line),
-                    self.anchor_ft, self._ref, self.max_points_per_frame)
+                    self.anchor_ft, self._ref, self.max_points_per_frame,
+                    self._zone_fit)
 
         return frame
 
@@ -299,8 +326,10 @@ class LiveAligner:
 _RawEntity = tuple[int, "int | None", float, float, "float | None"]
 
 
-def _parse_lines(text: str) -> tuple[tuple[float, float], bool, list[tuple[str, list[_RawEntity]]]]:
-    """Collect the C; reference and the raw F; frames from recording text.
+def _parse_lines(text: str) -> tuple[
+    tuple[float, float], bool, list[tuple[str, list[_RawEntity]]], str | None,
+]:
+    """Collect the C; reference, raw F; frames, and Z; line from recording text.
 
     Line grammar per evo_recorder's output (one timestamp line before each
     message) and evo_replay.parse_evo_data:
@@ -308,14 +337,19 @@ def _parse_lines(text: str) -> tuple[tuple[float, float], bool, list[tuple[str, 
       * ``HH:MM:SS.mmm``            wall-clock stamp for the next message
       * ``F;a;b;c;mask;ent;ent;..`` entities as ``oid,class,x,y,heading,..``
       * ``C;x,y,...``               sensor reference; first one wins
+      * ``Z;zone;zone;..``          configured zones in the EVO frame (part
+                                    of the GetCfg reply); first one wins,
+                                    returned raw for model.zonefit
 
-    Anything else (GetCfg responses, blank lines) is ignored. The whole file
-    is scanned before aligning, so a late C; line still anchors correctly.
+    Anything else (other GetCfg responses, blank lines) is ignored. The whole
+    file is scanned before aligning, so a late C;/Z; line still anchors
+    correctly.
 
     The per-line grammar lives in _parse_ref/_parse_frame_entities, shared
     with the streaming LiveAligner — this function only holds the scan state.
     """
     ref_x, ref_y, ref_seen = 0.0, 0.0, False
+    zline: str | None = None
     current_time = "00:00:00.000"
     raw_frames: list[tuple[str, list[_RawEntity]]] = []
 
@@ -330,6 +364,11 @@ def _parse_lines(text: str) -> tuple[tuple[float, float], bool, list[tuple[str, 
                 (ref_x, ref_y), ref_seen = ref, True
             continue
 
+        if line.startswith("Z;"):
+            if zline is None:
+                zline = line
+            continue
+
         if _TIME_RE.match(line):
             current_time = line
             continue
@@ -337,7 +376,7 @@ def _parse_lines(text: str) -> tuple[tuple[float, float], bool, list[tuple[str, 
         if line.startswith("F;"):
             raw_frames.append((current_time, _parse_frame_entities(line)))
 
-    return (ref_x, ref_y), ref_seen, raw_frames
+    return (ref_x, ref_y), ref_seen, raw_frames, zline
 
 
 def _parse_ref(line: str) -> tuple[float, float] | None:
@@ -377,27 +416,37 @@ def _align_frame(
     anchor: tuple[float, float],
     ref: tuple[float, float],
     max_points_per_frame: int | None,
+    zone_fit: ZoneFit | None = None,
 ) -> Frame:
-    """Align one raw frame into world feet — the single copy of the plan-§1b
-    transform. Both the batch parser and the streaming LiveAligner build every
-    Frame through here, so the m_to_ft-on-offset / emp-on-anchor split (and
-    any future y-sign/rotation fix, plan §7) lives in exactly one place."""
+    """Align one raw frame into world feet — the single copy of the transform.
+    Both the batch parser and the streaming LiveAligner build every Frame
+    through here. With a ``ZoneFit`` (the recording carried a usable ``Z;``
+    line) each point goes through the fitted similarity; otherwise the plan-
+    §1b translation applies, with its m_to_ft-on-offset / emp-on-anchor
+    split."""
     if max_points_per_frame is not None:
         entities = entities[:max_points_per_frame]
-    points = tuple(
-        TrackPoint(
+
+    def to_world(x: float, y: float) -> tuple[float, float]:
+        if zone_fit is not None:
+            return zone_fit.apply_m(x, y)
+        # y-down on both sides
+        return anchor[0] + m_to_ft(x - ref[0]), anchor[1] + m_to_ft(y - ref[1])
+
+    points = []
+    for oid, cls, x, y, heading in entities:
+        x_ft, y_ft = to_world(x, y)
+        points.append(TrackPoint(
             oid=oid,
             sensor=oid % 10,
             cls=cls,
-            x_ft=anchor[0] + m_to_ft(x - ref[0]),
-            y_ft=anchor[1] + m_to_ft(y - ref[1]),  # y-down on both sides
+            x_ft=x_ft,
+            y_ft=y_ft,
             heading=heading,
             x_raw_m=x,
             y_raw_m=y,
-        )
-        for oid, cls, x, y, heading in entities
-    )
-    return Frame(t=t, points=points)
+        ))
+    return Frame(t=t, points=tuple(points))
 
 
 def _is_int(s: str) -> bool:

@@ -1,10 +1,16 @@
 # Overlay Rotation — Investigation Brief (for a Fable diagnosis session)
 
-**Status:** open bug, escalated to Fable after an Opus fix attempt failed and the
-leading "wrong iprj" theory was ruled out on real hardware. This file is the
-complete handoff: the symptom, everything checked, the numbers, the code paths,
-the resources to read, and the specific questions to answer. Read it top to
-bottom before touching code.
+**Status: RESOLVED 2026-07-09 (Fable session) — see §10 for the outcome.**
+The `Z;`-zone similarity fit (§2b / §6 Q0) panned out and is implemented in
+`model/zonefit.py`, wired through `parse_recording` and `LiveAligner` with
+the old translation as fallback. Sections below are kept as the historical
+handoff record.
+
+*(Original status:)* open bug, escalated to Fable after an Opus fix attempt
+failed and the leading "wrong iprj" theory was ruled out on real hardware.
+This file is the complete handoff: the symptom, everything checked, the
+numbers, the code paths, the resources to read, and the specific questions
+to answer. Read it top to bottom before touching code.
 
 > Routing note: this is a legitimate Fable escalation per
 > [CLAUDE.md](CLAUDE.md) — a *specific, narrowed* bug (find the correct EVO→image
@@ -219,7 +225,7 @@ from collections import defaultdict
 
 proj = load_iprj(Path("sites/Banks/sensors_1&2_w_fail.iprj"))
 emp = units.effective_meter_per_pixel(proj.background)
-ref, seen, raw = _parse_lines(Path("10_37_23_201_EVO_1783582697.txt").read_text(errors="ignore"))
+ref, seen, raw, _z = _parse_lines(Path("10_37_23_201_EVO_1783582697.txt").read_text(errors="ignore"))  # 4-tuple since the fix
 tracks = defaultdict(list)
 for t, ents in raw:
     for oid, cls, x, y, h in ents:
@@ -290,3 +296,53 @@ with `units.px_to_ft(·, emp)`).
    short). Lowest priority.
 
 **Do not** re-attempt the sensor-position auto-fit (H3) — it is proven noise-limited.
+
+---
+
+## 10. OUTCOME (2026-07-09, Fable session) — resolved via §2b / Q0
+
+Q0 landed; direction 1 of §9 (find the original transform) and direction 3
+(georeferenced fit) turned out to be the *same thing* as the zone fit, and the
+manual line-up (direction 2) is unnecessary for any capture that carries `Z;`.
+
+**`Z;` header decoded** — the 4 ints are `sensor_slot, is_ignore_zone,
+phase_number, output_number`, and zones arrive per slot in the iprj's slot
+order, event zones before ignore zones. The Banks capture's 36 zones equal
+exactly the nonempty EventZone/IgnoreZone counts (8+3 / 12+7 / 4+2) of stream
+slots 0/1/3 across the concurrent `banks_1_2.iprj` + `banks_3_4.iprj`.
+
+**Slot matching** — a project sensor is identified to its stream slot by its
+ordered zone *signature*, the (kind, phase, output, vertex-count) sequence of
+its nonempty zones. Unique, self-validating (banks_3_4's lone sensor matches
+slot 3 only); ambiguity or non-match simply contributes no correspondences.
+
+**Q2 answered — the "element within the iprj" found.** Per-sensor similarity
+fits over matched zone centroids are **numerically exact (0.0 ft residual)**:
+the vendor tool converts between drawn map zones and the sensor's EVO-frame
+zones with exactly a per-sensor rotation+translation, using the *stored*
+MeterPerPixel — the fitted scale is exactly `effective_mpp / stored_mpp`
+(0.9525 = 0.0762/0.08 at Banks; the §1a rounding, recovered). The iprj zones
+*are* the transform record. §4's manual estimate (−33.7°, scale 1.23) was
+directionally right but biased by its track-point anchors and the older
+`sensors_1&2_w_fail.iprj` geometry; the zone fit supersedes those numbers.
+
+**Fit quality** — Banks (slots 0+1, 30 zones): **−34.9°, mean/max residual
+5.6/7.4 ft** (inter-sensor map placement inconsistency); the SB vehicle
+threads Ph 6 at 8.5 ft and runs 10–17 ft left of the entire Ph 2 string —
+the owner's ground truth. US95&SH8 (13 zones): **+1.5°, scale 1.017** —
+≈ identity, so the previously-correct site is untouched (the H3 regression
+cannot recur; a real least-squares optimum over 13 spread zones, not a 2-point
+noise fit). Q3 (what frame is the EVO fused frame) is thereby moot for
+alignment: whatever its convention, the `Z;` zones pin it per capture.
+
+**Implementation** — `model/zonefit.py` (pure: `parse_zline`, signature
+`match_slots`, complex least-squares `fit` — cannot express a reflection;
+fallback gates ≥3 zones, ≥50 ft spread, ≤30 ft mean residual). Wired into the
+single `_align_frame` transform: `parse_recording` fits from the file's `Z;`
+(`Recording.zone_fit`), `LiveAligner` adopts the fit when the GetCfg `Z;`
+arrives (first usable wins, like `C;`). No usable `Z;` → the plan-§1b
+translation, unchanged. Tests: `tests/test_zonefit.py` (exact synthetic
+recovery, signatures, fallback gates, batch+live wiring, Banks/US95
+integration pins). Remaining loose end: the standalone `../evo_replay.py`
+is still translation-only; port the same fit there if it keeps being used
+for rotated sites.
