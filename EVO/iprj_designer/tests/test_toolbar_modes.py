@@ -25,6 +25,13 @@ def test_background_tool_is_background_regardless_of_subkind(kind):
     assert effective_mode("Background", kind) == "Background"
 
 
+@pytest.mark.parametrize("kind", ["Event Zone", "Centerline", "Sensor"])
+def test_replay_and_live_tools_ignore_subkind(kind):
+    # Replay (Item 30) and Live (Item 35) are read-only top-level modes.
+    assert effective_mode("Replay", kind) == "Replay"
+    assert effective_mode("Live", kind) == "Live"
+
+
 @pytest.mark.parametrize("kind,mode", [
     ("Event Zone", "Draw"),
     ("Ignore Zone", "Draw"),

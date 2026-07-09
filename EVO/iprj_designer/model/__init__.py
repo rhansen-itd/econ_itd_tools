@@ -45,6 +45,7 @@ from .iprj_io import (
 from .replay import (
     SENSOR_COLORS,
     Frame,
+    LiveAligner,
     Recording,
     TrackPoint,
     anchor_world_ft,
@@ -91,6 +92,7 @@ __all__ = [
     "save_iprj",
     "SENSOR_COLORS",
     "Frame",
+    "LiveAligner",
     "Recording",
     "TrackPoint",
     "anchor_world_ft",

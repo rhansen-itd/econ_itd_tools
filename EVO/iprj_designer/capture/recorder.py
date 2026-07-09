@@ -11,16 +11,27 @@ the ``with open(...)`` block close the file handle on the way out.
 The blocking login POST (``requests``) is pushed through
 ``asyncio.to_thread`` so it never stalls the event loop other sessions and
 the GUI share.
+
+ROADMAP Item 34 (LIVE_OVERLAY_PLAN.md §1) adds a synchronous subscriber
+seam so a live consumer (Item 35's Live mode) can tap the same message
+stream without a second socket: ``subscribe``/``unsubscribe`` register
+callbacks that ``_run`` fans each raw message out to, in addition to (or,
+with ``save=False``, instead of) the disk write. Subscribers must be
+non-blocking and non-raising by contract; the loop still wraps each call in
+``try/except`` so a subscriber bug can never take down capture.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import ssl
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
 import requests
 import urllib3
@@ -33,6 +44,9 @@ SUBPROTOCOL = "ws_ui"
 FIELD_USER = "uname"
 FIELD_PASS = "passwd"
 
+# Rolling window (LIVE_OVERLAY_PLAN.md §6) used to compute status.fps.
+FPS_WINDOW_SECONDS = 2.0
+
 
 @dataclass
 class RecordingStatus:
@@ -44,6 +58,8 @@ class RecordingStatus:
     frames: int = 0
     error: str | None = None
     stopped: bool = False
+    fps: float = 0.0
+    last_frame_time: float | None = None  # time.monotonic() of latest message
 
 
 def _get_auth_cookie(host: str, username: str, password: str) -> str | None:
@@ -71,22 +87,36 @@ class RecordingSession:
     not the dialog's lifetime.
     """
 
-    def __init__(self, host: str, username: str, password: str, out_dir: Path):
+    def __init__(self, host: str, username: str, password: str, out_dir: Path,
+                 *, save: bool = True):
         self.host = host
         self.username = username
         self.password = password
         self.out_dir = out_dir
+        self.save = save  # plan §1: False = overlay-only, no disk write
         self.status = RecordingStatus(host=host)
         self._task: asyncio.Task | None = None
+        self._subscribers: list[Callable[[str], None]] = []
+        self._frame_times: deque[float] = deque()
 
     @property
     def running(self) -> bool:
         return self._task is not None and not self._task.done()
 
+    def subscribe(self, callback: Callable[[str], None]) -> None:
+        """Register a live consumer (plan §1) — receives every raw message
+        fanned out from ``_run``'s loop, in parallel with the disk write."""
+        self._subscribers.append(callback)
+
+    def unsubscribe(self, callback: Callable[[str], None]) -> None:
+        if callback in self._subscribers:
+            self._subscribers.remove(callback)
+
     def start(self) -> None:
         if self.running:
             return
         self.status = RecordingStatus(host=self.host)
+        self._frame_times = deque()
         self._task = asyncio.create_task(self._run())
 
     async def stop(self) -> None:
@@ -115,9 +145,11 @@ class RecordingSession:
             "Origin": f"http://{self.host}",
         }
 
-        self.out_dir.mkdir(parents=True, exist_ok=True)
-        path = self.out_dir / f"{self.host.replace('.', '_')}_EVO_{int(time.time())}.txt"
-        self.status.path = path
+        path: Path | None = None
+        if self.save:
+            self.out_dir.mkdir(parents=True, exist_ok=True)
+            path = self.out_dir / f"{self.host.replace('.', '_')}_EVO_{int(time.time())}.txt"
+            self.status.path = path
 
         try:
             async with ws_connect(
@@ -127,15 +159,35 @@ class RecordingSession:
             ) as websocket:
                 self.status.connected = True
                 await websocket.send("GetCfg")
-                with open(path, "w", encoding="utf-8") as f:
+                file_cm = open(path, "w", encoding="utf-8") if self.save \
+                    else contextlib.nullcontext()
+                with file_cm as f:
                     async for message in websocket:
-                        ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-                        f.write(f"{ts}\n{message}\n")
-                        f.flush()
+                        if f is not None:
+                            ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                            f.write(f"{ts}\n{message}\n")
+                            f.flush()
                         self.status.frames += 1
+                        self._record_frame_time()
+                        for callback in list(self._subscribers):
+                            try:
+                                callback(message)
+                            except Exception:  # noqa: BLE001 — a subscriber
+                                pass          # bug must never kill capture.
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 — surfaced via status.error
             self.status.error = str(exc)
         finally:
             self.status.connected = False
+
+    def _record_frame_time(self) -> None:
+        """Update status.last_frame_time / status.fps (plan §6) from a
+        rolling window of recent message-arrival times."""
+        now = time.monotonic()
+        self.status.last_frame_time = now
+        self._frame_times.append(now)
+        while self._frame_times and now - self._frame_times[0] > FPS_WINDOW_SECONDS:
+            self._frame_times.popleft()
+        span = self._frame_times[-1] - self._frame_times[0]
+        self.status.fps = (len(self._frame_times) - 1) / span if span > 0 else 0.0

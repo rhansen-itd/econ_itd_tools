@@ -19,6 +19,7 @@ from model import units
 from model.iprj_io import Background, Project, Sensor, load_iprj
 from model.replay import (
     SENSOR_COLORS,
+    LiveAligner,
     anchor_world_ft,
     load_recording,
     marker_color,
@@ -262,6 +263,159 @@ def test_matches_legacy_evo_replay_translation(site, tmp_path):
             units.m_to_ft(row.X - cfg.s0_x), abs=1e-9)
         assert p.y_ft - rec.anchor_ft[1] == pytest.approx(
             units.m_to_ft(row.Y - cfg.s0_y), abs=1e-9)
+
+
+# --- streaming LiveAligner (ROADMAP Item 33) ---------------------------------
+
+def _stream(aligner: LiveAligner, text: str) -> list:
+    """Feed recorded text one line per feed() call — messages arriving live —
+    and collect the emitted frames."""
+    frames = []
+    for line in text.splitlines():
+        f = aligner.feed(line)
+        if f is not None:
+            frames.append(f)
+    return frames
+
+
+def test_streamed_frames_match_batch_frame_for_frame(site):
+    """The Item 33 correctness gate: message-at-a-time streaming must equal
+    the batch Recording frame-for-frame — identical aligned coordinates and
+    timestamps (frozen dataclasses compare exactly, so this re-pins the §7
+    y-sign / no-rotation semantics on the incremental path)."""
+    batch = parse_recording(site, RECORDING, sensor_index=0)
+    streamed = _stream(LiveAligner(site, sensor_index=0), RECORDING)
+    assert streamed == batch.frames
+
+
+def test_streamed_equivalence_long_stream_other_sensor(site):
+    """Same gate on a long C;-once-at-the-top stream, anchored to sensor 1 —
+    the one-time reference must keep anchoring for the stream's whole life,
+    and the aligner's public state must match the batch Recording's."""
+    text = _many_frames(50, points_per_frame=4)
+    batch = parse_recording(site, text, sensor_index=1, max_frames=None)
+    aligner = LiveAligner(site, sensor_index=1)
+    assert _stream(aligner, text) == batch.frames
+    assert aligner.ref_m == batch.ref_m
+    assert aligner.ref_seen is batch.ref_seen
+    assert aligner.anchor_ft == batch.anchor_ft
+
+
+def test_streamed_noisy_text_matches_batch(site):
+    """Garbage, malformed C;, and partial entities stream through with the
+    batch parser's exact skip-on-error semantics."""
+    noisy = (
+        "GetCfg-response-gibberish\n"
+        "C;not,numeric\n"
+        f"C;{REF[0]},{REF[1]}\n"
+        "10:00:00.000\n"
+        "F;0;1;2;3;bad,entity;1,2\n"
+        "F;0;1;2;3;8,x,1.0,2.0,notafloat\n"
+    )
+    batch = parse_recording(site, noisy, sensor_index=0)
+    aligner = LiveAligner(site, sensor_index=0)
+    assert _stream(aligner, noisy) == batch.frames
+    assert aligner.ref_m == REF  # malformed C; didn't burn first-one-wins
+
+
+def test_feed_explicit_t_matches_recorded_time(site):
+    """Live messages carry no wall-clock line, so the caller passes t (plan
+    §2). Feeding the recorder's ts/message pairs via t= matches the batch on
+    time as well as coordinates."""
+    batch = parse_recording(site, RECORDING, sensor_index=0)
+    aligner = LiveAligner(site, sensor_index=0)
+    lines = RECORDING.splitlines()
+    streamed = []
+    for ts, msg in zip(lines[::2], lines[1::2]):  # recorder: ts line, message
+        f = aligner.feed(msg, t=ts)
+        if f is not None:
+            streamed.append(f)
+    assert streamed == batch.frames
+
+
+def test_feed_non_frame_messages_return_none(site):
+    aligner = LiveAligner(site, sensor_index=0)
+    assert aligner.feed(f"C;{REF[0]},{REF[1]}") is None
+    assert aligner.feed("09:15:02.100") is None
+    assert aligner.feed("GetCfg-response-gibberish") is None
+    assert aligner.feed("") is None
+
+
+def test_feed_malformed_never_raises(site):
+    """Robustness contract: no message content may raise; state survives."""
+    aligner = LiveAligner(site, sensor_index=0)
+    garbage = ["", "   ", "C;", "C;not,numeric", "F;", "F;0;1",
+               "F;0;1;2;3;bad,entity;1,2", "{\"json\": \"nope\"}", ";;;",
+               "99:99", "F;0;1;2;3;,,,,"]
+    for msg in garbage:
+        out = aligner.feed(msg)
+        # A partial F; still yields an (empty) frame, exactly as in batch.
+        assert out is None or out.points == ()
+    assert aligner.ref_seen is False
+    # The aligner still works after the abuse.
+    aligner.feed(f"C;{REF[0]},{REF[1]}")
+    f = aligner.feed(f"F;0;1;2;3;101,7,{REF[0]},{REF[1]},90.0")
+    assert f.points[0].x_ft == pytest.approx(aligner.anchor_ft[0], abs=1e-9)
+
+
+def test_feed_first_ref_wins(site):
+    aligner = LiveAligner(site, sensor_index=0)
+    aligner.feed(f"C;{REF[0]},{REF[1]}")
+    aligner.feed("C;999.0,999.0")
+    assert aligner.ref_m == REF
+
+
+def test_feed_frame_before_ref_uses_identity_fallback(site):
+    """An F; before any C; uses the documented (0, 0) fallback — raw meters
+    treated as anchor-relative, the batch default."""
+    aligner = LiveAligner(site, sensor_index=0)
+    f = aligner.feed("F;0;1;2;3;7,1,3.0,-2.0,0.0")
+    assert aligner.ref_seen is False
+    p = f.points[0]
+    assert p.x_ft - aligner.anchor_ft[0] == pytest.approx(units.m_to_ft(3.0), abs=1e-9)
+    assert p.y_ft - aligner.anchor_ft[1] == pytest.approx(units.m_to_ft(-2.0), abs=1e-9)
+
+
+def test_feed_late_ref_anchors_only_subsequent_frames(site):
+    """The documented streaming/batch divergence: the batch whole-file scan
+    applies a late C; retroactively, but a stream cannot rewrite frames it
+    already emitted — only frames after the reference re-anchor. The real
+    feed sends C; up front, so the paths agree on well-formed streams."""
+    aligner = LiveAligner(site, sensor_index=0)
+    before = aligner.feed("F;0;1;2;3;7,1,5.0,5.0,0.0")
+    aligner.feed(f"C;{REF[0]},{REF[1]}")
+    after = aligner.feed("F;0;1;2;3;7,1,5.0,5.0,0.0")
+    a = aligner.anchor_ft
+    assert before.points[0].x_ft - a[0] == pytest.approx(units.m_to_ft(5.0), abs=1e-9)
+    assert after.points[0].x_ft - a[0] == pytest.approx(
+        units.m_to_ft(5.0 - REF[0]), abs=1e-9)
+
+
+def test_feed_points_per_frame_cap(site):
+    ents = ";".join(f"{100 + j},1,{float(j)},0.0,0.0" for j in range(5))
+    aligner = LiveAligner(site, sensor_index=0, max_points_per_frame=2)
+    f = aligner.feed(f"F;0;1;2;3;{ents}")
+    assert len(f.points) == 2
+    # None lifts the cap, as in batch.
+    aligner = LiveAligner(site, sensor_index=0, max_points_per_frame=None)
+    assert len(aligner.feed(f"F;0;1;2;3;{ents}").points) == 5
+
+
+def test_feed_multiline_message_keeps_state_returns_last_frame(site):
+    """A multi-line message is consumed losslessly for state; the last F;
+    frame is the one returned (the render slot is drop-to-latest, plan §3)."""
+    batch = parse_recording(site, RECORDING, sensor_index=0)
+    aligner = LiveAligner(site, sensor_index=0)
+    f = aligner.feed(RECORDING)
+    assert f == batch.frames[-1]
+    assert aligner.ref_m == REF
+
+
+def test_live_aligner_sensor_index_validated(site):
+    with pytest.raises(ValueError):
+        LiveAligner(site, sensor_index=len(site.sensors))
+    with pytest.raises(ValueError):
+        LiveAligner(site, sensor_index=-1)
 
 
 # --- marker render helpers (ROADMAP Item 30) --------------------------------

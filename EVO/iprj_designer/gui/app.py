@@ -172,6 +172,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
 from xml.sax.saxutils import escape
 
@@ -200,7 +201,8 @@ from model.multifile import (MAX_SENSORS, BackgroundMismatch,
                              check_background_match, is_multifile,
                              is_valid_pair, merge_pair, pair_paths,
                              pair_role, split_project)
-from model.replay import (Recording, load_recording, marker_color, short_id)
+from model.replay import (Frame, LiveAligner, Recording, load_recording,
+                          marker_color, short_id)
 from model.templates import (DIRECTIONS, PlacementContext, expand_and_place,
                              expand_and_place_on_centerline, load_template,
                              missing_placeholders)
@@ -209,6 +211,11 @@ from capture.recorder import RecordingSession
 
 REPO = Path(__file__).resolve().parents[3]
 TEMPLATES_DIR = Path(__file__).resolve().parents[1] / "templates"
+
+# Live overlay (ROADMAP Item 35, LIVE_OVERLAY_PLAN.md §§3/5): if no new aligned
+# frame reaches the slot within this window the marker layer clears, so a stalled
+# or silently dropped stream fades instead of freezing its last markers on screen.
+LIVE_STALE_TIMEOUT = 2.0
 
 PHASE_COLORS = ["#d62728", "#1f77b4", "#2ca02c", "#ff7f0e", "#9467bd",
                 "#8c564b", "#e377c2", "#bcbd22", "#17becf"]
@@ -263,6 +270,8 @@ def effective_mode(tool_val: str, kind_val: str) -> str:
         return "Background"
     if tool_val == "Replay":
         return "Replay"  # read-only playback mode (ROADMAP Item 30)
+    if tool_val == "Live":
+        return "Live"  # read-only live-overlay mode (ROADMAP Item 35)
     if kind_val == "Centerline":
         return "Centerline"
     if kind_val == "Sensor":
@@ -465,6 +474,18 @@ class Viewer:
         # capture started earlier without losing it. Single-host minimum
         # per plan §5; nothing stops a second host running concurrently.
         self.record_sessions: dict[str, RecordingSession] = {}
+        # Live overlay (ROADMAP Item 35, plan §§3-5): a read-only "Live" mode
+        # that taps a RecordingSession's message stream (the Item 34 feed-tap),
+        # runs the Item 33 streaming LiveAligner per message, and drives the
+        # Item 30 marker layer. `live_frame` is the single "latest aligned frame"
+        # slot (frame + monotonic stamp) the capture callback overwrites and the
+        # ui.timer reads — drop-to-latest, so socket rate never floods the redraw
+        # (plan §3). Bounded: only ever the newest frame, never a growing list.
+        self.live_session: RecordingSession | None = None
+        self.live_aligner: LiveAligner | None = None
+        self.live_cb = None  # the subscribed callback, kept so we can unsubscribe
+        self.live_frame: tuple[Frame, float] | None = None
+        self.live_labels = True
         # Generic (non-chain) Lineals: a project-wide pool the Lineal draw
         # kind targets, round-tripped via model/centerline.py's
         # load_lineals/save_lineals (PHASE3_UI_PLAN §4.3). Each carries its
@@ -1185,30 +1206,25 @@ class Viewer:
                                       stroke_dasharray=f"{3 * lw} {2 * lw}"))
         return "".join(parts)
 
-    def replay_marker_svg(self) -> str:
-        """SVG for the current replay frame's track markers (ROADMAP Item 30).
-
-        Built as its own string for the separate marker layer (plan §4): the
-        static zone/centerline overlay from svg() renders beneath, untouched,
-        while this is the only content rewritten each ui.timer tick. Colors and
-        id labels mirror evo_replay (model.marker_color / short_id). Returns ""
-        when no recording is loaded, so the layer is simply empty off-Replay.
-        """
-        rec = self.replay
-        if rec is None or not rec.frames:
-            return ""
-        i = max(0, min(self.replay_frame, len(rec.frames) - 1))
+    def _marker_svg(self, points, labels: bool) -> str:
+        """Track-marker SVG for one frame's *points* — the single renderer both
+        Replay (Item 30) and Live (Item 35) drive, so markers read identically
+        (same evo_replay colors / short ids) whichever mode produced the frame.
+        Sizes are in overlay-px scaled by zoom, so markers hold their on-screen
+        size at any zoom/pan. Built as its own string for the separate marker
+        layer (plan §4): the static zone/centerline overlay from svg() renders
+        beneath, untouched, while this is the only content rewritten per tick."""
         lw = self.overlay_px / max(self.viewport.scale, 0.05)
         r = 4 * lw
         font = 7 * lw
         parts = []
-        for pt in rec.frames[i].points:
+        for pt in points:
             cx, cy = self.replay_point_to_canvas(pt.x_ft, pt.y_ft)
             color = marker_color(pt.sensor)
             parts.append(f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{r:.1f}" '
                          f'fill="{color}" fill-opacity="0.9" stroke="black" '
                          f'stroke-width="{lw / 2:.2f}"/>')
-            if self.replay_labels:
+            if labels:
                 label = escape(short_id(pt.oid))
                 parts.append(
                     f'<text x="{cx:.1f}" y="{cy - r - lw:.1f}" fill="white" '
@@ -1216,6 +1232,28 @@ class Viewer:
                     f'paint-order="stroke" stroke="black" '
                     f'stroke-width="{font / 8:.2f}">{label}</text>')
         return "".join(parts)
+
+    def replay_marker_svg(self) -> str:
+        """Markers for the current replay frame (ROADMAP Item 30). Returns ""
+        when no recording is loaded, so the layer is empty off-Replay."""
+        rec = self.replay
+        if rec is None or not rec.frames:
+            return ""
+        i = max(0, min(self.replay_frame, len(rec.frames) - 1))
+        return self._marker_svg(rec.frames[i].points, self.replay_labels)
+
+    def live_marker_svg(self) -> str:
+        """Markers for the latest live frame in the drop-to-latest slot (ROADMAP
+        Item 35, plan §3). Returns "" when no frame has arrived or the slot has
+        gone stale past LIVE_STALE_TIMEOUT — a stalled/dropped stream clears
+        rather than freezing its last markers on screen (plan §5)."""
+        slot = self.live_frame
+        if slot is None:
+            return ""
+        frame, stamped = slot
+        if time.monotonic() - stamped > LIVE_STALE_TIMEOUT:
+            return ""
+        return self._marker_svg(frame.points, self.live_labels)
 
 
 # ---------------------------------------------------------------------------
@@ -1284,7 +1322,7 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         for cl in v.centerlines:
             cl.handle_radius = 10.0 * f
         refresh_overlay()  # stroke widths track zoom level
-        refresh_replay_layer()  # marker sizes track zoom too (Item 30)
+        refresh_marker_layer()  # marker sizes track zoom too (Item 30)
 
     def status_scale() -> str:
         fpp = v.ft_per_px()
@@ -2385,6 +2423,27 @@ def build_ui(viewer: Viewer, state: dict) -> None:
                     f"mode: replay | frame {v.replay_frame + 1}/{n} | {f.t} | "
                     f"{len(f.points)} track{'s' if len(f.points) != 1 else ''} | "
                     f"{'playing' if v.replay_playing else 'paused'}")
+        elif v.mode == "Live":
+            s = v.live_session
+            if s is None:
+                status_label.set_text(
+                    "mode: live | connect to an EVO host (sensors icon at right)")
+            else:
+                st = s.status
+                if st.error:
+                    status_label.set_text(f"mode: live | {s.host} | error: {st.error}")
+                elif st.connected:
+                    slot = v.live_frame
+                    nt = len(slot[0].points) if slot else 0
+                    status_label.set_text(
+                        f"mode: live | {s.host} | {st.frames} msgs | "
+                        f"{st.fps:.1f} fps | {nt} track{'s' if nt != 1 else ''}"
+                        + (" | recording" if s.save else ""))
+                elif s.running:
+                    status_label.set_text(f"mode: live | {s.host} | connecting…")
+                else:
+                    status_label.set_text(
+                        f"mode: live | {s.host} | disconnected ({st.frames} msgs)")
         else:
             status_label.set_text(f"mode: {v.mode.lower()}")
         snap_switch.set_value(v.ctrl.snap_enabled)  # no-op when already equal
@@ -2884,17 +2943,20 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             cancel_rotate()
         v.marquee_anchor = None
         v.marquee_cursor = None
-        # Leaving Replay stops the animation; the marker layer is refreshed by
-        # the caller (change_tool) which clears it when mode != "Replay".
+        # Leaving Replay stops the animation; leaving Live tears down the
+        # connection + overlay timer (plan §4). The marker layer itself is
+        # refreshed by the caller (change_tool), which clears it off both modes.
         if new_mode != "Replay":
             _pause_replay()
+        if new_mode != "Live":
+            _stop_live()
 
     def change_tool(e):
         kind = draw_kind_toggle.value
         _enter_mode(effective_mode(e.value, kind))
         update_context_bar()
         refresh_overlay()
-        refresh_replay_layer()  # show markers entering Replay, clear them leaving
+        refresh_marker_layer()  # show markers entering Replay/Live, clear leaving
         refresh_status()
 
     def change_draw_kind(e):
@@ -3012,13 +3074,18 @@ def build_ui(viewer: Viewer, state: dict) -> None:
     # re-enter on_replay_scrub, the same pattern as _owner_sel_lock above.
     _replay_scrub_lock = [False]
 
-    def refresh_replay_layer():
-        """Rewrite the separate marker layer (plan §4). Empty off-Replay, so the
-        overlay above the static svg() layer simply clears when leaving the mode.
+    def refresh_marker_layer():
+        """Rewrite the shared track-marker layer (plan §4): Replay markers in
+        Replay mode, live markers in Live mode, empty otherwise — so the overlay
+        above the static svg() layer clears the moment either mode is left.
         Called on every zoom/pan (via apply_transform) so marker sizes track the
-        zoom, and on each timer tick / scrub."""
-        replay_layer.content = (
-            v.replay_marker_svg() if v.mode == "Replay" else "")
+        zoom, and on each replay/live timer tick / scrub."""
+        if v.mode == "Replay":
+            replay_layer.content = v.replay_marker_svg()
+        elif v.mode == "Live":
+            replay_layer.content = v.live_marker_svg()
+        else:
+            replay_layer.content = ""
 
     def _set_play_icon():
         replay_play_btn.props(
@@ -3044,7 +3111,7 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             _replay_scrub_lock[0] = True
             replay_slider.value = i
             _replay_scrub_lock[0] = False
-        refresh_replay_layer()
+        refresh_marker_layer()
         refresh_status()
 
     def replay_tick():
@@ -3094,7 +3161,7 @@ def build_ui(viewer: Viewer, state: dict) -> None:
 
     def toggle_replay_labels(e):
         v.replay_labels = bool(e.value)
-        refresh_replay_layer()
+        refresh_marker_layer()
 
     def recording_files() -> dict:
         """EVO recordings discoverable near the loaded project — the site
@@ -3125,7 +3192,7 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         replay_slider.value = 0
         _replay_scrub_lock[0] = False
         _set_play_icon()
-        refresh_replay_layer()
+        refresh_marker_layer()
         refresh_status()
         ui.notify(f"loaded {n} frame{'s' if n != 1 else ''} from {path.name} "
                   f"(anchored to S{rec.sensor_index + 1})")
@@ -3300,6 +3367,151 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         refresh_record_status()
         dialog.open()
 
+    # -- live overlay (ROADMAP Item 35, plan §§3-5) --------------------------
+    # Wires the Item 34 feed-tap → the Item 33 streaming aligner → the Item 30
+    # marker layer: a subscribed callback runs the aligner on every captured
+    # message (lossless, on the capture task) and overwrites the single
+    # `v.live_frame` slot; a fixed-cadence timer reads that slot and rewrites
+    # only the marker layer (drop-to-latest, so socket rate never floods the
+    # redraw — plan §3). All on one thread (the server loop), so the slot needs
+    # no lock between the callback and the timer.
+
+    def live_tick():
+        """10 fps cadence (plan §3/§5): render the latest slot frame onto the
+        marker layer and refresh the status line. If the connection has errored
+        or ended, stop the timer — the overlay then clears itself once the slot
+        goes stale (plan §5's error/disconnect surfacing)."""
+        s = v.live_session
+        if s is not None and (s.status.error or (not s.running and s.status.stopped)):
+            live_timer.active = False
+        refresh_marker_layer()
+        refresh_status()
+
+    def _stop_live():
+        """Tear down the live overlay (plan §4): stop the timer, unsubscribe the
+        aligner immediately (so no more frames land in the slot), and cancel the
+        capture task. Sync entry — the socket stop is async, so it's scheduled
+        on the running loop. Idempotent, so leaving Live from any path is safe."""
+        live_timer.active = False
+        s = v.live_session
+        if s is not None:
+            if v.live_cb is not None:
+                s.unsubscribe(v.live_cb)
+            if s.running:
+                asyncio.create_task(s.stop())
+        v.live_session = None
+        v.live_aligner = None
+        v.live_cb = None
+        v.live_frame = None
+
+    def open_live_connect():
+        """Live connect dialog (plan §4): shares the Record panel's host/
+        credentials form (same known_hosts source) plus the anchor-sensor pick
+        the Replay loader uses, and an optional record-to-disk toggle (the
+        superset behavior — a RecordingSession with save=True both overlays and
+        captures, plan §1). On connect it subscribes an aligner-driven callback
+        to the session's message stream and starts the overlay timer."""
+        if v.ft_per_px() is None:
+            ui.notify("calibrate the background first — the live overlay needs "
+                      "the meters-per-pixel scale", type="warning")
+            return
+        if v.live_session is not None and v.live_session.running:
+            ui.notify("already connected — Stop first", type="warning")
+            return
+        hosts = known_hosts()
+        first_host = next(iter(hosts), "")
+        default_user, default_pass = hosts.get(first_host, ("evo", "root"))
+
+        with ui.dialog() as dialog, ui.card().style("min-width: 420px"):
+            ui.label("Connect live EVO overlay").classes("text-lg")
+
+            def pick_known_host(host):
+                u, p = hosts.get(host, ("evo", "root"))
+                host_in.set_value(host)
+                user_in.set_value(u)
+                pass_in.set_value(p)
+
+            host_in = ui.input("host (IP)", value=first_host) \
+                .classes("w-full").props("dense")
+            if hosts:
+                ui.select({h: h for h in hosts}, label="known hosts",
+                          on_change=lambda e: pick_known_host(e.value)) \
+                    .classes("w-full").props("dense clearable")
+            user_in = ui.input("username", value=default_user) \
+                .classes("w-full").props("dense")
+            pass_in = ui.input("password", value=default_pass, password=True) \
+                .classes("w-full").props("dense")
+            n_sensors = len(v.project.sensors)
+            sensor_sel = ui.select(
+                {i: f"S{i + 1}" for i in range(n_sensors)},
+                value=min(v.active_si, n_sensors - 1),
+                label="anchor sensor").classes("w-full").props("dense")
+            with sensor_sel:
+                ui.tooltip("the sensor this host's stream belongs to — its C; "
+                           "reference aligns to this sensor (plan §1c)")
+            save_switch = ui.switch("also record to disk", value=False)
+            with save_switch:
+                ui.tooltip("keep a capture while overlaying (plan §1's superset "
+                           "behavior); off = overlay only, nothing written")
+
+            def connect():
+                host = host_in.value
+                if not host:
+                    ui.notify("enter a host", type="warning")
+                    return
+                out_dir = v.source.parent / "recordings"  # plan §5 convention
+                session = RecordingSession(
+                    host, user_in.value or "evo", pass_in.value or "root",
+                    out_dir, save=bool(save_switch.value))
+                try:
+                    aligner = LiveAligner(v.project, sensor_index=int(sensor_sel.value))
+                except Exception as exc:  # noqa: BLE001 — bad sensor, surface it
+                    ui.notify(f"cannot align: {exc}", type="negative")
+                    return
+
+                def on_message(msg: str) -> None:
+                    # Runs on the capture task (plan §1/§3): pure aligner + one
+                    # slot write, so it can't stall the socket. The GUI stamps
+                    # wall-clock time since a live message carries none (plan §2).
+                    frame = aligner.feed(
+                        msg, t=datetime.now().strftime("%H:%M:%S.%f")[:-3])
+                    if frame is not None:
+                        v.live_frame = (frame, time.monotonic())
+
+                session.subscribe(on_message)
+                v.live_session = session
+                v.live_aligner = aligner
+                v.live_cb = on_message
+                v.live_frame = None
+                session.start()
+                live_timer.active = True
+                dialog.close()
+                ui.notify(f"connecting to {host} (anchored to "
+                          f"S{int(sensor_sel.value) + 1})")
+                refresh_status()
+
+            with ui.row():
+                ui.button("Connect", icon="sensors", on_click=connect)
+                ui.button("Cancel", on_click=dialog.close)
+        dialog.open()
+
+    async def live_stop():
+        """Explicit Stop from the Live toolbar: disconnect but stay in Live mode
+        (so the status line reports the stop and the user can reconnect)."""
+        s = v.live_session
+        if s is not None and v.live_cb is not None:
+            s.unsubscribe(v.live_cb)
+        if s is not None:
+            await s.stop()
+        live_timer.active = False
+        v.live_frame = None
+        refresh_marker_layer()
+        refresh_status()
+
+    def toggle_live_labels(e):
+        v.live_labels = bool(e.value)
+        refresh_marker_layer()
+
     def update_context_bar():
         """Row-2 context controls per tool + Draw sub-kind (ROADMAP Item 24;
         PHASE3_UI_PLAN §3): built once, shown/hidden by visibility rather than
@@ -3307,10 +3519,11 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         dropdown's *options* also change with the sub-kind (General offered or
         not), so it is rebuilt here."""
         tool_is_draw = tool.value == "Draw"
-        # Unified Owner/Sensor dropdown: everywhere but Background and Replay
-        # (Replay is read-only, so it owns nothing — Item 30).
-        owner_sel.set_visibility(v.mode not in ("Background", "Replay"))
-        owner_hint_label.set_visibility(v.mode not in ("Background", "Replay"))
+        # Unified Owner/Sensor dropdown: everywhere but Background, Replay, and
+        # Live (all read-only, so they own nothing — Items 30/35).
+        owns_nothing = ("Background", "Replay", "Live")
+        owner_sel.set_visibility(v.mode not in owns_nothing)
+        owner_hint_label.set_visibility(v.mode not in owns_nothing)
         refresh_owner_sel()
         update_owner_hint()
         # Draw sub-kind toggle + the per-sub-kind extras.
@@ -3343,6 +3556,9 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         # Replay transport (Item 30): the whole cluster shows only in Replay.
         for _rw in replay_widgets:
             _rw.set_visibility(v.mode == "Replay")
+        # Live overlay controls (Item 35): shown only in Live.
+        for _lw in live_widgets:
+            _lw.set_visibility(v.mode == "Live")
         # Zone-table panel (Item 24, §5): Auto shows it only when a zone kind is
         # the active target; the three-state control itself is always on Row 2.
         zone_panel.set_visibility(
@@ -3399,12 +3615,13 @@ def build_ui(viewer: Viewer, state: dict) -> None:
     # cluster (template-editor · folder · filename · save) right. The product
     # name is gone; the filename is a muted inline label beside the folder menu.
     with ui.row().classes("w-full items-center gap-2 px-2 no-wrap overflow-x-auto"):
-        tool = ui.toggle(["Draw", "Edit", "Background", "Replay"], value="Edit",
-                         on_change=change_tool).props("dense")
+        tool = ui.toggle(["Draw", "Edit", "Background", "Replay", "Live"],
+                         value="Edit", on_change=change_tool).props("dense")
         with tool:
             ui.tooltip("accelerators: d draw · e edit · space+drag / "
                        "middle-drag pans · Esc cancel (Sensor & Centerline are "
-                       "Draw sub-kinds now). Replay: read-only EVO playback.")
+                       "Draw sub-kinds now). Replay: read-only EVO playback. "
+                       "Live: read-only real-time EVO overlay.")
         ui.separator().props("vertical")
         # Always-on drawing tools (apply in every mode).
         snap_switch = ui.switch("snap", on_change=toggle_snap).props("dense")
@@ -3641,6 +3858,24 @@ def build_ui(viewer: Viewer, state: dict) -> None:
                           replay_play_btn, replay_step_fwd_btn, replay_speed_sel,
                           replay_slider, replay_labels_switch]
 
+        # Live overlay controls (ROADMAP Item 35): connect (shares the Record
+        # panel's auth form) / stop, plus the id-label toggle. No timeline or
+        # scrubber — Live is a live tail, not file scrubbing (plan §4). Shown
+        # only in Live mode by update_context_bar().
+        live_connect_btn = ui.button(
+            icon="sensors", on_click=open_live_connect).props("flat dense")
+        with live_connect_btn:
+            ui.tooltip("connect to a live EVO host and overlay its tracks")
+        live_stop_btn = ui.button(
+            icon="stop", on_click=live_stop).props("flat dense").classes("text-red-5")
+        with live_stop_btn:
+            ui.tooltip("disconnect the live overlay")
+        live_labels_switch = ui.switch(
+            "ids", value=True, on_change=toggle_live_labels).props("dense")
+        with live_labels_switch:
+            ui.tooltip("show the abbreviated track id over each live marker")
+        live_widgets = [live_connect_btn, live_stop_btn, live_labels_switch]
+
         # Zone-table three-state control (Item 24, §5): right-justified at the
         # end of the context bar, directly above the table it governs.
         ui.space()
@@ -3754,6 +3989,9 @@ def build_ui(viewer: Viewer, state: dict) -> None:
     # Replay animation clock (Item 30): a fixed 10 fps cadence (plan §6),
     # inactive until playback starts so it costs nothing off-Replay.
     replay_timer = ui.timer(0.1, replay_tick, active=False)
+    # Live overlay clock (Item 35): the same fixed 10 fps cadence (plan §3),
+    # inactive until a live connection starts so it costs nothing off-Live.
+    live_timer = ui.timer(0.1, live_tick, active=False)
     ui.timer(0.3, fit_view, once=True)
     if v.derived_attachments:
         ui.timer(0.8, lambda: ui.notify(

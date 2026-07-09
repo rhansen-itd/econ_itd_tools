@@ -2382,6 +2382,215 @@ Suggested prompt:
     close/reopen preserving session state) — no browser console errors at
     any point.
 
+- 2026-07-08 — **ROADMAP Item 32: Live Overlay architecture & feed-tap seam
+  (Opus)** — decision document only, no code. Full write-up in
+  [LIVE_OVERLAY_PLAN.md], a sibling of RECORD_PLAYBACK_PLAN.md (RPP). Key
+  resolutions:
+  - **The hard parts are already built (28–31); the one new thing is a
+    stateful stream.** The EVO→world-feet transform (RPP §1b, live in
+    `model/replay.py`), the marker layer (Item 30's `replay_layer` +
+    `replay_point_to_canvas`), and the websocket controller
+    (`capture/recorder.RecordingSession`, Item 31) all get reused verbatim.
+    Only the real-time seam is new.
+  - **The distinction that drives everything: parse is stateful+lossless,
+    render is stateless+lossy.** The aligner must see *every* message (it
+    holds the one-time `C;` reference + timestamp across calls), but the
+    canvas only ever needs the *latest* aligned frame. So **drop-to-latest
+    lives after the aligner (at the aligned-frame slot), never at the raw-
+    message tap** — a "latest raw message" slot would drop the `C;` ref or
+    whole `F;` frames and corrupt the parse.
+  - **Feed-tap = synchronous subscriber-callback list on `RecordingSession`**
+    (`subscribe`/`unsubscribe`, fanned out in the `async for` loop,
+    `try/except`-guarded; subscribers non-blocking/non-raising by contract).
+    Rejected `asyncio.Queue` (needs a second consumer task that can lag →
+    unbounded growth on an endless feed) and a raw-message slot (lossy, breaks
+    the stateful parse). Callback runs on the server loop thread — same thread
+    as the render `ui.timer` — so no locking. `capture/` stays the only place
+    the socket lives.
+  - **Overlay doesn't require saving:** `save: bool = True` on
+    `RecordingSession`; `False` skips the disk write but still fans out. One
+    controller → capture-only, overlay-while-recording, or overlay-only.
+  - **Streaming parser lives *inside* `model/replay.py`** as a pure
+    `LiveAligner` class beside the batch parser — **not** a new module and
+    **not** a second copy of the coordinate math. Refactor the per-line body
+    of `_parse_lines` into shared `_parse_ref`/`_parse_frame_entities` helpers
+    both paths call, so the `F;`/`C;`/timestamp grammar exists once; batch vs.
+    streaming differ only in who holds the state. `feed(message, t=None) ->
+    Frame | None`; the live websocket message has no timestamp line (the
+    *recorder* adds that to the file), so the caller supplies `t`
+    (`datetime.now()` live; the recorded `t` in Item 33's equivalence test),
+    keeping `model/` pure/deterministic.
+  - **Async→GUI = one shared "latest aligned frame" slot + a fixed 10 fps
+    `ui.timer`** (Item 30's cadence) that rewrites only the marker layer.
+    Bounded memory (O(1) slot, no growing `list[Frame]`), no queue, no
+    backpressure possible. **Stale-frame expiry:** since each frame replaces
+    all markers, a dropped track vanishes on its own; a whole-stream stall is
+    caught by clearing the overlay when `now - slot_time > STALE_TIMEOUT`
+    (~2 s), which also covers a silent disconnect.
+  - **"Live" is a new read-only canvas mode, sibling to Replay** (not a
+    checkbox in the modal Record dialog, which sits over the canvas it'd draw
+    on; not an overload of Replay, whose whole point is a timeline/scrubber
+    Live doesn't have). It shares the Record panel's auth form +
+    `RecordingSession`, coexists with draw/edit exactly as Replay (read-only,
+    separate layer), and — because `save=True` both writes and fans out — can
+    optionally record-while-overlaying and hand the finished file to the Item
+    30 loader.
+  - **Guardrails (RPP §6 + Item 20):** `max_points_per_frame` cap, stale
+    timeout, marker-layer-only rewrite at fixed cadence, timer inactive
+    off-Live, error/disconnect surfaced via the existing
+    `RecordingStatus.error`/`connected` (auto-reconnect an explicit non-goal
+    for the first cut). Item 34 also adds a frames/sec + last-frame-time
+    readout to `RecordingStatus`.
+  - **Open item carried forward:** the first *live* connection (Item 35) is
+    the first real EVO data end-to-end and the real confirmation of RPP §7's
+    y-sign / no-rotation assumptions (Item 29 only had a synthetic recording +
+    an `evo_replay.align` equivalence test); any fix is a one-place sign change
+    in the shared transform, not a live-path hack. Single-host live is the
+    Item 35 minimum (mirroring Item 31); multi-host is a later extension.
+    Checked off Item 32's boxes in ROADMAP.md.
+
+- 2026-07-08 — **ROADMAP Item 33: Streaming align engine in `model/` (Fable)**
+  — `LiveAligner` in `model/replay.py`, exactly per LIVE_OVERLAY_PLAN.md §2:
+  the stateful one-message-at-a-time counterpart of `parse_recording`, still
+  pure/headless (no GUI, no network, no pandas — the existing purity test
+  covers the module).
+  - **One copy of the grammar and one copy of the transform.** Extracted the
+    per-line body of `_parse_lines` into shared helpers — `_parse_ref` (`C;`
+    → `(x, y) | None`) and `_parse_frame_entities` (`F;` → raw entities) —
+    and the alignment loop of `parse_recording` into `_align_frame`, which
+    holds the plan-§1b `m_to_ft`-on-offset / `emp`-on-anchor split (and the
+    y-down translation) in exactly one place. Batch and streaming now differ
+    only in who holds the state: a local scan vs. instance attributes. Any
+    future §7 y-sign/rotation fix lands once, in `_align_frame`, and both
+    paths inherit it.
+  - **Shape as the plan handed over:** `LiveAligner(project, sensor_index=0,
+    *, max_points_per_frame=200)` precomputes `anchor_ft` via
+    `anchor_world_ft` (constructor validates like the batch path; `feed`
+    itself never raises on message content); `feed(message, t=None) -> Frame
+    | None` returns an aligned `Frame` on an `F;` line, `None` for
+    `C;`/timestamp/`GetCfg`/garbage. First `C;` wins and persists across
+    calls (a malformed `C;` doesn't burn first-one-wins), so a
+    reference-once-at-the-top stream stays anchored for its whole life; an
+    `F;` before any reference uses the batch's `(0, 0)` fallback. `t` stays
+    caller-supplied (live has no wall-clock line — the recorder adds it), so
+    the GUI stamps `datetime.now()` and `model/` stays deterministic; recorded
+    timestamp lines fed as messages update the held time identically. A
+    partial `F;` yields an *empty* frame, matching batch (and usefully
+    clearing markers downstream). A multi-line message updates state
+    losslessly and returns the last frame (the render slot is drop-to-latest,
+    plan §3).
+  - **One documented divergence:** batch scans the whole file, so a late `C;`
+    anchors earlier frames retroactively; a stream can't rewrite frames it
+    already emitted, so pre-reference frames keep the fallback. The real feed
+    sends `C;` up front (GetCfg response), so the paths agree on any
+    well-formed stream — pinned by a dedicated test rather than papered over.
+  - **The correctness gate:** streamed-vs-batch **frame-for-frame equality**
+    (frozen dataclasses, exact `==` — same floats because same code path) on
+    the Item 29 synthetic recording against the real `86_US95&SH8` site, on a
+    50-frame reference-once stream anchored to sensor 1, on noisy/malformed
+    text, and on recorder-style `(ts, message)` pairs via `t=` so timestamps
+    match too. This re-checks RPP §7's y-sign/no-rotation semantics on the
+    incremental path, as Item 33 required. 529 pytest pass (12 new).
+    Re-exported `LiveAligner` from `model/__init__`; checked off Item 33 in
+    ROADMAP.md. No GUI changes — Items 34/35 consume this seam.
+
+- 2026-07-09 — **ROADMAP Item 34: Recorder feed-tap + live status (Sonnet)**
+  — `capture/recorder.RecordingSession` gets the synchronous subscriber seam
+  LIVE_OVERLAY_PLAN.md §1 specified, exactly as decided (no auth/socket/file
+  behavior otherwise changed).
+  - **Feed-tap.** Added `subscribe(cb)` / `unsubscribe(cb)` and a
+    `self._subscribers` list; `_run`'s `async for message in websocket` loop
+    now fans each raw message out to every subscriber, in addition to the
+    disk write. Each callback runs inside its own `try/except` so a
+    subscriber bug can't take down capture or the socket, per plan §1's
+    contract ("subscribers must be non-blocking and non-raising").
+  - **`save: bool = True`.** Added a keyword-only constructor param; when
+    `False`, `_run` skips `mkdir`/`open`/`write`/`flush` (via
+    `contextlib.nullcontext()` standing in for the file handle) but still
+    fans out, giving the plan's three compositions from one controller:
+    capture-only (today, no subscribers), overlay-while-recording
+    (`save=True` + a subscriber), overlay-only (`save=False` + a
+    subscriber). `status.path` stays `None` when `save=False`. Existing
+    positional call in `gui/app.py`'s Record panel is unaffected — `save`
+    defaults `True`.
+  - **Live status (plan §6).** `RecordingStatus` gained `fps: float` and
+    `last_frame_time: float | None`. A private `_frame_times` deque (reset
+    each `start()`) holds message-arrival monotonics within a 2 s rolling
+    window (`FPS_WINDOW_SECONDS`); `fps` is `(count - 1) / span` over that
+    window, recomputed on every message via a new `_record_frame_time()`
+    helper. `connected`/`error` were already on `RecordingStatus` from Item
+    31, so plan §6's three fields (fps, connection state, last-frame time)
+    are now all present for Item 35's Live status line and the existing
+    Record panel to poll.
+  - **Tests:** `tests/test_capture.py` drives `_run` against the existing
+    `FakeWebSocket`, no real socket, nothing under `sites/` — subscriber
+    receives every message alongside the disk write; `unsubscribe` mid-stream
+    stops delivery without affecting capture; a raising subscriber doesn't
+    set `status.error` or drop frame count; `save=False` fans out with no
+    file/dir written; `fps`/`last_frame_time` populate. 5 new tests; full
+    suite 534 pass. Checked off Item 34's boxes in ROADMAP.md — Item 35
+    (Live mode + render) consumes this seam next.
+
+- 2026-07-09 — **ROADMAP Item 35: Live overlay mode + render (Opus)** — the
+  last of the live-overlay batch (32–35): a read-only "Live" canvas mode that
+  taps a `RecordingSession` stream (Item 34), runs the streaming `LiveAligner`
+  (Item 33) per message, and drives Item 30's marker layer in real time. This
+  is the first end-to-end path from a live socket to the canvas; it reuses the
+  record/playback machinery verbatim and adds only the two seams
+  LIVE_OVERLAY_PLAN.md flagged as genuinely new — the stateful per-message
+  aligner (already built in 33) and the async→GUI drop-to-latest hand-off.
+  - **Mode.** Added a "Live" top-level tool beside Replay; `effective_mode`
+    maps it to a `"Live"` mode. Like Replay it is read-only — the Owner/Sensor
+    dropdown, draw/edit tools, and all owning context hide in Live (it owns
+    nothing). Leaving Live (any tool switch) tears down the connection + timer
+    via `_stop_live()` in the shared `_enter_mode` teardown, the exact place
+    Replay's `_pause_replay()` already sat.
+  - **The drop-to-latest slot (plan §3).** The load-bearing decision: parsing
+    is stateful+lossless, rendering is stateless+lossy, so drop-to-latest lives
+    *after* the aligner. A subscribed `on_message` callback runs
+    `LiveAligner.feed(msg, t=now)` on **every** captured message (on the capture
+    task) and overwrites a single `v.live_frame = (Frame, monotonic)` slot; a
+    fixed 10 fps `live_timer` reads that slot and rewrites **only** the marker
+    layer. Socket rate is fully decoupled from redraw, and the path keeps only
+    the newest frame — constant memory on an all-day feed. Callback + timer run
+    on the one server loop, so the slot needs no lock (plan §1). The GUI stamps
+    wall-clock `t` since a live message carries none (plan §2).
+  - **Shared renderer.** Refactored `replay_marker_svg` into a `_marker_svg(
+    points, labels)` helper that both Replay and the new `live_marker_svg` call,
+    so live and playback markers read identically (same evo_replay colors /
+    short ids, same `replay_point_to_canvas` → `world_to_canvas` transform,
+    same zoom-tracked sizes) — one copy of the render path, mirroring the
+    engine's one-copy-of-the-transform rule. `refresh_replay_layer` became
+    `refresh_marker_layer` (Replay markers in Replay, live in Live, empty
+    otherwise), driven by both timers and every zoom/pan through
+    `apply_transform`.
+  - **Connection UX (plan §4).** A Live-connect dialog shares the Record
+    panel's `known_hosts` host/credentials form plus the anchor-sensor pick the
+    Replay loader uses, and an optional **"also record to disk"** switch —
+    `RecordingSession(save=True)` both overlays *and* captures (the plan's
+    superset), and that capture's file hands to the Item 30 loader unchanged.
+    The toolbar Live cluster is just Connect / Stop / id-labels — no timeline or
+    scrubber, because Live is a live tail, not file scrubbing.
+  - **Guardrails (plan §5).** `LIVE_STALE_TIMEOUT` (2 s) clears the overlay when
+    no frame arrives in the window, so a stalled or silently dropped stream
+    fades instead of freezing its last markers; the aligner's
+    `max_points_per_frame` caps a pathological frame; `live_tick` stops the
+    timer and the status line surfaces `error`/disconnect (reconnect is
+    user-initiated, an explicit non-goal). Marker-layer-only rewrite at a fixed
+    cadence carries the Item 20 zoom-freeze lesson onto the live path.
+  - **Tests.** New `tests/test_live.py` exercises the exact Item 35 composition
+    headless — `RecordingSession._run` against a scripted fake socket (a `C;`
+    once, then `F;` frames), a subscriber running a real `LiveAligner` and
+    writing the slot, anchored to the real 86_US95&SH8 site: the feed is
+    lossless (the one-time `C;` anchors the whole stream), the slot holds only
+    the latest aligned frame, and the produced frames match the batch engine
+    frame-for-frame on aligned coordinates; plus the raising-render-callback and
+    overlay-without-disk guards. `effective_mode("Live") == "Live"` covered in
+    test_toolbar_modes. 6 new tests; full suite **540 pass**; the page builds
+    headless (200, no server-side exception). GUI/async wiring exercised by
+    hand per the plan. Checked off Item 35 in ROADMAP.md — the live-overlay
+    batch (32–35) is complete.
+
 ## Appendix — example template (acceptance case, revised for Items 15/17/18)
 
 45 mph approach, lanes `12' L | 12' T | 12' T | 12' R`, count loops, starting

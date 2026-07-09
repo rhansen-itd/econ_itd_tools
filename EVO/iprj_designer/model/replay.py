@@ -26,6 +26,14 @@ The anchor is per-sensor (plan §1c): each recording is one host's stream, so
 it is tagged with its owning sensor index and aligns to that sensor — never a
 hard-wired sensor 0. Everything here is pure and pandas-free (plan §§2-3);
 ``Recording.to_dataframe()`` imports pandas lazily for notebook use only.
+
+The streaming counterpart (ROADMAP Item 33, LIVE_OVERLAY_PLAN.md §2) is
+``LiveAligner``: feed it one live websocket message at a time and it emits
+the same aligned ``Frame``s incrementally, holding the ``C;`` reference and
+current timestamp as state. Both paths share one copy of the line grammar
+(``_parse_ref`` / ``_parse_frame_entities``) and one copy of the transform
+(``_align_frame``); they differ only in who holds the state — a local scan
+over the whole file vs. instance attributes across ``feed`` calls.
 """
 
 from __future__ import annotations
@@ -182,24 +190,10 @@ def parse_recording(
         raw_frames = raw_frames[:max_frames]
 
     anchor = anchor_world_ft(project, sensor_index)
-    frames = []
-    for t, entities in raw_frames:
-        if max_points_per_frame is not None:
-            entities = entities[:max_points_per_frame]
-        points = tuple(
-            TrackPoint(
-                oid=oid,
-                sensor=oid % 10,
-                cls=cls,
-                x_ft=anchor[0] + m_to_ft(x - ref[0]),
-                y_ft=anchor[1] + m_to_ft(y - ref[1]),  # y-down on both sides
-                heading=heading,
-                x_raw_m=x,
-                y_raw_m=y,
-            )
-            for oid, cls, x, y, heading in entities
-        )
-        frames.append(Frame(t=t, points=points))
+    frames = [
+        _align_frame(t, entities, anchor, ref, max_points_per_frame)
+        for t, entities in raw_frames
+    ]
 
     return Recording(
         sensor_index=sensor_index,
@@ -208,6 +202,95 @@ def parse_recording(
         anchor_ft=anchor,
         frames=frames,
     )
+
+
+# --- streaming alignment (ROADMAP Item 33, LIVE_OVERLAY_PLAN.md §2) ----------
+
+
+class LiveAligner:
+    """Streaming counterpart of ``parse_recording``: one message per call.
+
+    Built from a loaded ``Project`` + sensor index; ``feed(message)`` returns
+    an aligned world-feet ``Frame`` when the message carries an ``F;`` track
+    frame and ``None`` otherwise (``C;`` reference, timestamp, ``GetCfg``
+    responses, malformed/partial lines). The ``C;`` reference and current
+    timestamp persist across calls, so a stream that sends its reference once
+    at the top and only ``F;`` afterward stays anchored for its whole life.
+
+    A live websocket message carries no wall-clock line — the *recorder*
+    prepends one when writing to disk — so ``feed`` accepts an optional ``t``
+    the caller stamps (the GUI passes a ``datetime.now()``-formatted time;
+    a file replay can instead just feed the recorded timestamp lines, which
+    update the held time the same way). Timestamping stays with the caller so
+    this class remains pure and deterministic.
+
+    One documented divergence from the batch path: ``parse_recording`` scans
+    the whole file, so a ``C;`` arriving *after* some frames still anchors
+    them retroactively; a stream cannot rewrite frames it already emitted, so
+    frames fed before any reference use the same ``(0, 0)`` fallback as the
+    batch default and keep it. The real feed sends ``C;`` up front, so the
+    two paths agree frame-for-frame on any well-formed stream.
+
+    ``feed`` never raises on message content (the batch parser's
+    skip-on-``ValueError`` discipline); only the constructor validates, the
+    same way ``anchor_world_ft`` does for the batch path.
+    """
+
+    def __init__(
+        self,
+        project: Project,
+        sensor_index: int = 0,
+        *,
+        max_points_per_frame: int | None = DEFAULT_MAX_POINTS_PER_FRAME,
+    ) -> None:
+        self.sensor_index = sensor_index
+        self.anchor_ft = anchor_world_ft(project, sensor_index)
+        self.max_points_per_frame = max_points_per_frame
+        self._ref = (0.0, 0.0)
+        self._ref_seen = False
+        self._t = "00:00:00.000"
+
+    @property
+    def ref_m(self) -> tuple[float, float]:
+        return self._ref
+
+    @property
+    def ref_seen(self) -> bool:
+        return self._ref_seen
+
+    def feed(self, message: str, t: str | None = None) -> Frame | None:
+        """Ingest one raw message; return the aligned ``Frame`` it carries.
+
+        A live message is normally a single line; if one carries several
+        ``F;`` lines (e.g. a whole recorded blob), every line still updates
+        state losslessly and the last frame is the one returned — the live
+        render slot is drop-to-latest anyway (plan §3).
+        """
+        if t is not None:
+            self._t = t
+        frame = None
+        for line in message.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+
+            if line.startswith("C;"):
+                if not self._ref_seen:
+                    ref = _parse_ref(line)
+                    if ref is not None:
+                        self._ref, self._ref_seen = ref, True
+                continue
+
+            if _TIME_RE.match(line):
+                self._t = line
+                continue
+
+            if line.startswith("F;"):
+                frame = _align_frame(
+                    self._t, _parse_frame_entities(line),
+                    self.anchor_ft, self._ref, self.max_points_per_frame)
+
+        return frame
 
 
 # --- raw line parsing -------------------------------------------------------
@@ -228,6 +311,9 @@ def _parse_lines(text: str) -> tuple[tuple[float, float], bool, list[tuple[str, 
 
     Anything else (GetCfg responses, blank lines) is ignored. The whole file
     is scanned before aligning, so a late C; line still anchors correctly.
+
+    The per-line grammar lives in _parse_ref/_parse_frame_entities, shared
+    with the streaming LiveAligner — this function only holds the scan state.
     """
     ref_x, ref_y, ref_seen = 0.0, 0.0, False
     current_time = "00:00:00.000"
@@ -239,13 +325,9 @@ def _parse_lines(text: str) -> tuple[tuple[float, float], bool, list[tuple[str, 
             continue
 
         if line.startswith("C;") and not ref_seen:
-            vals = line[2:].split(",")
-            if len(vals) >= 2:
-                try:
-                    ref_x, ref_y = float(vals[0]), float(vals[1])
-                    ref_seen = True
-                except ValueError:
-                    pass
+            ref = _parse_ref(line)
+            if ref is not None:
+                (ref_x, ref_y), ref_seen = ref, True
             continue
 
         if _TIME_RE.match(line):
@@ -253,24 +335,69 @@ def _parse_lines(text: str) -> tuple[tuple[float, float], bool, list[tuple[str, 
             continue
 
         if line.startswith("F;"):
-            parts = line.split(";")
-            # parts[0]='F', [1..4] frame header fields, [5:] entities
-            entities: list[_RawEntity] = []
-            for ent in parts[5:]:
-                p = ent.split(",")
-                if len(p) < 4:
-                    continue
-                try:
-                    oid = int(p[0])
-                    x, y = float(p[2]), float(p[3])
-                except ValueError:
-                    continue
-                cls = int(p[1]) if _is_int(p[1]) else None
-                heading = float(p[4]) if len(p) > 4 and _is_float(p[4]) else None
-                entities.append((oid, cls, x, y, heading))
-            raw_frames.append((current_time, entities))
+            raw_frames.append((current_time, _parse_frame_entities(line)))
 
     return (ref_x, ref_y), ref_seen, raw_frames
+
+
+def _parse_ref(line: str) -> tuple[float, float] | None:
+    """A ``C;`` line's (x, y) reference in EVO meters; None if unparseable."""
+    vals = line[2:].split(",")
+    if len(vals) >= 2:
+        try:
+            return float(vals[0]), float(vals[1])
+        except ValueError:
+            pass
+    return None
+
+
+def _parse_frame_entities(line: str) -> list[_RawEntity]:
+    """The raw entities of an ``F;`` line; unparseable entities are skipped."""
+    parts = line.split(";")
+    # parts[0]='F', [1..4] frame header fields, [5:] entities
+    entities: list[_RawEntity] = []
+    for ent in parts[5:]:
+        p = ent.split(",")
+        if len(p) < 4:
+            continue
+        try:
+            oid = int(p[0])
+            x, y = float(p[2]), float(p[3])
+        except ValueError:
+            continue
+        cls = int(p[1]) if _is_int(p[1]) else None
+        heading = float(p[4]) if len(p) > 4 and _is_float(p[4]) else None
+        entities.append((oid, cls, x, y, heading))
+    return entities
+
+
+def _align_frame(
+    t: str,
+    entities: list[_RawEntity],
+    anchor: tuple[float, float],
+    ref: tuple[float, float],
+    max_points_per_frame: int | None,
+) -> Frame:
+    """Align one raw frame into world feet — the single copy of the plan-§1b
+    transform. Both the batch parser and the streaming LiveAligner build every
+    Frame through here, so the m_to_ft-on-offset / emp-on-anchor split (and
+    any future y-sign/rotation fix, plan §7) lives in exactly one place."""
+    if max_points_per_frame is not None:
+        entities = entities[:max_points_per_frame]
+    points = tuple(
+        TrackPoint(
+            oid=oid,
+            sensor=oid % 10,
+            cls=cls,
+            x_ft=anchor[0] + m_to_ft(x - ref[0]),
+            y_ft=anchor[1] + m_to_ft(y - ref[1]),  # y-down on both sides
+            heading=heading,
+            x_raw_m=x,
+            y_raw_m=y,
+        )
+        for oid, cls, x, y, heading in entities
+    )
+    return Frame(t=t, points=points)
 
 
 def _is_int(s: str) -> bool:
