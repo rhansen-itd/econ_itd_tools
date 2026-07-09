@@ -45,6 +45,40 @@ parameters robustly (see §4 for why the obvious source fails).
 
 ---
 
+## 2b. ★ Strongest lead (added later): the `Z;` line is the alignment reference
+
+The recording contains a **`Z;` line** — the sensor's event-loop / detector-zone
+polygons **in the EVO frame (metres)**, the same loops the iprj stores in map
+pixels. This is the long-baseline, in-frame correspondence set the 2-sensor
+baseline lacked: in the Banks capture it is **36 zones spanning the whole
+intersection**. It arrives once as part of the `GetCfg` response (alongside `C;`).
+
+Example (first two zones): `Z;0,0,6,33,43.577991,-11.129528,40.338005,-13.190846,
+48.925793,-26.690271,52.165779,-24.628952;0,0,0,0,66.253685,-1.890499,...` —
+i.e. `Z;` then `;`-separated zones, each `= 4 header ints + 4 (x,y) vertices`.
+The 4 header ints are **not yet decoded** (likely sensor index / zone id / type /
+enable) — decoding them is the key to matching a `Z;` zone to its iprj
+`EventZone`.
+
+Status: **promising but not yet solved.** A naïve fit assuming `Z;`-order ==
+iprj-order fails (36 `Z;` zones vs 20 iprj `event_zones`, different order, and the
+`Z;` set likely spans a different sensor subset — this capture's fused stream
+carries sensors 0/1/3 while `sensors_1&2_w_fail.iprj` has only 0/1). **Once the
+`Z;` header is decoded and zones are matched to the iprj by id, a similarity fit
+over 20+ well-spread zone centroids should pin rotation+scale precisely** — no
+human line-up needed, and it works for live too (the same `Z;` comes over the
+wire). This likely supersedes the manual-line-up fallback if it pans out.
+
+Tooling added: [../evo_recorder_full.py](../evo_recorder_full.py) records the full
+raw stream **and** mirrors every `C;`/`Z;` config line into a labelled
+`<host>_EVO_<epoch>.config.txt` sidecar, re-requesting `GetCfg` until a `Z;` is
+captured — so the alignment geometry is never missed or buried. (The existing
+recorders already write `Z;` if they catch the one `GetCfg` reply; this just makes
+it robust and obvious.) The designer's replay parser currently **ignores `Z;`** —
+`model/replay._parse_lines` only handles `F;`/`C;`/timestamps.
+
+---
+
 ## 3. Hypotheses — status
 
 | # | Hypothesis | Status | Evidence |
@@ -139,11 +173,18 @@ rotation.
 
 ## 6. Questions for Fable to answer (in priority order)
 
+0. **★ Decode the `Z;` line and align by zones (§2b) — try this first.** Work out
+   the 4 header ints per zone (sensor / zone-id / type / enable?), match each `Z;`
+   zone to its iprj `EventZone`, and fit a similarity over the matched zone
+   centroids (20+ points spanning the intersection = the long baseline H3 lacked).
+   If it lands the corridor within ~15 ft, this is the fix — automatic, and it
+   works live (same `Z;` on the wire). Cross-check against the manual long-baseline
+   number (−33.7°, scale 1.23).
 1. **Where does the Banks rotation come from, and is it derivable from stored
-   data at the precision needed (<~1°)?** The 2-sensor baseline is out (H3). Is
-   there any *other* long-baseline reference in the iprj/recording — the two
-   `MeterReference0/1` calibration points, the `C;` lat/long + a per-track GPS,
-   the detector geometry itself — that pins rotation robustly?
+   data at the precision needed (<~1°)?** The 2-sensor baseline is out (H3); `Z;`
+   zones (Q0) are the best candidate. Any *other* long-baseline reference — the two
+   `MeterReference0/1` calibration points, the `C;` lat/long + per-track GPS — is a
+   fallback.
 2. **Was there ever a rotation/fine-alignment step?** Chase the "Rough Alignment"
    thread (§5): read `fusion_visualizer.py` fully, `EVO_plotter.ipynb`'s alignment
    cells, and especially **`~/pyatspm/src/atspm/video/calibrate.py`** (the
