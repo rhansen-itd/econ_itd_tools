@@ -26,10 +26,21 @@ def test_background_tool_is_background_regardless_of_subkind(kind):
 
 
 @pytest.mark.parametrize("kind", ["Event Zone", "Centerline", "Sensor"])
-def test_replay_and_live_tools_ignore_subkind(kind):
-    # Replay (Item 30) and Live (Item 35) are read-only top-level modes.
-    assert effective_mode("Replay", kind) == "Replay"
-    assert effective_mode("Live", kind) == "Live"
+def test_overlay_tool_resolves_to_its_subkind_ignoring_draw_subkind(kind):
+    # Record/Replay/Live (Items 31/30/35) are siblings under one "Overlay"
+    # top-level tool now (Item 37); the Overlay sub-kind IS the effective
+    # mode, regardless of whatever the (irrelevant, hidden) Draw sub-kind is.
+    assert effective_mode("Overlay", kind, "Record") == "Record"
+    assert effective_mode("Overlay", kind, "Replay") == "Replay"
+    assert effective_mode("Overlay", kind, "Live") == "Live"
+    # Align (Item 40) is the fourth Overlay sub-kind — an interactive-alignment
+    # mode, resolved the same sub-kind-is-the-mode way as the other three.
+    assert effective_mode("Overlay", kind, "Align") == "Align"
+
+
+def test_overlay_tool_defaults_to_replay_subkind():
+    # The overlay_kind_val default mirrors the toolbar's initial toggle value.
+    assert effective_mode("Overlay", "Event Zone") == "Replay"
 
 
 @pytest.mark.parametrize("kind,mode", [

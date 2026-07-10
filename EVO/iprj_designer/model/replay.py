@@ -46,13 +46,14 @@ from __future__ import annotations
 import gzip
 import re
 import zlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as _dc_replace
 from pathlib import Path
 
 from . import zonefit
+from .calibration import AlignmentTransform
 from .iprj_io import Project
 from .units import effective_meter_per_pixel, m_to_ft, px_to_ft
-from .zonefit import ZoneFit
+from .zonefit import RawZone, ZoneFit
 
 _GZIP_MAGIC = b"\x1f\x8b"
 
@@ -120,6 +121,14 @@ class Recording:
     # Similarity recovered from the recording's Z; zones (rotation fix);
     # None = no usable Z; line, frames used the translation fallback.
     zone_fit: ZoneFit | None = None
+    # The raw Z; zones, kept so the calibrated group refit (Item 39,
+    # zonefit.fit(calib=...)) can re-run without re-parsing the recording.
+    zones: tuple[RawZone, ...] = ()
+    # The composed transform the frames were aligned through (Item 39). At
+    # parse time it is just the zone fit with no calibration (the plan-§0
+    # reduction); realign() swaps in a calibrated one. None = the frames used
+    # the legacy per-point translation fallback.
+    alignment: AlignmentTransform | None = None
 
     def to_dataframe(self):
         """Flatten to a tidy pandas DataFrame (notebook convenience only).
@@ -227,10 +236,13 @@ def parse_recording(
     if max_frames is not None:
         raw_frames = raw_frames[:max_frames]
 
-    fit = zonefit.fit(project, zonefit.parse_zline(zline)) if zline else None
+    zones = tuple(zonefit.parse_zline(zline)) if zline else ()
+    fit = zonefit.fit(project, list(zones)) if zones else None
+    alignment = (
+        AlignmentTransform(calib={}, placement=fit) if fit is not None else None)
     anchor = anchor_world_ft(project, sensor_index)
     frames = [
-        _align_frame(t, entities, anchor, ref, max_points_per_frame, fit)
+        _align_frame(t, entities, anchor, ref, max_points_per_frame, alignment)
         for t, entities in raw_frames
     ]
 
@@ -241,7 +253,29 @@ def parse_recording(
         anchor_ft=anchor,
         frames=frames,
         zone_fit=fit,
+        zones=zones,
+        alignment=alignment,
     )
+
+
+def realign(recording: Recording, alignment: AlignmentTransform | None) -> Recording:
+    """Re-align an already-parsed Recording through a new composed transform
+    (Item 39's calibration/placement authoring loop) without re-parsing text.
+
+    Every TrackPoint keeps its raw EVO meters, so this is exact: each frame is
+    rebuilt through the same single copy of the transform (``_align_frame``).
+    ``alignment=None`` restores the legacy translation fallback. Returns a new
+    Recording; the input is untouched."""
+    frames = [
+        _align_frame(
+            f.t,
+            [(p.oid, p.cls, p.x_raw_m, p.y_raw_m, p.heading) for p in f.points],
+            recording.anchor_ft, recording.ref_m,
+            None,  # frames were already capped at parse time
+            alignment)
+        for f in recording.frames
+    ]
+    return _dc_replace(recording, frames=frames, alignment=alignment)
 
 
 # --- streaming alignment (ROADMAP Item 33, LIVE_OVERLAY_PLAN.md §2) ----------
@@ -293,6 +327,13 @@ class LiveAligner:
         self._ref_seen = False
         self._zone_fit: ZoneFit | None = None
         self._t = "00:00:00.000"
+        self.zones: tuple[RawZone, ...] = ()  # raw Z; zones, as on Recording
+        # Item 39's seam: an externally-set composed transform overrides the
+        # auto zone-fit one below (Item 40 writes it on calibrate/commit and
+        # group moves; commit mid-session just re-assigns it and the next
+        # feed renders through the update — LIVE_OVERLAY_PLAN drop-to-latest).
+        self.alignment: AlignmentTransform | None = None
+        self._auto_alignment: AlignmentTransform | None = None
 
     @property
     def ref_m(self) -> tuple[float, float]:
@@ -331,8 +372,13 @@ class LiveAligner:
 
             if line.startswith("Z;"):
                 if self._zone_fit is None:  # first usable Z; wins, like C;
-                    self._zone_fit = zonefit.fit(
-                        self._project, zonefit.parse_zline(line))
+                    parsed = zonefit.parse_zline(line)
+                    if parsed and not self.zones:
+                        self.zones = tuple(parsed)
+                    self._zone_fit = zonefit.fit(self._project, parsed)
+                    if self._zone_fit is not None:
+                        self._auto_alignment = AlignmentTransform(
+                            calib={}, placement=self._zone_fit)
                 continue
 
             if _TIME_RE.match(line):
@@ -343,7 +389,7 @@ class LiveAligner:
                 frame = _align_frame(
                     self._t, _parse_frame_entities(line),
                     self.anchor_ft, self._ref, self.max_points_per_frame,
-                    self._zone_fit)
+                    self.alignment or self._auto_alignment)
 
         return frame
 
@@ -444,29 +490,31 @@ def _align_frame(
     anchor: tuple[float, float],
     ref: tuple[float, float],
     max_points_per_frame: int | None,
-    zone_fit: ZoneFit | None = None,
+    alignment: AlignmentTransform | None = None,
 ) -> Frame:
     """Align one raw frame into world feet — the single copy of the transform.
     Both the batch parser and the streaming LiveAligner build every Frame
-    through here. With a ``ZoneFit`` (the recording carried a usable ``Z;``
-    line) each point goes through the fitted similarity; otherwise the plan-
-    §1b translation applies, with its m_to_ft-on-offset / emp-on-anchor
-    split."""
+    through here. With an ``AlignmentTransform`` each point goes through the
+    composed per-sensor-calibration → group-placement pipeline (Item 39; at
+    parse time the calibration layer is empty, so this is exactly the fitted
+    ``Z;`` similarity); otherwise the plan-§1b translation applies, with its
+    m_to_ft-on-offset / emp-on-anchor split."""
     if max_points_per_frame is not None:
         entities = entities[:max_points_per_frame]
 
-    def to_world(x: float, y: float) -> tuple[float, float]:
-        if zone_fit is not None:
-            return zone_fit.apply_m(x, y)
+    def to_world(sensor: int, x: float, y: float) -> tuple[float, float]:
+        if alignment is not None:
+            return alignment.apply(sensor, x, y)
         # y-down on both sides
         return anchor[0] + m_to_ft(x - ref[0]), anchor[1] + m_to_ft(y - ref[1])
 
     points = []
     for oid, cls, x, y, heading in entities:
-        x_ft, y_ft = to_world(x, y)
+        sensor = oid % 10
+        x_ft, y_ft = to_world(sensor, x, y)
         points.append(TrackPoint(
             oid=oid,
-            sensor=oid % 10,
+            sensor=sensor,
             cls=cls,
             x_ft=x_ft,
             y_ft=y_ft,

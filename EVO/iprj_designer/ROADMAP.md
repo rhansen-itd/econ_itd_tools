@@ -46,9 +46,11 @@ phases:
 "Future" items at the bottom aren't scoped yet (no Target/Scope/prompt) —
 they need a planning pass before they're actionable.
 
-> **Temporary routing note (2026-07-08):** Items 28–35 below (the record/
-> playback batch 28–31, now done, and the live-overlay batch 32–35 added the
-> same day) use the owner's stated per-model division — **Fable for the
+> **Temporary routing note (2026-07-08, extended 2026-07-09):** Items 28–35
+> (the record/playback batch 28–31 and the live-overlay batch 32–35, all done)
+> **and the new Items 37–43** (the calibration + interactive-alignment batch
+> 37–40 and the track-stitching/fusion batch 41–43, added 2026-07-09 at the
+> owner's request) use the owner's stated per-model division — **Fable for the
 > hardest item, Sonnet for the routine one, Opus for the architecture
 > session** — which *inverts*
 > [[CLAUDE.md]]'s current Opus-default rule (Fable-as-debugging-escalation).
@@ -460,6 +462,378 @@ Suggested prompt:
 
 ---
 
+## 37 — Overlay Tab Consolidation: merge Record + Live/Replay into one "Overlay" surface (Target: Sonnet — routine) — DONE 2026-07-09
+
+The routine quick-win of the 2026-07-09 batch, and the surface the calibration/
+alignment work (38–40) then builds on. Today Record (Item 31), Replay (Item 30),
+and Live (Item 35) are separate entry points. Fold them into a **single
+"Overlay" tab/tool** with three sub-modes (Record / Replay file / Live stream)
+sharing one host/credentials form and one status line, instead of three
+scattered controls. This is UI consolidation over machinery that already exists
+and works — no new coordinate, engine, or async behavior — so Sonnet, whole item.
+
+Scope:
+- [x] One "Overlay" top-level tool that hosts Record, Replay (file), and Live
+      (stream) as sub-modes; retire the separate entry points without changing
+      their underlying `RecordingSession` / replay-loader / `LiveAligner`
+      wiring. Reuse the shared auth/host form (Live already shares Record's per
+      LIVE_OVERLAY_PLAN §4) for both Record and Live.
+- [x] Keep the read-only-canvas invariant intact for Replay/Live exactly as it
+      is now (that invariant is *relaxed* later by Item 40 — do **not** touch it
+      here; this item is a pure re-grouping so 40 has one clean surface to
+      modify).
+- [x] One consolidated status line (frames/sec, connection state, last-frame
+      time — the Item 34/§6 readout) serving whichever sub-mode is active.
+- [x] No regression to existing record/replay/live behavior; DESIGN_HISTORY
+      entry; check off this item. (Mostly GUI wiring; add/adjust any
+      `effective_mode` tests the sub-mode restructure touches.)
+
+Suggested prompt:
+> [Sonnet] In EVO/iprj_designer, do Item 37 of ROADMAP.md: consolidate the
+> Record, Replay, and Live entry points into a single "Overlay" tool with three
+> sub-modes sharing one host/credentials form and one status line, without
+> changing the underlying RecordingSession / replay-loader / LiveAligner wiring
+> or the read-only-canvas invariant (Item 40 relaxes that later, not here). Land
+> the DESIGN_HISTORY entry.
+
+---
+
+## 38 — Sensor-Transform Layer + Interactive Alignment: Architecture (Target: Opus) — DONE 2026-07-09 → CALIBRATION_ALIGNMENT_PLAN.md
+
+Prerequisite planning session for Items 39–40 — a **decision document, no
+code** (e.g. `CALIBRATION_ALIGNMENT_PLAN.md`), the sibling of
+RECORD_PLAYBACK_PLAN / LIVE_OVERLAY_PLAN for this batch. Opus owns it because
+Items 39–40 inherit every choice, and because it must get the **two distinct,
+composed transforms** right (owner clarification, 2026-07-09 — these are *not*
+two ways of authoring one artifact):
+
+1. **Calibration — relational, background-blind.** Uses the vehicle tracks to
+   make the sensors *agree with each other* about where a given vehicle is. It
+   never references loops/zones/background. Output = a locked set of per-sensor
+   relative corrections; afterward the sensors behave as **one internally-
+   consistent rigid body**. This is the residual/vehicle-pair math (Fable, 39).
+2. **Group placement — visual, background-referenced.** The user moves/rotates
+   that *now-locked* sensor cluster so the vehicle tracks visually sit over the
+   zones/background where they belong. The software **holds the inter-sensor
+   relationship fixed**, so a drag repositions the whole consistent group, not
+   one sensor relative to another. `zonefit.fit()`'s `Z;` global similarity is
+   the *automatic* version of this placement; the manual drag is the override/
+   refinement when that auto-fit is wrong or absent.
+
+Why they're different jobs (the load-bearing distinction to preserve): calibration
+alone **can't** place onto the background — it has no notion of where the
+background is; a group drag alone **can't** fix inter-sensor disagreement — a
+rigid move preserves relative error. So the pipeline composes them in order:
+**EVO frame → per-sensor calibration deltas (sensors agree) → one group rigid
+placement onto the map (auto from zonefit, or hand-adjusted) → world-feet →
+viewport.**
+
+Key framing established with the owner (2026-07-09), to be turned into decisions:
+- **Motivation — the error is upstream and human.** Sensor position/azimuth is
+  set today by eyeballing each sensor against the background *independently*, so
+  the sensors end up **disagreeing with each other** about where vehicles are.
+  Calibration re-estimates that eyeballed placement from vehicle observations so
+  the sensors agree and move as one unit; the locked group is *then* fit to the
+  background under the standing constraint that they still agree.
+- **The two transforms differ in kind, not just in job.** The `Z;` zone transform
+  (stream/recording coords ↔ iprj coords) is an **exact, one-way mathematical
+  derivation** — deterministic, *not* a source of error; zonefit recovers it to
+  float precision. **Vehicle positions are noisy radar approximations**, so
+  calibration is inherently a *statistical* fit over many isolated vehicle pairs
+  (residual minimization + isolation gates, needs volume), **not** a clean
+  closed-form solve like the zone transform. This is exactly why calibration is
+  the hard, Fable-worthy piece (39) and why the guardrails/gates matter.
+- **Calibration is *relational between sensors*, background-independent.**
+  `zonefit.fit()` already recovers **one global similarity** (`a`,`t`) over all
+  sensors' matched `Z;` zones pooled together; its ~5–7 ft residual (Banks) *is*
+  the inter-sensor placement disagreement left by those independent eyeballed
+  placements — the exact thing calibration removes, using vehicle tracks rather
+  than the map. zonefit fits a single global transform, so it *structurally
+  cannot* fix per-sensor disagreement; that's calibration's job. (Owner:
+  calibration is **not** a no-`Z;` fallback.)
+- **Group placement keeps the relationship locked.** The interactive move/rotate
+  operates on the calibrated cluster *as a rigid body* — the software preserves
+  the inter-sensor corrections while the user seats the group onto the
+  background "as they see best," overlay tracking live as they drag.
+- **Preview + commit (the owner's "both").** Both transforms render as a
+  reversible overlay-only state (project untouched); the user can then **commit**
+  the composed result — writing the resolved per-sensor correction back into each
+  iprj sensor's azimuth/position (what `EVO/sensor_calibration.py` recommends) —
+  or keep it as a designer-side layer. Decide the persistence format for the
+  uncommitted state.
+
+Scope — decide and write up (with rationale) each of:
+- [x] **The two-transform representation + compose order.** How the per-sensor
+      calibration deltas and the single group-placement transform are stored and
+      composed: EVO frame → **per-sensor calibration** → **group placement**
+      (auto `zonefit`/`replay` fit, overridable by the manual drag) → world-feet
+      → viewport. Whether calibration is applied in EVO-meter space or world-feet
+      space. Confirm it is one layer shared by both replay and live (reuse the
+      §1b transform; no second copy).
+- [x] **Relational calibration solver seam.** Generalize
+      `EVO/sensor_calibration.py`'s S1→S0 vehicle-pair rigid fit to **N sensors
+      (3+)** and to a joint "make all sensors agree" solve (background-blind).
+      Decide the reference (sensor-0 anchor vs. joint least-squares over all
+      pairs), the pairing/isolation gates, and what "locked relationship" means
+      numerically (the corrections that make the group internally consistent).
+      This is the piece the owner flagged for Fable review (Item 39).
+- [x] **Group-placement handle.** How the auto placement (zonefit's global
+      similarity) is exposed as an editable group transform, and how the manual
+      drag overrides/refines it while the calibration deltas stay locked
+      underneath. When there's no `Z;`, the group placement starts from the
+      existing translation fallback and is placed by hand.
+- [x] **Interactive-authoring UX / persist-into-edit.** How the live/replay
+      overlay **persists into draw/edit mode** (relaxing Item 30/35's
+      read-only-mode invariant — the load-bearing GUI change), how moving/
+      rotating the sensor group re-renders the overlay in real time, and the
+      lock/unlock affordance (normal use = move the locked group; unlock only to
+      re-run/adjust calibration). Reuse the existing sensor drag/rotate handles.
+- [x] **Preview → commit.** Format for the uncommitted state (sidecar keyed to
+      project? in-memory only?), and the commit path that folds the composed
+      (calibration ∘ placement) result into per-sensor iprj azimuth/position —
+      including the sign/units math (world-feet transform → iprj sensor azimuth
+      degrees + meter/pixel position) and how re-loading a committed project then
+      reads ≈identity.
+- [x] **Apply to live *and* recording.** How the composed transform feeds both
+      the Item 30 replay render and the Item 35 live render (one path, both), and
+      whether committing mid-session re-aligns an in-flight live overlay.
+- [x] **Guardrails / degeneracy.** Too-few pairs, collinear pairs, a sensor with
+      no matched pairs (it can't be calibrated — keep its uncorrected position
+      and flag it), and how the whole flow behaves on a site with no `Z;` (group
+      placement is manual from the translation fallback; calibration still runs
+      if there are vehicle pairs).
+- [x] Output the plan as a design doc under `EVO/iprj_designer/` and log the
+      decisions in [[DESIGN_HISTORY.md]] — no feature code this session.
+      *(→ [[CALIBRATION_ALIGNMENT_PLAN.md]] + DESIGN_HISTORY entry.)*
+
+Suggested prompt:
+> [Opus] In EVO/iprj_designer, do Item 38 of ROADMAP.md: produce the
+> architecture/decision document unifying vehicle-pair calibration and the
+> "move/rotate a sensor to align the overlay" gesture as one **per-sensor
+> overlay transform** composed on top of zonefit's global fit (transform-of-a-
+> transform, refine-residual only). Decide the transform layer + compose point,
+> the N-sensor relational solver seam (generalizing EVO/sensor_calibration.py),
+> the persist-overlay-into-edit interactive authoring UX, the preview→commit-to-
+> iprj path with sign/units math, apply-to-live-and-recording, and guardrails.
+> Land the doc and DESIGN_HISTORY entry — no feature code.
+
+---
+
+## 39 — Per-Sensor Transform Engine + N-Sensor Calibration Solver in `model/` (Target: Fable — hardest) — needs Item 38
+
+The correctness-critical core: a **pure, headless** transform layer that composes
+the two transforms Item 38 defines, plus the relational vehicle-pair calibration
+solver. Hardest, most bug-prone piece — the background-blind multi-sensor "make
+the sensors agree" least-squares, and the coordinate/sign math composing those
+per-sensor deltas with the group placement into world-feet — and the owner
+explicitly asked for Fable review/improvement of the existing solver, hence Fable.
+
+Scope:
+- [x] The composed transform in `model/` (e.g. `model/calibration.py` or an
+      extension of `replay.py`/`zonefit.py` per Item 38): **per-sensor
+      calibration deltas → group placement → world-feet**, in Item 38's compose
+      order and space. One layer used by both replay and live, reusing the
+      existing transform (no second copy of the coordinate math).
+- [x] **Relational calibration solver** — port + generalize
+      `EVO/sensor_calibration.py` to **N sensors (3+)**: the isolated-pair finder
+      and the rigid/similarity least-squares, retargeted from a raw S1→S0 fit to
+      a joint, **background-blind** solve that makes all sensors agree (the locked
+      inter-sensor relationship). It reads only vehicle pairs, never the map.
+- [x] **Group-placement transform** — the editable rigid transform that seats the
+      calibrated cluster onto the map, seeded from the existing `zonefit`/
+      translation fit and overridable (the value Item 40's drag writes). Keep it
+      one rigid transform over the whole locked group.
+- [x] The commit math (composed calibration ∘ placement → per-sensor iprj azimuth
+      + position) as a pure function, so Item 40 just calls it; round-trips so a
+      committed project re-loads to ≈identity.
+- [x] Robustness/guardrails from Item 38: too-few/collinear pairs, a sensor with
+      no pairs (uncalibrated, flagged — not silently identity-merged), never
+      raise on degenerate input.
+- [x] pytest coverage against a real multi-sensor site fixture under `sites/**`
+      (read-only; output to `tests/out/`/scratchpad), including: a calibration
+      recovery test (perturb one sensor's frame, recover the delta that re-agrees
+      it), group-placement compose-order correctness (a group move lands markers
+      where expected on the background *without* changing inter-sensor
+      agreement), and a commit→reload ≈identity round-trip.
+- [x] DESIGN_HISTORY entry; check off this item.
+
+Suggested prompt:
+> [Fable] In EVO/iprj_designer, do Item 39 of ROADMAP.md following Item 38's
+> design: build the pure composed transform (per-sensor calibration deltas →
+> group placement → world-feet) plus the N-sensor **relational, background-blind**
+> vehicle-pair calibration solver (generalizing EVO/sensor_calibration.py to make
+> all sensors agree), the editable group-placement transform seeded from the
+> zonefit fit, and the commit math (composed → per-sensor iprj azimuth/position),
+> all as pure functions. Keep it GUI-free; pytest calibration-recovery,
+> group-placement compose-order, and commit→reload-≈identity against a real
+> multi-sensor site.
+
+---
+
+## 40 — Interactive Alignment Mode + Apply Calibration to Live/Recording (Target: Opus) — DONE 2026-07-10 — needs Items 38 & 39
+
+Wire the Item 39 engine into the NiceGUI shell: **persist the overlay into
+draw/edit** (relaxing the read-only-mode invariant), let the user move/rotate
+the calibrated sensor group to seat the overlay on the background with live
+feedback, and expose preview→commit. New GUI seam + the invariant change → Opus.
+
+Scope:
+- [x] Relax the read-only-canvas invariant so a Replay/Live overlay **persists
+      into draw/edit mode** (per Item 38) — the marker layer stays live while
+      sensor drag/rotate handles are active; keep the separate `replay_layer`
+      + `pointer-events:none` machinery, drive it off the same transform.
+      *(Realized as a new non-read-only **Overlay › Align** sub-mode — the
+      marker layer stays live over an editable canvas whose drag/rotate seats
+      the group; a cleaner single surface than threading markers through every
+      Draw/Edit tool, see DESIGN_HISTORY.)*
+- [x] **Group placement (the normal gesture):** moving/rotating a sensor drags
+      the whole calibrated cluster as a **rigid body** (inter-sensor relationship
+      held locked by Item 39's calibration) and re-renders the overlay through the
+      composed transform **in real time**, for both live and loaded-recording
+      overlays — the user seats the tracks over the zones/background by eye.
+      *(Left-drag → `translated(G)`; 2-click Rotate-group → `rotated_about(G)`;
+      markers re-align from raw meters through `current_alignment()` per render.)*
+- [x] "Auto-calibrate" action that runs the Item 39 **relational** solver over the
+      current live/recorded pairs (makes the sensors agree — background-blind) and
+      locks the result; an **unlock** affordance to re-run/adjust it. This is a
+      distinct step from group placement, per Item 38. *(Solves over the
+      recording's frames or a bounded live-frame buffer; unlock → per-sensor
+      `Cᵢ` nudge via `nudged_delta`.)*
+- [x] Preview→commit UI: apply as reversible overlay state, or commit the composed
+      result into per-sensor iprj azimuth/position (Item 39's commit math) with
+      confirm + undo. *(In-memory until an explicit Commit; confirm dialog +
+      snapshot-backed Undo button; calibration stays applied to the uncorrected
+      recording so the overlay doesn't jump, plan §5d.)*
+- [x] Guardrails surfaced (pair count / residual / degenerate sensor), and the
+      Item 20/30 performance carries over (marker-layer-only rewrite; don't
+      re-render the static SVG on every drag tick).
+- [x] DESIGN_HISTORY entry; check off this item. (Model-side helpers get pytest
+      coverage; GUI wiring exercised by hand + a headless transform check.)
+
+Suggested prompt:
+> [Opus] In EVO/iprj_designer, do Item 40 of ROADMAP.md on top of Items 38–39:
+> persist the Replay/Live overlay into draw/edit mode; make moving/rotating a
+> sensor drag the whole calibrated group as a rigid body and re-render the
+> overlay live (group placement onto the background); add a distinct
+> auto-calibrate action that runs the relational solver over the current pairs
+> and locks the inter-sensor agreement; and a preview→commit path that writes the
+> composed result into per-sensor iprj azimuth/position. Reuse Item 30's
+> marker-layer-only rewrite for performance. Land the DESIGN_HISTORY entry.
+
+---
+
+## 41 — Track Stitching / Fusion: Architecture (Target: Opus) — reviews prior art + data first
+
+Prerequisite planning session for Items 42–43 — a **decision document, no
+code**. Previous fusion attempts (`../fusion_visualizer.py` ~100 KB,
+`../fusion_strict_logic.html`) failed under Sonnet/other models, so the owner
+wants Opus to **review the prior art *and* the raw data first**, then decide
+salvage-vs-clean-room before Fable builds the engine (owner's explicit choice,
+mirroring how Items 28/32 were scoped). Opus owns it because 42–43 inherit the
+approach and the failure post-mortem.
+
+Two distinct stitching problems the owner named, both in scope:
+- **Cross-sensor fusion** — the same real vehicle seen by multiple sensors
+  becomes **one** fused trajectory (dedup in overlap + continuous ID across
+  sensor-to-sensor handoff).
+- **Within-sensor stitching** — an object tracked into e.g. the intersection
+  that **stops, drops, and re-appears as a new object** when it moves again must
+  be re-joined into one continuous track. Temporal-gap + spatial-plausibility
+  bridging, not just cross-sensor merging.
+
+Scope — decide and write up (with rationale) each of:
+- [ ] **Prior-art post-mortem.** Read `../fusion_visualizer.py` /
+      `../fusion_strict_logic.html` and the raw recordings; document *why* prior
+      attempts failed and what (if anything) is salvageable vs. clean-room in
+      `model/`. Note that this per-sensor calibration batch (38–40) removes the
+      inter-sensor offset that likely sabotaged earlier cross-sensor matching —
+      decide whether stitching should **depend on** a calibrated overlay.
+- [ ] **Data model & seam.** Where fusion sits relative to the aligned `Frame`
+      stream (`model/replay.py`) — a pure transform over aligned frames producing
+      fused track IDs — keeping `model/` pure and headless-testable.
+- [ ] **Within-sensor gap-bridging policy.** Gap time/distance windows, heading/
+      speed continuity, the "stopped in the intersection then resumed" case; how
+      to bridge without wrongly merging two different vehicles.
+- [ ] **Cross-sensor association policy.** Overlap-zone dedup + handoff ID
+      continuity; whether it runs after calibration (38–40) and how much it
+      relies on that alignment quality.
+- [ ] **Batch vs. streaming.** Whether fusion must also run incrementally on the
+      live path (`LiveAligner`) or is replay/batch-first; the state a streaming
+      stitcher would carry.
+- [ ] **Success criteria & test strategy.** Concrete, checkable acceptance
+      (e.g. N hand-labeled trajectories on a real recording that must fuse into
+      M), so Item 42 has a real correctness gate — the thing prior attempts
+      lacked.
+- [ ] Output the plan as a design doc under `EVO/iprj_designer/` and log the
+      decisions in [[DESIGN_HISTORY.md]] — no feature code this session.
+
+Suggested prompt:
+> [Opus] In EVO/iprj_designer, do Item 41 of ROADMAP.md: produce the
+> architecture/decision document for track stitching + fusion. First post-mortem
+> the prior art (../fusion_visualizer.py, ../fusion_strict_logic.html) and the
+> raw data and decide salvage-vs-clean-room. Design both within-sensor
+> gap-bridging (stop/drop/resume) and cross-sensor fusion (overlap dedup +
+> handoff ID) as a pure transform over aligned Frames, decide batch-vs-streaming,
+> and set concrete success criteria/test strategy. Land the doc and
+> DESIGN_HISTORY entry — no feature code.
+
+---
+
+## 42 — Fusion Engine in `model/` (Target: Fable — hardest) — needs Item 41
+
+The correctness-critical core the owner most wants Fable on (prior non-Fable
+attempts failed): a **pure, headless** stitching engine over the aligned `Frame`
+stream — within-sensor gap-bridging **and** cross-sensor fusion, per Item 41's
+design, gated by Item 41's success criteria.
+
+Scope:
+- [ ] A pure `model/` stitcher (e.g. `model/fusion.py`) consuming aligned
+      `Frame`s (Item 29) and emitting fused track IDs — within-sensor bridging
+      (stop/drop/resume) + cross-sensor association (overlap dedup + handoff),
+      per Item 41. Optionally consumes the calibrated overlay (Item 40) if 41 so
+      decided.
+- [ ] Streaming variant only if Item 41 required it (state carried across
+      frames), reusing the batch logic — no second copy.
+- [ ] pytest against Item 41's labeled acceptance set on a real recording
+      (read-only fixtures; output to `tests/out/`/scratchpad): the hand-labeled
+      trajectories fuse into the expected fused tracks; adversarial "don't merge
+      these two distinct vehicles" cases hold.
+- [ ] DESIGN_HISTORY entry; check off this item.
+
+Suggested prompt:
+> [Fable] In EVO/iprj_designer, do Item 42 of ROADMAP.md following Item 41's
+> design: build the pure `model/` fusion engine over aligned Frames — within-
+> sensor gap-bridging (stop/drop/resume) and cross-sensor dedup+handoff — gated
+> by Item 41's labeled acceptance tests on a real recording. Keep it GUI-free;
+> include the adversarial don't-merge cases.
+
+---
+
+## 43 — Fusion Overlay Wiring (Target: Opus) — needs Item 42
+
+Wire the Item 42 engine into the overlay render: show **fused** tracks (one
+marker/ID per real vehicle) with a raw↔fused toggle, on both replay and live.
+New GUI seam → Opus.
+
+Scope:
+- [ ] Feed the aligned frame stream through the Item 42 stitcher and render fused
+      track IDs on the existing marker layer (Item 30/35), both replay and live.
+- [ ] A raw↔fused toggle so the user can compare; consistent fused-ID labelling/
+      colour (à la `evo_replay`), reusing the marker layer — no static-SVG
+      re-render (Item 20/30 performance).
+- [ ] Streaming fusion on the live path only if Item 41/42 built it; otherwise
+      fused view is replay/batch and live shows raw.
+- [ ] DESIGN_HISTORY entry; check off this item. (Model helpers pytested; GUI
+      wiring by hand + a headless fused-render check.)
+
+Suggested prompt:
+> [Opus] In EVO/iprj_designer, do Item 43 of ROADMAP.md: wire the Item 42 fusion
+> engine into the overlay render — fused track IDs on the existing marker layer
+> with a raw↔fused toggle, on replay (and live if 41/42 built streaming fusion),
+> reusing Item 30's marker-layer-only rewrite. Land the DESIGN_HISTORY entry.
+
+---
+
 ## 10 — Webserver Deployment (Target: Opus)
 
 Carried over unchanged from the earlier "Phase 5" round (not started, not
@@ -507,5 +881,11 @@ Suggested prompt:
   for legacy captures that never recorded one (fold into the `calibrate.py`
   item below only if that case ever matters). Robustness to a stale/edited
   iprj (partial zone matching + outlier rejection) is scoped as Item 36 above.
-- Integrate the line-up/calibrate workflow (see
-  `~/pyatspm/src/atspm/video/calibrate.py`) more directly into the app.
+- (Now scoped as Items 38–40 above: the calibrate/line-up workflow — two
+  composed transforms: **relational vehicle-pair calibration** (makes the
+  sensors agree with each other, background-blind) plus a **group placement**
+  the user seats onto the zones/background by moving/rotating the locked sensor
+  cluster, with preview→commit into the iprj. Interaction reference:
+  `~/pyatspm/src/atspm/video/calibrate.py`.)
+- (Now scoped as Items 41–43 above: track stitching / fusion — within-sensor
+  gap-bridging + cross-sensor fusion into one trajectory per vehicle.)

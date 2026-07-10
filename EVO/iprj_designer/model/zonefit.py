@@ -36,9 +36,13 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Mapping
 
 from .iprj_io import Project, Sensor
 from .units import effective_meter_per_pixel, m_to_ft, px_to_ft
+
+if TYPE_CHECKING:
+    from .calibration import RigidDelta
 
 # Fallback gates: below MIN_ZONES a similarity is under-constrained in
 # practice; below MIN_SPREAD_FT the lever arm is too short to trust the
@@ -153,8 +157,21 @@ def _centroid(pts: list[tuple[float, float]]) -> tuple[float, float]:
     return (sum(p[0] for p in pts) / n, sum(p[1] for p in pts) / n)
 
 
-def fit(project: Project, zones: list[RawZone]) -> ZoneFit | None:
-    """Similarity over matched zone centroids; None → keep translation."""
+def fit(
+    project: Project,
+    zones: list[RawZone],
+    calib: Mapping[int, RigidDelta] | None = None,
+) -> ZoneFit | None:
+    """Similarity over matched zone centroids; None → keep translation.
+
+    *calib* (optional, keyed by ``Z;`` slot) is Item 39's calibrated group
+    refit: each zone centroid is pushed through its slot's per-sensor rigid
+    correction before the least-squares, so the similarity seats the
+    *calibrated* cluster (CALIBRATION_ALIGNMENT_PLAN.md §1 — one LS kernel,
+    two callers, no second copy of the math). A rigid map commutes with the
+    centroid, so transforming the centroid equals transforming the vertices.
+    None / missing slots are identity — bit-identical to today's fit.
+    """
     mapping = match_slots(project, zones)
     if not mapping:
         return None
@@ -170,9 +187,12 @@ def fit(project: Project, zones: list[RawZone]) -> ZoneFit | None:
         stream_zones = (
             [z for z in zones if z.slot == slot and not z.is_ignore]
             + [z for z in zones if z.slot == slot and z.is_ignore])
+        delta = calib.get(slot) if calib is not None else None
         # match_slots guarantees the two lists pair up index-for-index
         for zs, zi in zip(stream_zones, iprj_zones):
             ec = _centroid(list(zs.points_m))
+            if delta is not None:
+                ec = delta.apply_m(*ec)
             mc = _centroid(list(zi.points))
             evo.append(complex(m_to_ft(ec[0]), m_to_ft(ec[1])))
             world.append(complex(px_to_ft(mc[0], emp), px_to_ft(mc[1], emp)))

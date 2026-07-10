@@ -2692,6 +2692,233 @@ Suggested prompt:
     captures carry `Z;`; a follow-up could port the same fit to the standalone
     `evo_replay.py`, which remains translation-only.
 
+- 2026-07-09 — **ROADMAP Item 37: Overlay tab consolidation (Sonnet, one
+  session)** — pure UI re-grouping, no engine/coordinate changes. Record
+  (Item 31), Replay (Item 30), and Live (Item 35) were three independent
+  entry points (Replay/Live as top-level toolbar tools, Record as a button
+  only reachable from inside Replay). Folded into one **"Overlay" top-level
+  tool** with a **Record/Replay/Live sub-kind toggle**, mirroring how
+  Sensor/Centerline already sit as Draw sub-kinds (Item 24):
+  - **`effective_mode`** grew a third parameter, `overlay_kind_val` (default
+    `"Replay"`): when `tool_val == "Overlay"` it returns the sub-kind
+    directly — Record/Replay/Live are unchanged as *modes*, only their
+    top-level entry point moved. `change_tool`/`change_draw_kind` now thread
+    `overlay_kind_toggle.value` through; a new `change_overlay_kind` handler
+    is the Overlay-tool sibling of `change_draw_kind`.
+  - **Record became a real mode** (`v.mode == "Record"`) instead of a modal
+    dialog floating over whatever mode was active. It falls into the
+    read-only-canvas invariant "for free" — the mouse/keyboard handlers were
+    already `elif`-chains that don't recognize it, the same mechanism that
+    already made Replay/Live read-only (Item 37 was told not to touch that
+    invariant, and didn't need to). Leaving Record does *not* stop an
+    in-progress capture (`record_status_timer.active` just turns off) —
+    same "close ≠ stop" model the old dialog already had.
+  - **One consolidated status line.** Added a `"Record"` branch to
+    `refresh_status()` (host, frames, fps/error/connecting/stopped — same
+    shape as the existing Live branch) fed by a new `_active_record_session()`
+    helper (prefers a running session, else the most recently started one)
+    and a new `record_status_timer` (0.5 s, active only in Record mode) so
+    the toolbar status line stays live even with the Record dialog closed —
+    it no longer only updates via the dialog-local poll.
+  - **Shared host/credentials form.** LIVE_OVERLAY_PLAN §4 called Live
+    "sharing" Record's auth form, but the two dialogs actually each
+    re-declared an identical widget block. Extracted a real `_host_auth_form()`
+    (known-hosts picker + host/user/password inputs) that both
+    `open_record_panel` and `open_live_connect` now call — the first actual
+    shared builder, not just a shared `known_hosts()` data source.
+  - **Load-into-Replay hand-off.** `set_recording()` (called by both the
+    manual Replay file-load path and the Record panel's "Load into Replay")
+    now also does `tool.value = "Overlay"; overlay_kind_toggle.set_value(
+    "Replay")` so loading a recording always lands the user looking at its
+    transport controls and status, regardless of which sub-mode they loaded
+    it from — a no-op when already there.
+  - **Tests.** `tests/test_toolbar_modes.py`'s Replay/Live-specific
+    `effective_mode` test was replaced with
+    `test_overlay_tool_resolves_to_its_subkind_ignoring_draw_subkind` (all
+    three sub-kinds) plus a default-value test. Full suite: 562 passed.
+    Verified headless: `python -m gui.app <fixture>.iprj` serves HTTP 200
+    with no server-side exceptions, and the rendered page shows the new
+    "Overlay" tool + "Record"/"Replay"/"Live" sub-kind toggle in place of the
+    old five-way top-level toggle. Checked off Item 37 in ROADMAP.md.
+
+- 2026-07-09 — **ROADMAP Item 38: Sensor calibration & interactive alignment
+  architecture (Opus)** — decision document only, no code. Full write-up in
+  [CALIBRATION_ALIGNMENT_PLAN.md], the sibling of RECORD_PLAYBACK_PLAN.md (RPP)
+  and LIVE_OVERLAY_PLAN.md (LOP) for the 38–40 batch. Key resolutions:
+  - **Two transforms, different in kind, composed in order** (the load-bearing
+    owner distinction): `EVO frame → per-sensor calibration Cᵢ (sensors agree,
+    background-blind, from vehicles) → group placement G (cluster seated on the
+    map, one transform, from Z; zones or a hand drag) → world-feet`. Calibration
+    alone can't place onto the background; a group drag alone can't fix
+    inter-sensor disagreement — so they *must* compose, in that order.
+  - **The exact/approximate split made operational.** `G` from `Z;` is an
+    exact vendor-derived similarity `zonefit` already recovers to float
+    precision — reproducible every load, nothing to persist. Calibration is a
+    *statistical* rigid fit over noisy radar vehicle pairs — the part that
+    re-estimates genuine human eyeballing, and the only part that **commits**
+    into the iprj (per-sensor `azimuth`/`position`).
+  - **Zero-regression reduction.** With no vehicle pairs every `Cᵢ = identity`,
+    `G` is fit on the same centroids as today, and the whole pipeline collapses
+    to **exactly** current `zonefit` (or the translation fallback with no `Z;`).
+    Calibration is a strict superset; a site with no new vehicle data renders
+    unchanged.
+  - **One pure `AlignmentTransform` in new `model/calibration.py`**, threaded
+    through `_align_frame` in place of `zone_fit` — so **replay and live inherit
+    calibration from the one seam** (RPP §1b / LOP §2 single-copy discipline).
+    Calibration applies in **EVO-meter space, per-sensor, before** placement;
+    `G` stays the world-feet output. `_align_frame`'s `to_world` gains the
+    point's `sensor` (`oid % 10`).
+  - **The solver is the rigid sibling of `zonefit`'s similarity solver** — the
+    same pure-Python complex-number least-squares, normalized to unit modulus
+    (pure rotation, no scale; sensors share physical scale, only position/azimuth
+    are wrong). **Explicitly re-implemented, not ported:**
+    `EVO/sensor_calibration.py`'s scipy/pandas/numpy stay out of `model/` (none
+    is a model dependency and none may become one). Reference-anchored pairwise
+    (`C₀ = identity` as the gauge fix) for the first cut; joint N-sensor
+    least-squares over a weak/disconnected overlap graph noted as the upgrade.
+    Isolation/coarse-match/volume gates generalized from `sensor_calibration.py`.
+  - **`G` refit on *calibrated* centroids** (push each zone centroid through its
+    sensor's `Cᵢ`, then reuse `zonefit`'s LS — no second copy) so the two layers
+    compose consistently; identical to today's fit when `Cᵢ = identity`.
+  - **Interactive UX = relax the read-only invariant** (Item 30/35) so the
+    overlay persists into draw/edit on the same `replay_layer` +
+    `pointer-events:none` machinery — the load-bearing GUI change Item 37 was
+    told to leave for here. Gesture split: **locked** sensor drag/rotate moves
+    the whole calibrated cluster as a rigid body (edits `G`, real-time
+    marker-layer-only re-render); a distinct **Auto-calibrate** action runs the
+    solver and locks; **unlock** exposes per-sensor `Cᵢ` adjustment. Normal use
+    = locked (move the group); unlock is the rare "auto-calibration is wrong"
+    path.
+  - **Preview → commit.** Uncommitted alignment is in-memory session state
+    (reversible, project untouched); an optional `*.align.json` sidecar for a
+    manual no-`Z;` placement is deferred. Commit writes **only calibration**
+    into per-sensor `azimuth`/`position` via the "rotate about the sensor's own
+    position, then move the sensor" decomposition (`azimuth ± θ`,
+    `position = Cᵢ(pos)`); the azimuth-write **sign** is the one bug-prone line,
+    pinned by a commit→reload **≈identity round-trip test** (approximate, not
+    float-exact — it's a statistical fit, validated against a re-capture).
+  - **Guardrails (refuse-don't-guess).** Too-few/collinear pairs or a sensor with
+    no pairs → that sensor stays uncalibrated + **flagged**, never fit to noise;
+    degenerate solves return identity+flag, never raise. Per-sensor pair-count/
+    residual + `G`'s residual surfaced for a fit-quality readout (Item 40).
+  - **Downstream (§8 table):** Item 39 (Fable) owns the pure transform + N-sensor
+    solver + commit math with three pytest gates (calibration recovery,
+    group-placement compose-order, commit→reload ≈identity) against a real
+    multi-sensor site; Item 40 (Opus) owns the invariant relaxation, the
+    locked-group vs. unlocked-per-sensor gestures, auto-calibrate, and
+    preview→commit. Checked off Item 38's boxes in ROADMAP.md.
+
+- 2026-07-09 — **ROADMAP Item 39: Per-sensor transform engine + N-sensor
+  calibration solver in `model/` (Fable)** — the pure, headless core of the
+  38–40 batch, implementing CALIBRATION_ALIGNMENT_PLAN.md exactly. New
+  `model/calibration.py`; no GUI code (Item 40's surface).
+  - **The composed transform.** `RigidDelta` (per-sensor rigid correction,
+    EVO meters, unit-modulus complex rotation) + `Placement` (a `ZoneFit`-
+    shaped editable similarity) + `AlignmentTransform` (calib dict → group
+    placement, plan-§1 order). `_align_frame` now takes an
+    `AlignmentTransform` instead of a bare `ZoneFit` — the one seam both
+    `parse_recording` and `LiveAligner` render through. At parse time the
+    calibration layer is empty, so existing recordings align **bit-for-bit**
+    as before (the plan-§0 reduction; asserted `==` in tests). A sensor
+    missing from `calib` passes through untouched — a refused solve can
+    never silently move a sensor.
+  - **The solver.** Reference-anchored (`C₀ = identity` gauge) closed-form
+    complex least-squares — the rigid sibling of `zonefit`'s similarity
+    solve, multiplier normalized to unit modulus — replacing
+    `sensor_calibration.py`'s scipy Powell search; `model/` stays free of
+    numpy/pandas/scipy. Pair gates generalized per sensor: isolation 15 m,
+    coarse match 10 m, `MIN_PAIRS` 50, plus a `MIN_SPREAD_M` 15 m lever-arm
+    gate (the zonefit `MIN_SPREAD_FT` analogue → translation-only + flag)
+    and a `MAX_MEAN_RESIDUAL_M` 5 m refuse gate (non-rigidly inconsistent
+    pairs → identity + flag). `Calibration`/`SensorCalibration` carry
+    per-sensor status, pair count, and residuals for Item 40's fit-quality
+    readout; nothing raises on degenerate input.
+  - **`G` refit on calibrated centroids.** `zonefit.fit` gained an optional
+    `calib=` mapping — centroids are pushed through their slot's `Cᵢ` before
+    the LS (one kernel, two callers, no second copy); identity deltas are
+    bit-identical to today's fit. `Recording`/`LiveAligner` now retain the
+    raw `Z;` zones so the refit can re-run without re-parsing, and
+    `replay.realign()` re-aligns a parsed Recording through a new transform
+    from the preserved raw meters. `LiveAligner.alignment` is the external
+    override Item 40 writes (auto `Z;` fit stays the fallback).
+  - **Commit math** (`committed_sensor_config` / pure `commit_calibration`):
+    azimuth gains `+θ` — the `sensor_calibration.py` "ADD θ°" sign, pinned
+    by the round-trip test — and the position is the conjugated rigid map
+    `G(Cᵢ(G⁻¹(pos)))` in the post-`normalize_origin` world-px frame.
+    `slot_to_sensor` defaults from the `ZoneFit` signature match.
+  - **Real-data results (US95&SH8 fixture, the three plan-§8 gates).**
+    Sensor 1 solves against sensor 0 over 483 isolated pairs: θ = +0.72°,
+    |d| ≈ 7.2 m, mean residual 1.8 m; sparse stream ids 4/5 correctly refused
+    (too few pairs). Commit→re-solve lands ≈identity (0.15°, 0.45 m — the
+    honest-scope statistical bound); an injected 1.5°/2.2 m perturbation is
+    recovered to 0.23°/0.47 m; a group move relands markers through the
+    exact expected world rigid map with cross-sensor distances locked.
+    22 tests in `tests/test_calibration.py`; suite 584 pass. Checked off
+    Item 39 in ROADMAP.md.
+
+- 2026-07-10 — **ROADMAP Item 40: Interactive alignment mode + apply
+  calibration to live/recording (Opus)** — wired the Item 39 engine into the
+  NiceGUI shell as a new **Overlay › Align** sub-mode, closing the 38–40
+  batch. All GUI wiring plus one small tested model helper; no iprj
+  format-contract change (commit writes existing `azimuth_angle`/`position_x/y`).
+  - **A dedicated "Align" sub-mode (the read-only-invariant relaxation).**
+    Rather than thread the marker overlay through every draw/edit tool, Align
+    is a fourth Overlay sub-kind (beside Record/Replay/Live) that is the *first
+    non-read-only overlay mode*: the `replay_layer` + `pointer-events:none`
+    marker layer stays live over a canvas whose sensor drag/rotate now edits
+    the overlay transform, so the user watches the tracks seat onto the zones
+    as they align. This realizes plan §4's intent within this toggle-based UI
+    (a clean, single surface) instead of relaxing the invariant piecemeal
+    across Draw/Edit/Sensor — noted here as a deliberate, plan-faithful
+    scoping call. `effective_mode("Overlay", …, "Align") == "Align"`.
+  - **Markers re-align live from raw meters.** `Viewer._marker_svg` gained an
+    optional `align=` — in Align mode each point is re-projected from its raw
+    EVO meters through `current_alignment()` every render, so a group drag/
+    rotate re-seats the markers with a **marker-layer-only rewrite** (never the
+    static SVG — the Item 20/30 performance lesson, plan §6), no whole-recording
+    realign per tick. `align_source_frame()` prefers a fresh live slot over the
+    current replay frame and honors `LIVE_STALE_TIMEOUT`.
+  - **Group placement = the normal (locked) gesture.** A left-drag translates
+    `G` (`translated`); a 2-click Rotate-group arms/commits via `rotated_about`
+    about a world-feet pivot — both edit only `G`, so the locked `{Cᵢ}`
+    inter-sensor agreement stays fixed (the cluster moves as a rigid body). The
+    drag recomputes from the drag-start snapshot each move so it can't
+    accumulate rounding.
+  - **Auto-calibrate + lock/unlock.** "Auto-calibrate" runs the Item 39
+    relational solver over the recording's frames — or a bounded rolling buffer
+    of recent **live** frames (`Viewer.live_history`, so the statistical fit has
+    volume on a live overlay too) — refits `G` over the calibrated centroids,
+    and surfaces per-sensor pair-count/residual/flags in the status line. The
+    **lock toggle** switches a drag between moving the whole group (locked) and
+    nudging one sensor's `Cᵢ` position (unlocked) via the new tested
+    `model.calibration.nudged_delta` (a world-feet drag → the pre-placement
+    meter translation `ft_to_m(Δw / a)`, rotation untouched).
+  - **Preview → commit.** All state is in-memory (plan §5a); an explicit
+    **Commit** folds `{Cᵢ}` into per-sensor `azimuth`/`position` via
+    `commit_calibration` behind a confirm dialog, snapshots the prior values for
+    an **Undo** button, and leaves the calibration applied to the (still
+    uncorrected) loaded recording so the overlay doesn't jump — the write
+    persists the mounting correction for the field device / future captures,
+    matching the model's commit→re-solve-≈identity contract. `slot_to_sensor`
+    for the commit is taken off the source's `Z;` fit, not the (possibly
+    manually-dragged, mapping-free `Placement`) current placement.
+  - **One path, both sources.** Leaving Align bakes the authored transform into
+    the sources (`realign` the recording once; set `LiveAligner.alignment`) so
+    Replay/Live keep it; the live session survives Live↔Align so alignment runs
+    on a live overlay, with `_push_live_alignment` routing new live frames
+    through the transform (drop-to-latest, plan §6).
+  - **Tests.** New `model.calibration.nudged_delta` with a unit test (a drag
+    moves the sensor's markers by exactly Δw, rotation held; degenerate
+    placement passes through); `tests/test_align_gui.py` drives the `Viewer`
+    compose/render seam headless against the real US95&SH8 recording
+    (current_alignment matches the model transform; a group move re-seats the
+    SVG; markers derive from raw meters not precomputed feet; live-slot
+    precedence + staleness); `effective_mode("Align")` in test_toolbar_modes.
+    The button-handler closures (switch-to-Align → seed, Auto-calibrate over
+    the real recording, lock, reset) were smoke-driven headless against the
+    auto-index client, and the page builds headless. Full suite **589 pass**.
+    Checked off Item 40 in ROADMAP.md.
+
 ## Appendix — example template (acceptance case, revised for Items 15/17/18)
 
 45 mph approach, lanes `12' L | 12' T | 12' T | 12' R`, count loops, starting

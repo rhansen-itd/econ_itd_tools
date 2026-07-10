@@ -163,6 +163,7 @@ import argparse
 import asyncio
 import atexit
 import base64
+import collections
 import io
 import math
 import os
@@ -201,8 +202,13 @@ from model.multifile import (MAX_SENSORS, BackgroundMismatch,
                              check_background_match, is_multifile,
                              is_valid_pair, merge_pair, pair_paths,
                              pair_role, split_project)
+from model.calibration import (IDENTITY, AlignmentTransform, Placement,
+                               RigidDelta, build_alignment, calibrate,
+                               commit_calibration, nudged_delta, rotated_about,
+                               translated)
 from model.replay import (Frame, LiveAligner, Recording, load_recording,
-                          marker_color, short_id)
+                          marker_color, realign, short_id)
+from model.zonefit import ZoneFit
 from model.templates import (DIRECTIONS, PlacementContext, expand_and_place,
                              expand_and_place_on_centerline, load_template,
                              missing_placeholders)
@@ -258,20 +264,25 @@ MODE_SUBKINDS = ("Centerline", "Sensor")
 _GENERAL_KEY = "G"
 
 
-def effective_mode(tool_val: str, kind_val: str) -> str:
+def effective_mode(tool_val: str, kind_val: str, overlay_kind_val: str = "Replay") -> str:
     """The effective mode the drawing state machine branches on (ROADMAP
-    Item 24), derived from the top-level tool (Draw/Edit/Background) plus the
-    Draw sub-kind. Sensor and Centerline sub-kinds resolve to their own modes;
-    everything else under Draw is "Draw". Template (Item 27) is a sub-state of
-    "Draw" › Event Zone, not an effective mode, so it never resolves here."""
+    Item 24), derived from the top-level tool (Draw/Edit/Background/Overlay)
+    plus the Draw sub-kind or, for Overlay, the Overlay sub-kind. Sensor and
+    Centerline sub-kinds resolve to their own modes; everything else under
+    Draw is "Draw". Template (Item 27) is a sub-state of "Draw" › Event Zone,
+    not an effective mode, so it never resolves here. Overlay (ROADMAP
+    Item 37) folds Record/Replay/Live into one top-level tool whose
+    Record/Replay/Live sub-kind *is* the effective mode — the three modes
+    themselves are unchanged from Items 30/31/35, only their entry point
+    moved. Align (ROADMAP Item 40) is a fourth Overlay sub-kind: an
+    interactive-alignment mode where the overlay persists over an editable
+    canvas and sensor drag/rotate seats the calibrated group (plan §4)."""
     if tool_val == "Edit":
         return "Edit"
     if tool_val == "Background":
         return "Background"
-    if tool_val == "Replay":
-        return "Replay"  # read-only playback mode (ROADMAP Item 30)
-    if tool_val == "Live":
-        return "Live"  # read-only live-overlay mode (ROADMAP Item 35)
+    if tool_val == "Overlay":
+        return overlay_kind_val  # "Record" | "Replay" | "Live" | "Align"
     if kind_val == "Centerline":
         return "Centerline"
     if kind_val == "Sensor":
@@ -486,6 +497,32 @@ class Viewer:
         self.live_cb = None  # the subscribed callback, kept so we can unsubscribe
         self.live_frame: tuple[Frame, float] | None = None
         self.live_labels = True
+        # Rolling buffer of live frames (Item 40): auto-calibrate needs many
+        # frames' worth of vehicle pairs (the statistical fit needs volume,
+        # plan §2c/§7), but the live path keeps only the newest slot for the
+        # drop-to-latest render. This bounded deque retains recent live frames
+        # so "Auto-calibrate" has real data on a live overlay too, not only a
+        # loaded recording. Bounded, so a long live session can't grow it.
+        self.live_history: collections.deque = collections.deque(maxlen=3000)
+        # Interactive alignment (ROADMAP Item 40, CALIBRATION_ALIGNMENT_PLAN.md
+        # §4): the overlay's composed transform is authored here, in-memory and
+        # reversible (plan §5a — the Project is untouched until an explicit
+        # Commit). `align_placement` is the group transform G a locked drag/
+        # rotate edits as a rigid body; `align_calib` is the per-sensor
+        # calibration {Cᵢ} an Auto-calibrate solves and holds *locked* beneath G
+        # (unlock to hand-adjust one sensor). Markers in Align mode render by
+        # live-applying current_alignment() to each point's raw meters, so a
+        # drag re-seats the tracks in real time (marker-layer-only, plan §6).
+        self.align_placement: ZoneFit | Placement | None = None
+        self.align_calib: dict[int, RigidDelta] = {}
+        self.align_calibration = None  # last Calibration solve, for the readout
+        self.align_locked = True   # locked: drag → G; unlocked: drag → active Cᵢ
+        self.align_labels = True
+        self.align_rotate_armed = False  # group-rotate 2-click, like Edit rotate
+        self.align_drag: dict | None = None  # in-flight group / per-sensor drag
+        # Pre-commit snapshot {si: (azimuth, x_px, y_px)} for the commit undo
+        # (plan §5d): None until a commit, restored by the align Undo button.
+        self.align_commit_snapshot: dict | None = None
         # Generic (non-chain) Lineals: a project-wide pool the Lineal draw
         # kind targets, round-tripped via model/centerline.py's
         # load_lineals/save_lineals (PHASE3_UI_PLAN §4.3). Each carries its
@@ -1206,20 +1243,31 @@ class Viewer:
                                       stroke_dasharray=f"{3 * lw} {2 * lw}"))
         return "".join(parts)
 
-    def _marker_svg(self, points, labels: bool) -> str:
-        """Track-marker SVG for one frame's *points* — the single renderer both
-        Replay (Item 30) and Live (Item 35) drive, so markers read identically
-        (same evo_replay colors / short ids) whichever mode produced the frame.
-        Sizes are in overlay-px scaled by zoom, so markers hold their on-screen
-        size at any zoom/pan. Built as its own string for the separate marker
-        layer (plan §4): the static zone/centerline overlay from svg() renders
-        beneath, untouched, while this is the only content rewritten per tick."""
+    def _marker_svg(self, points, labels: bool, align=None) -> str:
+        """Track-marker SVG for one frame's *points* — the single renderer
+        Replay (Item 30), Live (Item 35), and Align (Item 40) drive, so markers
+        read identically (same evo_replay colors / short ids) whichever mode
+        produced the frame. Sizes are in overlay-px scaled by zoom, so markers
+        hold their on-screen size at any zoom/pan. Built as its own string for
+        the separate marker layer (plan §4): the static zone/centerline overlay
+        from svg() renders beneath, untouched, while this is the only content
+        rewritten per tick.
+
+        With *align* (an ``AlignmentTransform``) each point is re-aligned from
+        its raw EVO meters through the composed transform live — the Align-mode
+        path (Item 40), so a group drag/rotate re-seats the markers in real time
+        without re-aligning the whole recording. Without it the point's
+        precomputed ``x_ft/y_ft`` are used (Replay/Live, unchanged)."""
         lw = self.overlay_px / max(self.viewport.scale, 0.05)
         r = 4 * lw
         font = 7 * lw
         parts = []
         for pt in points:
-            cx, cy = self.replay_point_to_canvas(pt.x_ft, pt.y_ft)
+            if align is not None:
+                fx, fy = align.apply(pt.sensor, pt.x_raw_m, pt.y_raw_m)
+            else:
+                fx, fy = pt.x_ft, pt.y_ft
+            cx, cy = self.replay_point_to_canvas(fx, fy)
             color = marker_color(pt.sensor)
             parts.append(f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{r:.1f}" '
                          f'fill="{color}" fill-opacity="0.9" stroke="black" '
@@ -1254,6 +1302,43 @@ class Viewer:
         if time.monotonic() - stamped > LIVE_STALE_TIMEOUT:
             return ""
         return self._marker_svg(frame.points, self.live_labels)
+
+    def align_source_frame(self):
+        """The frame the Align overlay renders (Item 40): the newest live slot
+        when a live session is running, else the current replay frame. Returns
+        None when neither source has a frame — the overlay is then empty and the
+        status line prompts the user to load a recording / connect live."""
+        if self.live_session is not None:
+            slot = self.live_frame
+            if slot is not None and time.monotonic() - slot[1] <= LIVE_STALE_TIMEOUT:
+                return slot[0]
+            return None
+        rec = self.replay
+        if rec is not None and rec.frames:
+            i = max(0, min(self.replay_frame, len(rec.frames) - 1))
+            return rec.frames[i]
+        return None
+
+    def current_alignment(self):
+        """The composed transform being authored in Align mode (Item 40):
+        ``{Cᵢ}`` calibration under the group placement G. None until a
+        placement is seeded (no ``Z;`` fit and no anchor — nothing to align)."""
+        if self.align_placement is None:
+            return None
+        return AlignmentTransform(calib=dict(self.align_calib),
+                                  placement=self.align_placement,
+                                  calibration=self.align_calibration)
+
+    def align_marker_svg(self) -> str:
+        """Markers for the Align overlay (Item 40): the source frame re-aligned
+        live through current_alignment(), so a group drag/rotate re-seats the
+        tracks over the zones in real time. Empty when there's no source frame
+        or no placement yet."""
+        frame = self.align_source_frame()
+        align = self.current_alignment()
+        if frame is None or align is None:
+            return ""
+        return self._marker_svg(frame.points, self.align_labels, align=align)
 
 
 # ---------------------------------------------------------------------------
@@ -2412,6 +2497,28 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             status_label.set_text(
                 "mode: calibrate 2-pt | click two reference points, "
                 "then enter the known distance")
+        elif v.mode == "Record":
+            s = _active_record_session()
+            if s is None:
+                status_label.set_text(
+                    "mode: record | start a capture (record icon at right)")
+            else:
+                st = s.status
+                if st.error:
+                    status_label.set_text(f"mode: record | {s.host} | error: {st.error}")
+                elif st.connected:
+                    status_label.set_text(
+                        f"mode: record | {s.host} | {st.frames} frames | "
+                        f"{st.fps:.1f} fps")
+                elif s.running:
+                    status_label.set_text(f"mode: record | {s.host} | connecting…")
+                elif st.stopped:
+                    name = st.path.name if st.path else "?"
+                    status_label.set_text(
+                        f"mode: record | {s.host} | stopped — {st.frames} "
+                        f"frames → {name}")
+                else:
+                    status_label.set_text(f"mode: record | {s.host} | idle")
         elif v.mode == "Replay":
             if v.replay is None:
                 status_label.set_text(
@@ -2444,6 +2551,8 @@ def build_ui(viewer: Viewer, state: dict) -> None:
                 else:
                     status_label.set_text(
                         f"mode: live | {s.host} | disconnected ({st.frames} msgs)")
+        elif v.mode == "Align":
+            status_label.set_text(align_status())
         else:
             status_label.set_text(f"mode: {v.mode.lower()}")
         snap_switch.set_value(v.ctrl.snap_enabled)  # no-op when already equal
@@ -2459,6 +2568,11 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             v.mode == "Edit" and v.draw_kind_name == "Event Zone"
             and len(v.ctrl.selection) == 1 and 0 <= v.ctrl.selected < len(zones)
             and attached_centerline_for(zones[v.ctrl.selected]) is not None)
+        # Align (Item 40): Commit only once there's a calibration to write and
+        # no pending commit; Undo only while a commit snapshot is held.
+        align_commit_btn.set_enabled(bool(v.align_calib)
+                                     and v.align_commit_snapshot is None)
+        align_undo_btn.set_enabled(v.align_commit_snapshot is not None)
         refresh_zone_table()
 
     # -- zone table panel (synced with canvas selection) -----------------------
@@ -2676,6 +2790,27 @@ def build_ui(viewer: Viewer, state: dict) -> None:
                 if si != v.active_si:
                     activate_sensor(si)  # unified dropdown follows the pick
                     refresh_status()
+        elif button == 0 and v.mode == "Align":
+            pw = v.canvas_to_world(p)
+            if v.align_rotate_armed:
+                if v.rotate_pivot is None:
+                    v.rotate_pivot = pw  # click 1: place the pivot
+                else:
+                    commit_align_rotate(v.rotate_pivot, v.rotate_angle)  # click 2
+                refresh_overlay()
+                refresh_status()
+            elif v.align_placement is not None and v.ft_per_px() is not None:
+                # Start a group drag (locked) / per-sensor nudge (unlocked). In
+                # unlocked mode a click on a sensor selects which sensor's Cᵢ the
+                # drag adjusts (reusing the Sensor-mode pick), then the whole
+                # gesture edits the transform, never the sensor field.
+                if not v.align_locked:
+                    si = v.sensor_at(pw)
+                    if si != -1 and si != v.active_si:
+                        activate_sensor(si)
+                v.align_drag = {"anchor": pw, "placement0": v.align_placement,
+                                "calib0": dict(v.align_calib),
+                                "slot": _active_slot(), "moved": False}
         elif button == 0 and v.template_placement_active():
             # Item 27: a template picked in Draw › Event Zone turns the click
             # into a template drop (was the standalone Template tool). With a
@@ -2744,6 +2879,16 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             if math.dist(pw, d["anchor"]) > v.ctrl.handle_radius / 3:
                 d["moved"] = True
             refresh_overlay()
+        elif v.align_drag is not None and e.args.get("buttons", 0) & 1:
+            _align_drag_move(pw)  # marker-layer-only re-render (plan §6)
+        elif v.mode == "Align" and v.align_rotate_armed:
+            if v.rotate_pivot is not None:
+                if v.rotate_ray is None:
+                    v.rotate_ray = pw  # freeze the angle-measure reference ray
+                else:
+                    v.rotate_angle = geometry.rotation_angle_deg(
+                        v.rotate_pivot, v.rotate_ray, pw)
+            refresh_overlay()
         elif v.ruler_active:
             if v.ruler_pending:
                 v.ruler_end = pw
@@ -2790,6 +2935,11 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             d, v.sensor_drag = v.sensor_drag, None
             if not d["moved"]:
                 sensor_properties(d["si"])
+        elif v.align_drag is not None:
+            v.align_drag = None
+            _push_live_alignment()  # new live frames adopt the seated transform
+            refresh_marker_layer()
+            refresh_status()
         elif v.ruler_active:
             # a real click-drag-release finishes the measurement in one
             # gesture; a plain click leaves it pending for a second click
@@ -2884,6 +3034,11 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             refresh_overlay()
             refresh_status()
             return
+        if name == "Escape" and v.align_rotate_armed:
+            cancel_align_rotate()
+            refresh_overlay()
+            refresh_status()
+            return
         if name == "Escape" and v.template_placement_active() \
                 and v.template_ref is not None:
             v.template_ref = None
@@ -2925,6 +3080,13 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         """Apply an effective-mode transition: sync the controller mode and run
         the same teardown change_tool used to do (exit the ruler, clear template
         preview, end a centerline drag, cancel a rotate, drop the marquee)."""
+        old_mode = v.mode
+        # Leaving Align (Item 40): bake the authored transform into the overlay
+        # sources so Replay/Live keep it, and end any in-flight align gesture.
+        if old_mode == "Align" and new_mode != "Align":
+            cancel_align_rotate()
+            v.align_drag = None
+            _persist_align_to_sources()
         v.mode = new_mode
         v.ctrl.set_mode("edit" if new_mode == "Edit" else "draw")
         # Selecting any tool / sub-kind exits the ruler overlay (owner's call):
@@ -2944,16 +3106,24 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         v.marquee_anchor = None
         v.marquee_cursor = None
         # Leaving Replay stops the animation; leaving Live tears down the
-        # connection + overlay timer (plan §4). The marker layer itself is
-        # refreshed by the caller (change_tool), which clears it off both modes.
+        # connection + overlay timer (plan §4). Leaving Record just stops its
+        # status poll — an in-progress capture keeps running (close ≠ stop,
+        # same as the old dialog-only Record). The marker layer itself is
+        # refreshed by the caller (change_tool/change_overlay_kind), which
+        # clears it off both Replay/Live modes.
         if new_mode != "Replay":
             _pause_replay()
-        if new_mode != "Live":
+        # Align works *on* a live overlay, so keep the live session running
+        # across Live↔Align; only tear it down when leaving overlay entirely.
+        if new_mode not in ("Live", "Align"):
             _stop_live()
+        if new_mode == "Align":
+            enter_align()  # seed the group placement + route the live feed
+        record_status_timer.active = (new_mode == "Record")
 
     def change_tool(e):
         kind = draw_kind_toggle.value
-        _enter_mode(effective_mode(e.value, kind))
+        _enter_mode(effective_mode(e.value, kind, overlay_kind_toggle.value))
         update_context_bar()
         refresh_overlay()
         refresh_marker_layer()  # show markers entering Replay/Live, clear leaving
@@ -2962,7 +3132,7 @@ def build_ui(viewer: Viewer, state: dict) -> None:
     def change_draw_kind(e):
         cancel_rotate()  # retarget clears the controller's selection
         kind = e.value
-        _enter_mode(effective_mode(tool.value, kind))
+        _enter_mode(effective_mode(tool.value, kind, overlay_kind_toggle.value))
         if kind not in MODE_SUBKINDS:
             # A real drawing kind: retarget the controller to its element list
             # (also what Edit then operates on). Centerline/Sensor aren't
@@ -2970,6 +3140,16 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             v.set_draw_kind(kind)
         update_context_bar()  # owner options / zone panel key off mode + kind
         refresh_overlay()
+        refresh_status()
+
+    def change_overlay_kind(e):
+        """Overlay sub-kind toggle (ROADMAP Item 37): Record/Replay/Live are
+        siblings under the one "Overlay" tool now, so switching between them
+        works exactly like change_draw_kind switching Draw sub-kinds."""
+        _enter_mode(effective_mode(tool.value, draw_kind_toggle.value, e.value))
+        update_context_bar()
+        refresh_overlay()
+        refresh_marker_layer()
         refresh_status()
 
     _OWNER_BAND_TEXT = {Owner.GENERAL: "→ both files",
@@ -3084,6 +3264,8 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             replay_layer.content = v.replay_marker_svg()
         elif v.mode == "Live":
             replay_layer.content = v.live_marker_svg()
+        elif v.mode == "Align":
+            replay_layer.content = v.align_marker_svg()
         else:
             replay_layer.content = ""
 
@@ -3178,14 +3360,35 @@ def build_ui(viewer: Viewer, state: dict) -> None:
                     pass
         return found
 
+    def _active_record_session() -> RecordingSession | None:
+        """The session the consolidated status line reports for Record mode
+        (ROADMAP Item 37): whichever host is actively running, else the most
+        recently started one. Mirrors how the Live/Replay status branches
+        already summarize a single "current" thing."""
+        running = [s for s in v.record_sessions.values() if s.running]
+        if running:
+            return running[0]
+        return next(reversed(v.record_sessions.values()), None)
+
     def set_recording(rec: Recording, path: Path):
         """Adopt a freshly loaded Recording: reset transport state and size the
-        scrubber to its frame count."""
+        scrubber to its frame count. Also switches the Overlay sub-kind to
+        Replay (ROADMAP Item 37) so the transport controls and status line
+        are already showing it — a no-op if already there, and how "Load into
+        Replay" from the Record panel now lands the user in Replay."""
+        tool.value = "Overlay"
+        overlay_kind_toggle.set_value("Replay")
         v.replay = rec
         v.replay_path = path
         v.replay_playing = False
         v.replay_frame = 0
         v.replay_pos = 0.0
+        # A new recording supersedes any authored alignment (Item 40): reseed
+        # from this recording's own Z; fit / anchor next time Align is entered.
+        v.align_placement = None
+        v.align_calib = {}
+        v.align_calibration = None
+        v.align_commit_snapshot = None
         replay_timer.active = False
         n = len(rec.frames)
         _replay_scrub_lock[0] = True
@@ -3257,39 +3460,51 @@ def build_ui(viewer: Viewer, state: dict) -> None:
                 ui.button("Cancel", on_click=dialog.close)
         dialog.open()
 
-    def open_record_panel():
-        """Record panel (ROADMAP Item 31, plan §5): host/credentials form,
-        start/stop over the existing evo_recorder websocket logic (now
-        capture/recorder.py), live frame-count status, and a one-click hand-
-        off of the finished file into the Item 30 loader above. The session
-        lives on `v.record_sessions` (keyed by host), not the dialog, so
-        reopening the panel finds an in-progress or just-finished capture
-        instead of losing track of it."""
+    def _host_auth_form() -> tuple:
+        """Shared host/credentials form (ROADMAP Item 37): the known-hosts
+        picker + host/user/password inputs Record and Live each used to
+        re-declare independently (LIVE_OVERLAY_PLAN §4 called this "shared"
+        but it was only a shared data source, `known_hosts()` — this is the
+        first actual shared widget builder). Must be called inside the
+        caller's own `ui.dialog()`/`ui.card()` context so the widgets land
+        in the right place; returns the three inputs for the caller to read."""
         hosts = known_hosts()
         first_host = next(iter(hosts), "")
         default_user, default_pass = hosts.get(first_host, ("evo", "root"))
 
+        def pick_known_host(host):
+            u, p = hosts.get(host, ("evo", "root"))
+            host_in.set_value(host)
+            user_in.set_value(u)
+            pass_in.set_value(p)
+
+        host_in = ui.input("host (IP)", value=first_host) \
+            .classes("w-full").props("dense")
+        if hosts:
+            # Known-hosts picker writes into host_in, mirroring the "found
+            # recordings" select's relationship to path_in in the Replay
+            # loader above.
+            ui.select({h: h for h in hosts}, label="known hosts",
+                      on_change=lambda e: pick_known_host(e.value)) \
+                .classes("w-full").props("dense clearable")
+        user_in = ui.input("username", value=default_user) \
+            .classes("w-full").props("dense")
+        pass_in = ui.input("password", value=default_pass, password=True) \
+            .classes("w-full").props("dense")
+        return host_in, user_in, pass_in
+
+    def open_record_panel():
+        """Record panel (ROADMAP Item 31, plan §5; folded under Overlay ›
+        Record by Item 37): host/credentials form, start/stop over the
+        existing evo_recorder websocket logic (now capture/recorder.py), live
+        frame-count status, and a one-click hand-off of the finished file
+        into the Item 30 loader above. The session lives on
+        `v.record_sessions` (keyed by host), not the dialog, so reopening the
+        panel finds an in-progress or just-finished capture instead of
+        losing track of it."""
         with ui.dialog() as dialog, ui.card().style("min-width: 420px"):
             ui.label("Record EVO capture").classes("text-lg")
-
-            def pick_known_host(host):
-                u, p = hosts.get(host, ("evo", "root"))
-                host_in.set_value(host)
-                user_in.set_value(u)
-                pass_in.set_value(p)
-
-            host_in = ui.input("host (IP)", value=first_host) \
-                .classes("w-full").props("dense")
-            if hosts:
-                # Known-hosts picker writes into host_in, mirroring the
-                # "found recordings" select's relationship to path_in above.
-                ui.select({h: h for h in hosts}, label="known hosts",
-                          on_change=lambda e: pick_known_host(e.value)) \
-                    .classes("w-full").props("dense clearable")
-            user_in = ui.input("username", value=default_user) \
-                .classes("w-full").props("dense")
-            pass_in = ui.input("password", value=default_pass, password=True) \
-                .classes("w-full").props("dense")
+            host_in, user_in, pass_in = _host_auth_form()
 
             status_label = ui.label("idle").classes("font-mono text-sm")
 
@@ -3412,9 +3627,9 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         v.live_frame = None
 
     def open_live_connect():
-        """Live connect dialog (plan §4): shares the Record panel's host/
-        credentials form (same known_hosts source) plus the anchor-sensor pick
-        the Replay loader uses, and an optional record-to-disk toggle (the
+        """Live connect dialog (plan §4): built from the same `_host_auth_form`
+        as the Record panel (ROADMAP Item 37) plus the anchor-sensor pick the
+        Replay loader uses, and an optional record-to-disk toggle (the
         superset behavior — a RecordingSession with save=True both overlays and
         captures, plan §1). On connect it subscribes an aligner-driven callback
         to the session's message stream and starts the overlay timer."""
@@ -3425,29 +3640,9 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         if v.live_session is not None and v.live_session.running:
             ui.notify("already connected — Stop first", type="warning")
             return
-        hosts = known_hosts()
-        first_host = next(iter(hosts), "")
-        default_user, default_pass = hosts.get(first_host, ("evo", "root"))
-
         with ui.dialog() as dialog, ui.card().style("min-width: 420px"):
             ui.label("Connect live EVO overlay").classes("text-lg")
-
-            def pick_known_host(host):
-                u, p = hosts.get(host, ("evo", "root"))
-                host_in.set_value(host)
-                user_in.set_value(u)
-                pass_in.set_value(p)
-
-            host_in = ui.input("host (IP)", value=first_host) \
-                .classes("w-full").props("dense")
-            if hosts:
-                ui.select({h: h for h in hosts}, label="known hosts",
-                          on_change=lambda e: pick_known_host(e.value)) \
-                    .classes("w-full").props("dense clearable")
-            user_in = ui.input("username", value=default_user) \
-                .classes("w-full").props("dense")
-            pass_in = ui.input("password", value=default_pass, password=True) \
-                .classes("w-full").props("dense")
+            host_in, user_in, pass_in = _host_auth_form()
             n_sensors = len(v.project.sensors)
             sensor_sel = ui.select(
                 {i: f"S{i + 1}" for i in range(n_sensors)},
@@ -3484,12 +3679,16 @@ def build_ui(viewer: Viewer, state: dict) -> None:
                         msg, t=datetime.now().strftime("%H:%M:%S.%f")[:-3])
                     if frame is not None:
                         v.live_frame = (frame, time.monotonic())
+                        # Retain recent frames so Align › Auto-calibrate has
+                        # volume on a live overlay (Item 40); bounded deque.
+                        v.live_history.append(frame)
 
                 session.subscribe(on_message)
                 v.live_session = session
                 v.live_aligner = aligner
                 v.live_cb = on_message
                 v.live_frame = None
+                v.live_history.clear()  # fresh buffer per connection (Item 40)
                 session.start()
                 live_timer.active = True
                 dialog.close()
@@ -3519,6 +3718,305 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         v.live_labels = bool(e.value)
         refresh_marker_layer()
 
+    # -- interactive alignment (ROADMAP Item 40, CALIBRATION_ALIGNMENT_PLAN §4)
+    # The Align sub-mode of Overlay relaxes the Replay/Live read-only invariant:
+    # the marker overlay persists over a canvas whose sensor drag/rotate now
+    # seats the *calibrated group* (G) as a rigid body, while Auto-calibrate
+    # solves the locked per-sensor relationship {Cᵢ} underneath. Everything is
+    # in-memory and reversible (plan §5a) until an explicit Commit folds {Cᵢ}
+    # into the iprj sensors. Markers re-align live through v.current_alignment()
+    # (Viewer.align_marker_svg), so a drag re-seats them with a marker-layer-only
+    # rewrite — never the static SVG (the Item 20/30 performance lesson, §6).
+
+    def _align_zones_anchor_ref():
+        """The Z; zones + sensor anchor/reference of the active overlay source
+        (live session first, else the loaded recording) — what build_alignment
+        seeds the group placement G from."""
+        if v.live_session is not None and v.live_aligner is not None:
+            la = v.live_aligner
+            return la.zones, la.anchor_ft, la.ref_m
+        rec = v.replay
+        if rec is not None:
+            return rec.zones, rec.anchor_ft, rec.ref_m
+        return (), None, (0.0, 0.0)
+
+    def _align_calib_frames():
+        """Frames Auto-calibrate solves over: the live rolling buffer when a
+        live overlay is running (volume for the statistical fit), else the
+        loaded recording's frames."""
+        if v.live_session is not None:
+            return list(v.live_history)
+        return v.replay.frames if v.replay is not None else []
+
+    def _seed_align_placement():
+        """(Re)seed the group placement G from the current calibration: G is the
+        zonefit refit over calibrated centroids when Z; exists, else the
+        translation seed from the sensor anchor (plan §§1/3). Resets any manual
+        drag/rotate override to the automatic fit."""
+        zones, anchor, ref = _align_zones_anchor_ref()
+        tr = build_alignment(v.project, list(zones), v.align_calibration,
+                             anchor_ft=anchor, ref_m=ref)
+        if tr is None:
+            v.align_placement = None
+            v.align_calib = {}
+        else:
+            v.align_placement = tr.placement
+            v.align_calib = dict(tr.calib)
+
+    def _push_live_alignment():
+        """Route the live aligner through the authored transform so new live
+        frames align through it too (plan §6 — one path, both replay and live).
+        A no-op off a live session."""
+        if v.live_aligner is not None:
+            v.live_aligner.alignment = v.current_alignment()
+
+    def _persist_align_to_sources():
+        """On leaving Align, bake the authored transform into the overlay
+        sources so Replay/Live keep it (plan §6): realign the loaded recording
+        once (O(frames), not per drag tick) and set the live aligner's
+        transform. A no-op when nothing was authored."""
+        tr = v.current_alignment()
+        if tr is None:
+            return
+        if v.replay is not None:
+            v.replay = realign(v.replay, tr)
+        _push_live_alignment()
+
+    def _align_slot_map() -> dict:
+        """Stream slot → project sensor index, from the overlay source's Z; fit.
+        Kept off the *source* (recording / live aligner) rather than the current
+        placement because a manual group drag turns the placement into a plain
+        ``Placement`` that no longer carries the match (plan §3). With no Z; the
+        slot is the sensor index itself."""
+        zf = None
+        if v.live_session is not None and v.live_aligner is not None:
+            zf = v.live_aligner.zone_fit
+        elif v.replay is not None:
+            zf = v.replay.zone_fit
+        if zf is not None:
+            return dict(zf.slot_to_sensor)
+        return {s: s for s in v.align_calib}
+
+    def _active_slot() -> int:
+        """The stream slot (oid % 10) of the active project sensor — the target
+        of an unlocked per-sensor nudge."""
+        for slot, si in _align_slot_map().items():
+            if si == v.active_si:
+                return slot
+        return v.active_si
+
+    def enter_align():
+        """Entering Align (plan §4): seed the group placement if none is held
+        yet, and route any live feed through the current transform. Requires a
+        calibrated background (markers need the meters/pixel scale)."""
+        if v.ft_per_px() is None:
+            ui.notify("calibrate the background first — alignment needs the "
+                      "meters-per-pixel scale", type="warning")
+            return
+        if v.align_placement is None:
+            _seed_align_placement()
+        _push_live_alignment()
+
+    def align_auto_calibrate():
+        """Run the Item 39 relational solver over the current overlay's frames,
+        make the sensors agree (background-blind), and lock the result (plan §4).
+        Refits G over the calibrated centroids and surfaces the per-sensor
+        fit-quality (pair counts / residuals / flags, plan §7)."""
+        if v.ft_per_px() is None:
+            ui.notify("calibrate the background first", type="warning")
+            return
+        frames = _align_calib_frames()
+        if len(frames) < 2:
+            ui.notify("no frames yet — load a recording or let the live overlay "
+                      "run a moment first", type="warning")
+            return
+        cal = calibrate(frames)
+        if not cal.sensors:
+            ui.notify("no sensors seen in the frames", type="warning")
+            return
+        v.align_calibration = cal
+        v.align_commit_snapshot = None  # a new solve supersedes any prior commit
+        _seed_align_placement()  # refit G over calibrated centroids; set {Cᵢ}
+        _push_live_alignment()
+        refresh_marker_layer()
+        refresh_status()
+        ok = [s for s in cal.sensors if s.status in ("ok", "translation_only")]
+        flagged = cal.flagged
+        parts = [f"calibrated {len(ok)} sensor{'s' if len(ok) != 1 else ''}"]
+        if flagged:
+            parts.append(", ".join(
+                f"S{s.sensor + 1}:{s.status}" for s in flagged))
+        ui.notify(" — ".join(parts),
+                  type="positive" if v.align_calib else "warning")
+
+    def toggle_align_lock():
+        """Locked (default): a drag moves the whole calibrated group (edits G).
+        Unlocked: a drag nudges the active sensor's calibration Cᵢ (the rare
+        hand-adjust path, plan §4)."""
+        v.align_locked = not v.align_locked
+        align_lock_btn.props(f"icon={'lock' if v.align_locked else 'lock_open'}")
+        refresh_status()
+
+    def start_align_rotate():
+        if v.align_placement is None:
+            ui.notify("nothing to rotate yet — load an overlay first",
+                      type="warning")
+            return
+        v.align_rotate_armed = True
+        v.rotate_pivot = None
+        v.rotate_ray = None
+        v.rotate_angle = 0.0
+        refresh_status()
+
+    def cancel_align_rotate():
+        if not v.align_rotate_armed:
+            return
+        v.align_rotate_armed = False
+        v.rotate_pivot = None
+        v.rotate_ray = None
+        v.rotate_angle = 0.0
+
+    def commit_align_rotate(pivot_px, angle):
+        """Rotate the group about a world-px pivot (plan §4): edits G only, so
+        the locked {Cᵢ} — the inter-sensor agreement — stays fixed."""
+        fpp = v.ft_per_px()
+        if fpp is None or v.align_placement is None:
+            cancel_align_rotate()
+            return
+        pivot_ft = (pivot_px[0] * fpp, pivot_px[1] * fpp)
+        v.align_placement = rotated_about(v.align_placement, pivot_ft, angle)
+        cancel_align_rotate()
+        _push_live_alignment()
+        refresh_marker_layer()
+        refresh_status()
+
+    def _align_drag_move(pw):
+        """Live drag: locked → translate G (whole group); unlocked → nudge the
+        active sensor's Cᵢ position (plan §4). Recomputed from the drag-start
+        snapshot each move so it can't accumulate rounding."""
+        d = v.align_drag
+        fpp = v.ft_per_px()
+        if fpp is None:
+            return
+        dx_ft = (pw[0] - d["anchor"][0]) * fpp
+        dy_ft = (pw[1] - d["anchor"][1]) * fpp
+        if math.hypot(dx_ft, dy_ft) > 0.1:
+            d["moved"] = True
+        if v.align_locked:
+            v.align_placement = translated(d["placement0"], dx_ft, dy_ft)
+        else:
+            slot = d["slot"]
+            base = d["calib0"].get(slot, IDENTITY)
+            v.align_calib = dict(d["calib0"])
+            v.align_calib[slot] = nudged_delta(base, d["placement0"], (dx_ft, dy_ft))
+        refresh_marker_layer()
+        refresh_status()
+
+    async def align_commit():
+        """Fold the per-sensor calibration into the iprj sensors' azimuth +
+        position (plan §5b/§5c — only calibration commits; G is reproducible
+        from Z; or stays a designer-side layer). Confirmed, snapshotted for
+        undo, and left applied to the current (uncorrected) recording so the
+        overlay doesn't jump — the write persists the mounting correction for
+        future captures / the field device, matching the commit→re-solve
+        ≈identity contract the model layer proves."""
+        tr = v.current_alignment()
+        if tr is None or not tr.calib:
+            ui.notify("nothing to commit — run Auto-calibrate first (only the "
+                      "per-sensor calibration commits, plan §5b)", type="warning")
+            return
+        updates = commit_calibration(v.project, tr, slot_to_sensor=_align_slot_map())
+        if not updates:
+            ui.notify("no committable sensors — need a Z; sensor match and a "
+                      "stored sensor position", type="warning")
+            return
+        with ui.dialog() as dlg, ui.card():
+            ui.label("Commit calibration to sensors").classes("text-lg")
+            ui.label("Writes each sensor's mounting correction into the "
+                     "project (reversible with the undo button):") \
+                .classes("text-sm text-gray-400")
+            for si, (az, _px) in sorted(updates.items()):
+                old = v.project.sensors[si]
+                ui.label(f"S{si + 1}:  azimuth {old.azimuth_angle or 0.0:.2f}° "
+                         f"→ {az:.2f}°   ·   position moved").classes("font-mono text-sm")
+            with ui.row():
+                ui.button("Commit", on_click=lambda: dlg.submit("commit"))
+                ui.button("Cancel", on_click=lambda: dlg.submit("cancel"))
+        if await dlg != "commit":
+            return
+        snap = {}
+        for si in updates:
+            s = v.project.sensors[si]
+            snap[si] = (s.azimuth_angle, s.position_x, s.position_y)
+        v.align_commit_snapshot = snap
+        for si, (az, px) in updates.items():
+            s = v.project.sensors[si]
+            s.azimuth_angle = az
+            s.position_x, s.position_y = px
+        refresh_overlay()  # the sensor icons moved to their corrected mounting
+        refresh_marker_layer()
+        refresh_status()
+        ui.notify(
+            f"committed calibration to {len(updates)} sensor"
+            f"{'s' if len(updates) != 1 else ''} — Save to keep it; undo button "
+            "to revert", type="positive")
+
+    def align_undo_commit():
+        snap = v.align_commit_snapshot
+        if not snap:
+            return
+        for si, (az, x, y) in snap.items():
+            s = v.project.sensors[si]
+            s.azimuth_angle = az
+            s.position_x = x
+            s.position_y = y
+        v.align_commit_snapshot = None
+        refresh_overlay()
+        refresh_marker_layer()
+        refresh_status()
+        ui.notify("reverted the calibration commit")
+
+    def align_reset():
+        """Discard the authored alignment — back to the automatic fit, no
+        calibration (plan §5a reversibility)."""
+        v.align_calibration = None
+        v.align_calib = {}
+        v.align_commit_snapshot = None
+        _seed_align_placement()
+        _push_live_alignment()
+        refresh_marker_layer()
+        refresh_status()
+        ui.notify("alignment reset to the automatic fit")
+
+    def toggle_align_labels(e):
+        v.align_labels = bool(e.value)
+        refresh_marker_layer()
+
+    def align_status() -> str:
+        p = v.align_placement
+        if p is None:
+            return ("mode: align | load a recording (Replay) or connect Live, "
+                    "then drag to seat the overlay onto the background")
+        if v.align_rotate_armed:
+            if v.rotate_pivot is None:
+                return "mode: align rotate | click to place the pivot  [Esc cancels]"
+            return (f"mode: align rotate | {v.rotate_angle:+.1f}° | "
+                    "move to aim, click to commit  [Esc cancels]")
+        lock = ("locked — drag moves the group" if v.align_locked
+                else f"UNLOCKED — drag nudges S{v.active_si + 1}")
+        cal = v.align_calibration
+        if cal is None:
+            calnote = "no calibration (Auto-calibrate to make sensors agree)"
+        else:
+            ok = [s for s in cal.sensors if s.status in ("ok", "translation_only")]
+            res = [s.mean_residual_m for s in ok if s.mean_residual_m is not None]
+            calnote = (f"calibrated {len(ok)} sensor"
+                       f"{'s' if len(ok) != 1 else ''}"
+                       + (f", ~{max(res):.1f} m residual" if res else "")
+                       + (f", {len(cal.flagged)} flagged" if cal.flagged else ""))
+        return (f"mode: align | {lock} | G {p.rotation_deg:+.1f}° ×{p.scale:.3f}"
+                f" | {calnote}")
+
     def update_context_bar():
         """Row-2 context controls per tool + Draw sub-kind (ROADMAP Item 24;
         PHASE3_UI_PLAN §3): built once, shown/hidden by visibility rather than
@@ -3526,15 +4024,18 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         dropdown's *options* also change with the sub-kind (General offered or
         not), so it is rebuilt here."""
         tool_is_draw = tool.value == "Draw"
-        # Unified Owner/Sensor dropdown: everywhere but Background, Replay, and
-        # Live (all read-only, so they own nothing — Items 30/35).
-        owns_nothing = ("Background", "Replay", "Live")
+        tool_is_overlay = tool.value == "Overlay"
+        # Unified Owner/Sensor dropdown: everywhere but Background, Record,
+        # Replay, and Live (all read-only, so they own nothing — Items 30/31/35).
+        owns_nothing = ("Background", "Record", "Replay", "Live")
         owner_sel.set_visibility(v.mode not in owns_nothing)
         owner_hint_label.set_visibility(v.mode not in owns_nothing)
         refresh_owner_sel()
         update_owner_hint()
         # Draw sub-kind toggle + the per-sub-kind extras.
         draw_kind_toggle.set_visibility(tool_is_draw)
+        # Overlay sub-kind toggle (ROADMAP Item 37): Record/Replay/Live.
+        overlay_kind_toggle.set_visibility(tool_is_overlay)
         add_sensor_btn.set_visibility(v.mode == "Sensor")
         delete_sensor_btn.set_visibility(v.mode == "Sensor")
         centerline_sel.set_visibility(v.mode == "Centerline")
@@ -3560,12 +4061,19 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         template_sel.set_visibility(event_zone)
         event_cl_sel.set_visibility(event_zone)
         template_values_btn.set_visibility(event_zone and v.template is not None)
+        # Record entry (Item 31, folded under Overlay by Item 37): shown only
+        # in the Record sub-mode.
+        for _cw in record_widgets:
+            _cw.set_visibility(v.mode == "Record")
         # Replay transport (Item 30): the whole cluster shows only in Replay.
         for _rw in replay_widgets:
             _rw.set_visibility(v.mode == "Replay")
         # Live overlay controls (Item 35): shown only in Live.
         for _lw in live_widgets:
             _lw.set_visibility(v.mode == "Live")
+        # Interactive alignment controls (Item 40): shown only in Align.
+        for _aw in align_widgets:
+            _aw.set_visibility(v.mode == "Align")
         # Zone-table panel (Item 24, §5): Auto shows it only when a zone kind is
         # the active target; the three-state control itself is always on Row 2.
         zone_panel.set_visibility(
@@ -3622,13 +4130,13 @@ def build_ui(viewer: Viewer, state: dict) -> None:
     # cluster (template-editor · folder · filename · save) right. The product
     # name is gone; the filename is a muted inline label beside the folder menu.
     with ui.row().classes("w-full items-center gap-2 px-2 no-wrap overflow-x-auto"):
-        tool = ui.toggle(["Draw", "Edit", "Background", "Replay", "Live"],
+        tool = ui.toggle(["Draw", "Edit", "Background", "Overlay"],
                          value="Edit", on_change=change_tool).props("dense")
         with tool:
             ui.tooltip("accelerators: d draw · e edit · space+drag / "
                        "middle-drag pans · Esc cancel (Sensor & Centerline are "
-                       "Draw sub-kinds now). Replay: read-only EVO playback. "
-                       "Live: read-only real-time EVO overlay.")
+                       "Draw sub-kinds now). Overlay: Record/Replay/Live a "
+                       "capture (Replay & Live are read-only).")
         ui.separator().props("vertical")
         # Always-on drawing tools (apply in every mode).
         snap_switch = ui.switch("snap", on_change=toggle_snap).props("dense")
@@ -3694,6 +4202,19 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             ui.tooltip("draw sub-kind: z Event Zone · i Ignore Zone · l Lineal "
                        "· a Text Label · c Centerline · s Sensor — also picks "
                        "what Edit operates on")
+        # Overlay sub-kind toggle (ROADMAP Item 37): Record/Replay/Live share
+        # one top-level "Overlay" tool now; this picks which of the three is
+        # active, the same way draw_kind_toggle picks the Draw sub-kind.
+        overlay_kind_toggle = ui.toggle(
+            ["Record", "Replay", "Live", "Align"],
+            value="Replay",
+            on_change=change_overlay_kind).props("dense")
+        with overlay_kind_toggle:
+            ui.tooltip("Record: capture a live EVO host to disk. Replay: play "
+                       "back a saved recording (read-only). Live: overlay a "
+                       "live stream in real time (read-only). Align: seat the "
+                       "overlay onto the background — drag/rotate the calibrated "
+                       "sensor group, Auto-calibrate, and commit to the iprj.")
         ui.separator().props("vertical")
 
         # Unified Owner/Sensor dropdown (Item 24, §3.3): replaces the active-
@@ -3821,6 +4342,16 @@ def build_ui(viewer: Viewer, state: dict) -> None:
                        "approach); shown in the pickers and saved as a label "
                        "at the far end")
 
+        # Record panel (ROADMAP Item 31, its own Overlay sub-mode by Item 37):
+        # capture straight from a live EVO host and hand the finished file
+        # into the loader below. Shown only in Record mode.
+        record_btn = ui.button(
+            icon="fiber_manual_record", on_click=open_record_panel) \
+            .props("flat dense").classes("text-red-5")
+        with record_btn:
+            ui.tooltip("record a live EVO capture (Record panel)")
+        record_widgets = [record_btn]
+
         # Replay transport (ROADMAP Item 30): a load-recording picker plus
         # play/pause, frame-step, speed, a timeline scrubber, and an id-label
         # toggle. Shown only in Replay mode by update_context_bar().
@@ -3828,13 +4359,6 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             icon="video_file", on_click=load_replay_recording).props("flat dense")
         with replay_load_btn:
             ui.tooltip("load an EVO recording to play back")
-        # Record panel (ROADMAP Item 31): capture straight from a live EVO
-        # host and hand the finished file into the loader above.
-        record_btn = ui.button(
-            icon="fiber_manual_record", on_click=open_record_panel) \
-            .props("flat dense").classes("text-red-5")
-        with record_btn:
-            ui.tooltip("record a live EVO capture (Record panel)")
         replay_step_back_btn = ui.button(
             icon="skip_previous", on_click=lambda: replay_step(-1)).props("flat dense")
         with replay_step_back_btn:
@@ -3861,14 +4385,14 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             "ids", value=True, on_change=toggle_replay_labels).props("dense")
         with replay_labels_switch:
             ui.tooltip("show the abbreviated track id over each marker")
-        replay_widgets = [replay_load_btn, record_btn, replay_step_back_btn,
+        replay_widgets = [replay_load_btn, replay_step_back_btn,
                           replay_play_btn, replay_step_fwd_btn, replay_speed_sel,
                           replay_slider, replay_labels_switch]
 
-        # Live overlay controls (ROADMAP Item 35): connect (shares the Record
-        # panel's auth form) / stop, plus the id-label toggle. No timeline or
-        # scrubber — Live is a live tail, not file scrubbing (plan §4). Shown
-        # only in Live mode by update_context_bar().
+        # Live overlay controls (ROADMAP Item 35): connect (built from the
+        # same _host_auth_form as the Record panel) / stop, plus the id-label
+        # toggle. No timeline or scrubber — Live is a live tail, not file
+        # scrubbing (plan §4). Shown only in Live mode by update_context_bar().
         live_connect_btn = ui.button(
             icon="sensors", on_click=open_live_connect).props("flat dense")
         with live_connect_btn:
@@ -3882,6 +4406,49 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         with live_labels_switch:
             ui.tooltip("show the abbreviated track id over each live marker")
         live_widgets = [live_connect_btn, live_stop_btn, live_labels_switch]
+
+        # Interactive alignment controls (ROADMAP Item 40): Auto-calibrate makes
+        # the sensors agree (the relational solver, §2); the lock toggle switches
+        # a drag between moving the whole group (locked) and nudging one sensor's
+        # calibration (unlocked); Rotate group is a 2-click group rotate; Commit
+        # folds the calibration into the iprj sensors (§5); Undo reverts a
+        # commit; Reset discards the authored alignment. Shown only in Align.
+        align_calibrate_btn = ui.button(
+            icon="auto_fix_high", on_click=align_auto_calibrate).props("flat dense")
+        with align_calibrate_btn:
+            ui.tooltip("Auto-calibrate — solve the per-sensor corrections that "
+                       "make the sensors agree (needs vehicle traffic in the "
+                       "recording / live buffer)")
+        align_lock_btn = ui.button(
+            icon="lock", on_click=toggle_align_lock).props("flat dense")
+        with align_lock_btn:
+            ui.tooltip("lock: drag moves the whole calibrated group · unlock: "
+                       "drag nudges the active sensor's calibration")
+        align_rotate_btn = ui.button(
+            icon="rotate_right", on_click=start_align_rotate).props("flat dense")
+        with align_rotate_btn:
+            ui.tooltip("rotate the group: click a pivot, aim, click to commit "
+                       "(Esc cancels)")
+        align_reset_btn = ui.button(
+            icon="restart_alt", on_click=align_reset).props("flat dense")
+        with align_reset_btn:
+            ui.tooltip("reset to the automatic fit (discards drags + calibration)")
+        align_commit_btn = ui.button(
+            icon="save_as", on_click=align_commit).props("flat dense")
+        with align_commit_btn:
+            ui.tooltip("commit the calibration into the iprj sensors' azimuth + "
+                       "position (confirm + undo)")
+        align_undo_btn = ui.button(
+            icon="undo", on_click=align_undo_commit).props("flat dense")
+        with align_undo_btn:
+            ui.tooltip("undo the last calibration commit")
+        align_labels_switch = ui.switch(
+            "ids", value=True, on_change=toggle_align_labels).props("dense")
+        with align_labels_switch:
+            ui.tooltip("show the abbreviated track id over each marker")
+        align_widgets = [align_calibrate_btn, align_lock_btn, align_rotate_btn,
+                         align_reset_btn, align_commit_btn, align_undo_btn,
+                         align_labels_switch]
 
         # Zone-table three-state control (Item 24, §5): right-justified at the
         # end of the context bar, directly above the table it governs.
@@ -3999,6 +4566,11 @@ def build_ui(viewer: Viewer, state: dict) -> None:
     # Live overlay clock (Item 35): the same fixed 10 fps cadence (plan §3),
     # inactive until a live connection starts so it costs nothing off-Live.
     live_timer = ui.timer(0.1, live_tick, active=False)
+    # Record status poll (ROADMAP Item 37): keeps the consolidated status
+    # line live while in Record mode even with the dialog closed — mirrors
+    # the dialog-local `record_timer`'s 0.5s cadence, just scoped to the
+    # main toolbar instead of the dialog.
+    record_status_timer = ui.timer(0.5, refresh_status, active=False)
     ui.timer(0.3, fit_view, once=True)
     if v.derived_attachments:
         ui.timer(0.8, lambda: ui.notify(
