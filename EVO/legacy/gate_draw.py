@@ -4,7 +4,7 @@ import os
 from evo_fusion_visualizer import parse_xml_config # Re-use your existing parser
 
 # --- CONFIG ---
-XML_FILE = "us95&sh8_iprj.txt"
+XML_FILE = "./sites/86_US95&SH8/us95&sh8_iprj.txt"
 OUTPUT_FILE = "gates.json"
 
 def create_gates():
