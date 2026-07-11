@@ -183,6 +183,18 @@ def _full_signed_drift(ctrl_h: int, ctrl_m: int, ctrl_s: int,
     return (diff + 43200) % 86400 - 43200
 
 
+# Live clock line on the CLOCK OPTION screen looks like:
+#   "06/30/2026    TUE  22:54:17"
+# Anchor on the actual 3-letter day so we can never latch onto the static
+# "SET TIME       03:30:00" label further down the same screen — a bare
+# [A-Z]{3} matches the "IME" of "TIME", so "IME  03:30:00" would otherwise be
+# a valid (wrong) match if it ever preceded the live line.
+# Groups: 1=HH, 2=MM, 3=SS (day is a non-capturing group, so indices are stable).
+DAY_TIME_RE = re.compile(
+    r"(?:MON|TUE|WED|THU|FRI|SAT|SUN)\s+(\d{2}):(\d{2}):(\d{2})"
+)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # EOSController
 # ══════════════════════════════════════════════════════════════════════════════
@@ -419,10 +431,6 @@ class EOSController:
                         f"Cursor moved on STATUS screen to ({row},{col}) — "
                         "user appears active."
                     )
-                #if structural != last_structural:
-                #    raise UserActiveError(
-                #        "STATUS screen content changed structurally during observation."
-                #    )
             else:  # MAIN MENU
                 if structural != last_structural:
                     raise UserActiveError(
@@ -761,6 +769,41 @@ class EOSController:
             f"Could not navigate to field ({target_row},{target_col})"
         )
 
+    def _assert_safe_to_type(self, expected_row: int, expected_col: int):
+        """
+        Final gate fired immediately before any digit key is sent.
+
+        Re-confirms, from the most recent frame, that BOTH:
+          • the screen is still CLOCK OPTION, and
+          • the cursor is exactly on the expected field.
+
+        This closes the window between navigation/timing-wait and the actual
+        keypress: a seconds edit can wait up to ~90 s with the cursor "parked"
+        on the field, and we must not type into whatever happens to be under the
+        cursor if anything shifted during that wait.
+
+        No digit has been sent when this runs, so a failure here leaves no
+        partial field entry — we simply raise and let set_time() retry.
+
+        Raises:
+            NavigationError      – no longer on CLOCK OPTION.
+            CursorPositionError  – cursor not on the expected field.
+        """
+        msg = self._last_message
+        screen = self.get_screen_text(msg)
+        if "CLOCK OPTION" not in screen:
+            raise NavigationError(
+                f"Not on CLOCK OPTION immediately before typing "
+                f"(screen: {screen[:60]!r}) — refusing to send digits."
+            )
+        row, col = self.get_cursor_position(msg)
+        if (row, col) != (expected_row, expected_col):
+            raise CursorPositionError(
+                f"Cursor at ({row},{col}), expected field "
+                f"({expected_row},{expected_col}) immediately before typing — "
+                f"refusing to send digits."
+            )
+
     # ── Step 4: Set the time ──────────────────────────────────────────────────
 
     async def set_time(self):
@@ -803,7 +846,7 @@ class EOSController:
             except asyncio.TimeoutError:
                 break
             screen = self.get_screen_text(raw)
-            m = re.search(r"[A-Z]{3}\s+(\d{2}):(\d{2}):(\d{2})", screen)
+            m = DAY_TIME_RE.search(screen)
             if m:
                 return int(m.group(1)), int(m.group(2)), int(m.group(3))
         return None
@@ -965,6 +1008,8 @@ class EOSController:
         await self._wait_for_safe_minutes_window()
 
         await self._navigate_to_field(MINUTES_CURSOR_ROW, MINUTES_CURSOR_COL)
+        # Final gate before typing — confirm screen + cursor are still correct.
+        self._assert_safe_to_type(MINUTES_CURSOR_ROW, MINUTES_CURSOR_COL)
         await self._send(DIGIT_KEYS[str(target_minute // 10)])
         await asyncio.sleep(0.1)
         await self._send(DIGIT_KEYS[str(target_minute % 10)])
@@ -1081,6 +1126,11 @@ class EOSController:
             target_ss, target_dt.hour, target_dt.minute, target_dt.second,
         )
 
+        # Final gate: the cursor has been parked on the seconds field through
+        # the (possibly ~90 s) timing-window wait.  Re-confirm screen + cursor
+        # before sending a single digit, so we never type into the wrong field.
+        self._assert_safe_to_type(SECONDS_CURSOR_ROW, SECONDS_CURSOR_COL)
+
         # ── Type digits + commit ──────────────────────────────────────────────
         # From here until Enter we track whether any digits have been sent so
         # we know whether KEY_CLEAR is needed on failure.
@@ -1127,7 +1177,7 @@ class EOSController:
                 )
 
             # Anchor to day abbreviation to avoid matching SET TIME / SYNC REF.
-            m = re.search(r"[A-Z]{3}\s+(\d{2}):(\d{2}):(\d{2})", screen)
+            m = DAY_TIME_RE.search(screen)
             if m:
                 ctrl_m, ctrl_s = int(m.group(2)), int(m.group(3))
                 local = datetime.now()
