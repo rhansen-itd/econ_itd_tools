@@ -178,6 +178,65 @@ def test_live_source_precedence_and_staleness(viewer):
     assert v.align_source_frame() is None
 
 
+def test_sensor_boresight_convention():
+    """sensor_boresight_deg maps iprj AzimuthAngle to a canvas polar angle
+    (y-down): az 0 -> straight up (-90), and the mapping is a plain -az-90 so
+    the wedge aims the way the beam does. Read off the real sites 2026-07-11."""
+    from gui.app import sensor_boresight_deg
+
+    assert sensor_boresight_deg(0.0) == pytest.approx(-90.0)
+    assert sensor_boresight_deg(None) == pytest.approx(-90.0)  # missing -> 0
+    assert sensor_boresight_deg(90.0) == pytest.approx(-180.0)
+    assert sensor_boresight_deg(-170.56) == pytest.approx(80.56)
+
+
+@needs_us95
+def test_sensor_boresight_aims_at_zones():
+    """The convention is only useful if the wedge points where the sensor
+    looks: for every real sensor the boresight lands within a wide margin of
+    its own event-zone cluster (they sit downstream of the beam)."""
+    proj = load_iprj(US95_IPRJ)
+    from gui.app import sensor_boresight_deg
+
+    for s in proj.sensors:
+        pts = [p for z in s.event_zones for p in z.points]
+        assert pts and s.position_x is not None
+        cx = sum(p[0] for p in pts) / len(pts)
+        cy = sum(p[1] for p in pts) / len(pts)
+        to_zones = math.degrees(math.atan2(cy - s.position_y, cx - s.position_x))
+        d = (sensor_boresight_deg(s.azimuth_angle) - to_zones + 180) % 360 - 180
+        assert abs(d) < 30.0  # boresight ~ zone direction (zones aren't dead-centre)
+
+
+def test_sensor_glyph_arc_centres_on_boresight():
+    """_sensor_glyph draws the wedge apex at the sensor and its curved side
+    centred on the aim direction: the arc midpoint sits along boresight from
+    the apex, so the glyph reads directionally regardless of rotation."""
+    from gui.app import _sensor_glyph
+
+    cx, cy, r = 100.0, 100.0, 40.0
+    for boresight in (-90.0, 0.0, 37.5, 200.0):
+        svg = _sensor_glyph(cx, cy, boresight, r, fill="white", stroke="black",
+                            stroke_width=1.0)
+        assert svg.count("<path") == 3  # wedge + two signal ripples
+        assert f"M {cx:.1f} {cy:.1f}" in svg  # apex at the sensor point
+        # arc midpoint (radius r, angle=boresight) must lie on the aim ray
+        th = math.radians(boresight)
+        mid = (cx + r * math.cos(th), cy + r * math.sin(th))
+        ang = math.degrees(math.atan2(mid[1] - cy, mid[0] - cx))
+        assert (ang - boresight + 180) % 360 - 180 == pytest.approx(0.0, abs=1e-6)
+
+
+@needs_us95
+def test_overlay_renders_directional_sensor_glyph(viewer):
+    """The overlay svg draws each sensor as the directional wedge (an arc 'A'
+    command), not the old rotationless triangle."""
+    v = viewer
+    svg = v.svg()
+    assert " A " in svg  # SVG elliptical-arc command from the wedge/ripples
+    assert ">S1<" in svg  # sensor still labelled
+
+
 def test_marker_source_routing():
     """marker_source() (Item 40, owner fix 2026-07-11): the Overlay sub-modes
     keep their own painter, Record stays blank, and every non-overlay mode

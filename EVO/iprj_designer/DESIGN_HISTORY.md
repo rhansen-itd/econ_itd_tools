@@ -3149,3 +3149,14 @@ At 45 mph / 1.0 s extension: the stop-bar-side decision detector sits at
 bridges the corridor at 224.4 ft (two 39.4 ft gaps). Decision and advance
 lengths default to 20 / 10 ft but are template seeding inputs (Item 18). See
 the decisions log for the Item 15/17/18 revision.
+- 2026-07-11 — Sensor icon is now **directional**: a "radio wedge" (pizza
+  slice fanning from the sensor point to an arc, with two concentric signal
+  ripples beyond it) aimed along the beam, replacing the rotationless
+  triangle. `gui/app._sensor_glyph` draws it; the Align ghost reuses it at
+  its proposed azimuth. The aim direction needed a convention for
+  `AzimuthAngle`, which the format never documented — read off five real
+  sites (2026-07-11): canvas polar angle (y-down) = `-AzimuthAngle - 90`,
+  fitting each sensor's event-zone cluster direction to within a few degrees.
+  `sensor_boresight_deg` centralises it; `world_to_image` carries no rotation
+  so the same angle holds in canvas space. Recorded in IPRJ_FORMAT.md;
+  `test_align_gui.py` grew glyph/convention checks; suite 637 pass.

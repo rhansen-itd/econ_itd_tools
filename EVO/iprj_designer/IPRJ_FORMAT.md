@@ -164,6 +164,15 @@ two-point calibration across the image's top edge (`units.calibrate_image_width`
 `RoadGradientAngle`, `InstallationHeight`, `RainInterferenceThreshold`,
 `HighwayMode`, `MaxStopTime`, `FrequencyChannel`, `Gps_lat`, `Gps_lng`
 
+`AzimuthAngle` is the beam heading in **degrees**. Its screen convention was
+undocumented by the vendor; read off five real sites (2026-07-11) by fitting
+each sensor's azimuth to the direction of its own event-zone cluster (zones
+sit downstream of the beam): the boresight's **canvas polar angle** (y-down,
+`atan2(dy,dx)`) `= -AzimuthAngle - 90`, i.e. azimuth 0 points straight up and
+azimuth increases counter-clockwise on screen. Fit held to within a few
+degrees at every site. `gui/app.sensor_boresight_deg` is the single source of
+this mapping (used to aim the directional sensor glyph).
+
 ### Event zones (the loops)
 
 `Radarsensor_{i}_EventZone_{j}_…`:

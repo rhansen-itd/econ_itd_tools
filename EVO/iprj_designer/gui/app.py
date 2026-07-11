@@ -404,6 +404,51 @@ def _polygon(points_img, **attrs) -> str:
     return f'<polygon points="{pts}" {a}/>'
 
 
+def sensor_boresight_deg(azimuth_angle: float | None) -> float:
+    """Canvas polar angle (y-down, atan2(dy,dx) convention) a sensor's beam
+    points along, from its iprj ``AzimuthAngle``. The mapping ``-az - 90`` was
+    read off the real sites (2026-07-11): a sensor's event zones sit downstream
+    of its boresight, and this fit the zone-cluster direction to within a few
+    degrees across every surveyed site. ``world_to_image`` is a pure
+    translate+scale (no rotation), so the same angle holds in canvas space."""
+    return -(azimuth_angle or 0.0) - 90.0
+
+
+def _sensor_glyph(cx, cy, boresight_deg, r, *, fill, stroke, stroke_width,
+                  fill_opacity=None, dash=None) -> str:
+    """Directional "radio wedge" sensor glyph: a pizza-slice fanning from the
+    sensor point out to an arc, with two concentric signal arcs beyond it, the
+    whole thing aimed along *boresight_deg* (canvas polar angle). The curved
+    side — the wedge's one unique edge — centres on the aim direction, so the
+    glyph reads as "this sensor looks that way". Replaces the old rotationless
+    triangle; the Align ghost reuses it at its proposed azimuth."""
+    th = math.radians(boresight_deg)
+    a = math.radians(40.0)   # wedge half-angle
+    b = math.radians(32.0)   # signal-arc half-angle (a touch narrower)
+
+    def pt(rad, ang):
+        return (cx + rad * math.cos(th + ang), cy + rad * math.sin(th + ang))
+
+    common = f'stroke="{stroke}" stroke-width="{stroke_width:.2f}"'
+    if dash:
+        common += f' stroke-dasharray="{dash}"'
+    fo = f' fill-opacity="{fill_opacity}"' if fill_opacity is not None else ""
+    # Wedge: apex at the sensor, sweeping the short way (large-arc-flag 0,
+    # sweep-flag 1 = increasing angle = clockwise in y-down) to the far arc.
+    p0, p1 = pt(r, -a), pt(r, a)
+    wedge = (f'M {cx:.1f} {cy:.1f} L {p0[0]:.1f} {p0[1]:.1f} '
+             f'A {r:.1f} {r:.1f} 0 0 1 {p1[0]:.1f} {p1[1]:.1f} Z')
+    parts = [f'<path d="{wedge}" fill="{fill}"{fo} {common} '
+             f'stroke-linejoin="round"/>']
+    for k in (1.34, 1.68):   # concentric signal ripples beyond the wedge
+        rk = r * k
+        q0, q1 = pt(rk, -b), pt(rk, b)
+        parts.append(f'<path d="M {q0[0]:.1f} {q0[1]:.1f} '
+                     f'A {rk:.1f} {rk:.1f} 0 0 1 {q1[0]:.1f} {q1[1]:.1f}" '
+                     f'fill="none" {common} stroke-linecap="round"/>')
+    return "".join(parts)
+
+
 def _cross(x: float, y: float, size: float, color: str, width: float) -> str:
     return (f'<path d="M {x - size} {y} H {x + size} M {x} {y - size} V {y + size}" '
             f'stroke="{color}" stroke-width="{width}" fill="none"/>')
@@ -1088,10 +1133,11 @@ class Viewer:
                     stroke_dasharray=f"{4 * lw} {3 * lw}"))
             if self.show_sensors and sensor.position_x is not None:
                 x, y = w2i((sensor.position_x, sensor.position_y))
-                s = 6 * lw
+                s = 7 * lw
                 fill = "#00e5ff" if si == self.active_si else "white"
-                parts.append(_polygon([(x, y - s), (x - s, y + s), (x + s, y + s)],
-                                      fill=fill, stroke="black", stroke_width=lw / 2))
+                parts.append(_sensor_glyph(
+                    x, y, sensor_boresight_deg(sensor.azimuth_angle), s,
+                    fill=fill, stroke="black", stroke_width=lw / 2))
                 parts.append(f'<text x="{x:.1f}" y="{y + s + font:.1f}" fill="white" '
                              f'font-size="{font:.1f}" text-anchor="middle" '
                              f'paint-order="stroke" stroke="black" '
@@ -1531,15 +1577,16 @@ class Viewer:
     def _align_ghost_svg(self) -> str:
         """Dashed ghost-sensor glyphs + displacement leaders, rendered on the
         marker layer so drag ticks stay marker-layer-only (plan §6). The ghost
-        triangle is rotated by the proposed azimuth change, and a leader line
-        ties it back to the real (unmoved) sensor so the size of the proposed
-        move reads at a glance."""
+        wedge is aimed at the sensor's *proposed* azimuth (its current azimuth
+        plus the alignment's rotation), and a leader line ties it back to the
+        real (unmoved) sensor so the size of the proposed move reads at a
+        glance."""
         ghosts = self.align_ghosts()
         if not ghosts:
             return ""
         lw = self.overlay_px / max(self.viewport.scale, 0.05)
         font = 7 * lw
-        s = 6 * lw
+        s = 7 * lw
         parts = []
         for si, real_px, ghost_px, d_az in ghosts:
             ox, oy = self.world_to_canvas(real_px)
@@ -1549,14 +1596,11 @@ class Viewer:
                     f'<line x1="{ox:.1f}" y1="{oy:.1f}" x2="{gx:.1f}" '
                     f'y2="{gy:.1f}" stroke="#ff9800" stroke-width="{lw / 2:.2f}" '
                     f'stroke-dasharray="{2 * lw} {2 * lw}"/>')
-            tri = (f'{gx:.1f},{gy - s:.1f} {gx - s:.1f},{gy + s:.1f} '
-                   f'{gx + s:.1f},{gy + s:.1f}')
-            rot = (f' transform="rotate({d_az:.2f} {gx:.1f} {gy:.1f})"'
-                   if abs(d_az) > 0.01 else '')
-            parts.append(f'<polygon points="{tri}" fill="#ff9800" '
-                         f'fill-opacity="0.35" stroke="#ff9800" '
-                         f'stroke-width="{lw:.2f}" '
-                         f'stroke-dasharray="{3 * lw} {2 * lw}"{rot}/>')
+            base_az = self.project.sensors[si].azimuth_angle or 0.0
+            parts.append(_sensor_glyph(
+                gx, gy, sensor_boresight_deg(base_az + d_az), s,
+                fill="#ff9800", fill_opacity="0.35", stroke="#ff9800",
+                stroke_width=lw, dash=f"{3 * lw} {2 * lw}"))
             parts.append(f'<text x="{gx:.1f}" y="{gy + s + font:.1f}" '
                          f'fill="#ff9800" font-size="{font:.1f}" '
                          f'text-anchor="middle" paint-order="stroke" '
