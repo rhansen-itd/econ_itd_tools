@@ -670,7 +670,18 @@ Suggested prompt:
 
 ---
 
-## 40 — Interactive Alignment Mode + Apply Calibration to Live/Recording (Target: Opus) — DONE 2026-07-10 — needs Items 38 & 39
+## 40 — Interactive Alignment Mode + Apply Calibration to Live/Recording (Target: Opus) — DONE 2026-07-10; reframed per owner fixes 2026-07-11 — needs Items 38 & 39
+
+> **Owner fixes (2026-07-11, Fable session).** Align reframed as "move the
+> sensors": the `Z;` auto-fit stays the automatic default mapping at open;
+> Align now shows **ghost sensor copies** that drag/rotate together with the
+> tracks against the fixed background, Commit writes the composed move
+> (calibration *and* group-placement delta — a pure group drag commits) into
+> per-sensor azimuth/position, the 2-click rotate gained its pivot cross +
+> live preview, and auto-calibrate is restricted to stream slots mapped to
+> project sensors (no more impossible "S5/S6 too few pairs" on a 4-sensor
+> site). Details in DESIGN_HISTORY 2026-07-11 and the
+> CALIBRATION_ALIGNMENT_PLAN §5 amendment.
 
 Wire the Item 39 engine into the NiceGUI shell: **persist the overlay into
 draw/edit** (relaxing the read-only-mode invariant), let the user move/rotate
@@ -682,10 +693,12 @@ Scope:
       into draw/edit mode** (per Item 38) — the marker layer stays live while
       sensor drag/rotate handles are active; keep the separate `replay_layer`
       + `pointer-events:none` machinery, drive it off the same transform.
-      *(Realized as a new non-read-only **Overlay › Align** sub-mode — the
-      marker layer stays live over an editable canvas whose drag/rotate seats
-      the group; a cleaner single surface than threading markers through every
-      Draw/Edit tool, see DESIGN_HISTORY.)*
+      *(First realized only as the **Overlay › Align** sub-mode — the owner
+      rejected that reading 2026-07-11: switching to Draw/Edit froze/cleared
+      the overlay. Fixed same day (Fable): `marker_source()` keeps a running
+      live feed or loaded recording rendering — playback still animating — in
+      every non-overlay mode; only picking a different Overlay source stops
+      the current one. See DESIGN_HISTORY 2026-07-11.)*
 - [x] **Group placement (the normal gesture):** moving/rotating a sensor drags
       the whole calibrated cluster as a **rigid body** (inter-sensor relationship
       held locked by Item 39's calibration) and re-renders the overlay through the
@@ -722,7 +735,7 @@ Suggested prompt:
 
 ---
 
-## 41 — Track Stitching / Fusion: Architecture (Target: Opus) — reviews prior art + data first
+## 41 — Track Stitching / Fusion: Architecture (Target: Opus) — DONE 2026-07-10 → FUSION_PLAN.md — reviews prior art + data first
 
 Prerequisite planning session for Items 42–43 — a **decision document, no
 code**. Previous fusion attempts (`../fusion_visualizer.py` ~100 KB,
@@ -742,30 +755,47 @@ Two distinct stitching problems the owner named, both in scope:
   bridging, not just cross-sensor merging.
 
 Scope — decide and write up (with rationale) each of:
-- [ ] **Prior-art post-mortem.** Read `../fusion_visualizer.py` /
+- [x] **Prior-art post-mortem.** Read `../fusion_visualizer.py` /
       `../fusion_strict_logic.html` and the raw recordings; document *why* prior
       attempts failed and what (if anything) is salvageable vs. clean-room in
       `model/`. Note that this per-sensor calibration batch (38–40) removes the
       inter-sensor offset that likely sabotaged earlier cross-sensor matching —
       decide whether stitching should **depend on** a calibrated overlay.
-- [ ] **Data model & seam.** Where fusion sits relative to the aligned `Frame`
+      *(→ FUSION_PLAN §0–1: clean-room in pure `model/fusion.py`; the `.html`
+      files are just rendered plotly output; the prior RBF spatial warp is
+      retired in favor of the 38–40 calibration, so fusion **depends on** a
+      calibrated overlay and drops the RBF + `gates.json`.)*
+- [x] **Data model & seam.** Where fusion sits relative to the aligned `Frame`
       stream (`model/replay.py`) — a pure transform over aligned frames producing
       fused track IDs — keeping `model/` pure and headless-testable.
-- [ ] **Within-sensor gap-bridging policy.** Gap time/distance windows, heading/
+      *(→ §2: `model/fusion.py`, a transform *after* alignment in world-feet
+      over the Item 29 `Frame`s → `FusionResult` + `id_of`; parse `Frame.t`→
+      seconds, work in tolerant time windows, no pandas.)*
+- [x] **Within-sensor gap-bridging policy.** Gap time/distance windows, heading/
       speed continuity, the "stopped in the intersection then resumed" case; how
       to bridge without wrongly merging two different vehicles.
-- [ ] **Cross-sensor association policy.** Overlap-zone dedup + handoff ID
+      *(→ §3: velocity-selected time/space windows, forward ±60° cone, class
+      gate, refuse-on-ambiguity.)*
+- [x] **Cross-sensor association policy.** Overlap-zone dedup + handoff ID
       continuity; whether it runs after calibration (38–40) and how much it
       relies on that alignment quality.
-- [ ] **Batch vs. streaming.** Whether fusion must also run incrementally on the
+      *(→ §4: overlap dedup + handoff-id continuity; **assumes** calibration,
+      degrades flagged (not silently) when uncalibrated.)*
+- [x] **Batch vs. streaming.** Whether fusion must also run incrementally on the
       live path (`LiveAligner`) or is replay/batch-first; the state a streaming
       stitcher would carry.
-- [ ] **Success criteria & test strategy.** Concrete, checkable acceptance
+      *(→ §5: batch/replay-first; live stays raw; streaming is a documented
+      future upgrade.)*
+- [x] **Success criteria & test strategy.** Concrete, checkable acceptance
       (e.g. N hand-labeled trajectories on a real recording that must fuse into
       M), so Item 42 has a real correctness gate — the thing prior attempts
       lacked.
-- [ ] Output the plan as a design doc under `EVO/iprj_designer/` and log the
+      *(→ §6: labeled acceptance set on the real `86_US95&SH8` fixture (now
+      present — the Item 29/33 "no recording" caveat is stale) + deterministic
+      synthetic don't-merge cases; label format seeded.)*
+- [x] Output the plan as a design doc under `EVO/iprj_designer/` and log the
       decisions in [[DESIGN_HISTORY.md]] — no feature code this session.
+      *(→ [[FUSION_PLAN.md]] + DESIGN_HISTORY entry.)*
 
 Suggested prompt:
 > [Opus] In EVO/iprj_designer, do Item 41 of ROADMAP.md: produce the
@@ -779,7 +809,7 @@ Suggested prompt:
 
 ---
 
-## 42 — Fusion Engine in `model/` (Target: Fable — hardest) — needs Item 41
+## 42 — Fusion Engine in `model/` (Target: Fable — hardest) — DONE 2026-07-10 — needs Item 41
 
 The correctness-critical core the owner most wants Fable on (prior non-Fable
 attempts failed): a **pure, headless** stitching engine over the aligned `Frame`
@@ -787,18 +817,29 @@ stream — within-sensor gap-bridging **and** cross-sensor fusion, per Item 41's
 design, gated by Item 41's success criteria.
 
 Scope:
-- [ ] A pure `model/` stitcher (e.g. `model/fusion.py`) consuming aligned
+- [x] A pure `model/` stitcher (e.g. `model/fusion.py`) consuming aligned
       `Frame`s (Item 29) and emitting fused track IDs — within-sensor bridging
       (stop/drop/resume) + cross-sensor association (overlap dedup + handoff),
       per Item 41. Optionally consumes the calibrated overlay (Item 40) if 41 so
       decided.
-- [ ] Streaming variant only if Item 41 required it (state carried across
+      *(→ `model/fusion.py`: `fuse(frames, *, calibrated)` → `FusionResult`
+      (`tracks` + `id_of` for Item 43); the caller states whether the frames
+      came through a calibrated overlay — uncalibrated widens the cross-sensor
+      gate and flags `low_confidence`, per plan §4b.)*
+- [x] Streaming variant only if Item 41 required it (state carried across
       frames), reusing the batch logic — no second copy.
-- [ ] pytest against Item 41's labeled acceptance set on a real recording
+      *(→ Item 41 decided batch-only (§5): no streaming variant; live stays
+      raw for Item 43.)*
+- [x] pytest against Item 41's labeled acceptance set on a real recording
       (read-only fixtures; output to `tests/out/`/scratchpad): the hand-labeled
       trajectories fuse into the expected fused tracks; adversarial "don't merge
       these two distinct vehicles" cases hold.
-- [ ] DESIGN_HISTORY entry; check off this item.
+      *(→ `tests/fixtures/fusion_labels_86_us95_sh8.json`, verified by
+      trajectory inspection, + `tests/test_fusion.py` (28 tests): labeled
+      acceptance on the calibrated overlay, graceful+flagged uncalibrated,
+      calibration-tightens-overlaps, synthetic don't-merge adversarial
+      cases.)*
+- [x] DESIGN_HISTORY entry; check off this item.
 
 Suggested prompt:
 > [Fable] In EVO/iprj_designer, do Item 42 of ROADMAP.md following Item 41's
@@ -809,22 +850,33 @@ Suggested prompt:
 
 ---
 
-## 43 — Fusion Overlay Wiring (Target: Opus) — needs Item 42
+## 43 — Fusion Overlay Wiring (Target: Opus) — DONE 2026-07-10 — needs Item 42
 
 Wire the Item 42 engine into the overlay render: show **fused** tracks (one
 marker/ID per real vehicle) with a raw↔fused toggle, on both replay and live.
 New GUI seam → Opus.
 
 Scope:
-- [ ] Feed the aligned frame stream through the Item 42 stitcher and render fused
+- [x] Feed the aligned frame stream through the Item 42 stitcher and render fused
       track IDs on the existing marker layer (Item 30/35), both replay and live.
-- [ ] A raw↔fused toggle so the user can compare; consistent fused-ID labelling/
+      *(Two pure `model/fusion.py` render helpers — `frame_times_s` (extracted
+      from `fold_tracks`, shared clock) + `fused_frame_markers` → per-frame
+      `{fused_id: (x_ft, y_ft)}`, preserving the engine's overlap dedup on
+      screen. `Viewer.ensure_fusion()` caches `fuse()` by (recording,
+      calibrated?); `replay_marker_svg` branches on `fused_view`.)*
+- [x] A raw↔fused toggle so the user can compare; consistent fused-ID labelling/
       colour (à la `evo_replay`), reusing the marker layer — no static-SVG
-      re-render (Item 20/30 performance).
-- [ ] Streaming fusion on the live path only if Item 41/42 built it; otherwise
-      fused view is replay/batch and live shows raw.
-- [ ] DESIGN_HISTORY entry; check off this item. (Model helpers pytested; GUI
-      wiring by hand + a headless fused-render check.)
+      re-render (Item 20/30 performance). *("fused" switch in the Replay
+      transport; a shared `_marker_glyph` backs raw + fused so they read
+      identically; fused hue = evo_replay palette by `fused_id % 10`. Only the
+      `replay_layer` content is rewritten per tick.)*
+- [x] Streaming fusion on the live path only if Item 41/42 built it; otherwise
+      fused view is replay/batch and live shows raw. *(Item 41/42 decided
+      batch-only, §5 — so the toggle lives only in Replay; Live is unchanged
+      and always raw.)*
+- [x] DESIGN_HISTORY entry; check off this item. (Model helpers pytested; GUI
+      wiring by hand + a headless fused-render check.) *(test_fusion.py +5,
+      new test_fusion_gui.py (4); full suite 626 pass; page builds headless.)*
 
 Suggested prompt:
 > [Opus] In EVO/iprj_designer, do Item 43 of ROADMAP.md: wire the Item 42 fusion

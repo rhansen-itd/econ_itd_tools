@@ -1,0 +1,56 @@
+{
+  "_comment": [
+    "Hand-labeled fusion ground truth for tests/fixtures/10_37_2_86_EVO_1770311735.txt",
+    "(site 86_US95&SH8), the FUSION_PLAN.md §6 acceptance set for ROADMAP Item 42.",
+    "Members are raw [sensor, oid] keys (sensor = oid % 10). Each group was verified",
+    "by trajectory inspection (junction kinematics + a no-confusable-track-nearby",
+    "check, 2026-07-10 session; see DESIGN_HISTORY.md): 'fused'/'stitched' groups",
+    "must come out as exactly one fused track with exactly these members; 'single'",
+    "entries are controls that must NOT merge with anything (a stationary object,",
+    "and two distinct simultaneous vehicles queuing nose-to-tail). Slots 4/5 are",
+    "the sensors' secondary (cls=0) streams; they carry ~17 ft of systematic offset",
+    "because the per-sensor calibration rightly refuses their sparse pair sets."
+  ],
+  "labels": [
+    {
+      "expect": "fused",
+      "members": [[0, 714780], [1, 420531]],
+      "note": "NE-bound through the S0/S1 overlap; 7.6 s dual coverage, dedup"
+    },
+    {
+      "expect": "fused",
+      "members": [[1, 421261], [0, 717220]],
+      "note": "arrives on the diagonal, stops ~60 s at the light at (530,227), resumes; S1->S0 handoff mid-acceleration with 5.6 s overlap"
+    },
+    {
+      "expect": "fused",
+      "members": [[0, 716460], [1, 421491], [5, 421505]],
+      "note": "three-source NE-through: both sensors plus S1's secondary slot"
+    },
+    {
+      "expect": "fused",
+      "members": [[0, 715090], [5, 420685]],
+      "note": "SW-bound; short secondary-slot echo wholly inside the S0 track"
+    },
+    {
+      "expect": "stitched",
+      "members": [[1, 421051], [1, 421131]],
+      "note": "creeps to a stop at (632,-927), drops 3.9 s, resumes 26 ft on; isolated corridor, no confusable track"
+    },
+    {
+      "expect": "single",
+      "members": [[0, 717120]],
+      "note": "stationary object at (345,563) tracked 3.5 min by S0 only; nothing may merge into it"
+    },
+    {
+      "expect": "single",
+      "members": [[1, 422921]],
+      "note": "queue arrival; distinct from and concurrent with 422971 stopped one car-length away"
+    },
+    {
+      "expect": "single",
+      "members": [[1, 422971]],
+      "note": "the neighbouring queued vehicle of 422921; the pair pins two-nearby-vehicles-stay-separate on real data"
+    }
+  ]
+}

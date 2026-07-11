@@ -101,6 +101,62 @@ def test_align_uses_raw_meters_not_precomputed_feet(viewer):
 
 
 @needs_us95
+def test_ghost_sensors_track_the_group_move(viewer):
+    """The 2026-07-11 reframing: ghost sensor copies sit exactly on the real
+    sensors at the automatic fit and translate with a group drag — the visible
+    'how much have the sensors moved' the owner asked for."""
+    v = viewer
+    base = build_alignment(v.project, v.replay.zones, None)
+    v.align_base = base
+    v.align_placement = base.placement
+    fpp = v.ft_per_px()
+
+    ghosts = v.align_ghosts()
+    assert {si for si, *_ in ghosts} == {0, 1}  # both mapped sensors
+    for _si, real, ghost, daz in ghosts:
+        assert ghost == pytest.approx(real, abs=1e-6)  # nothing authored yet
+        assert daz == pytest.approx(0.0, abs=1e-9)
+    assert not v.align_dirty()
+
+    v.align_placement = translated(base.placement, 20.0, -8.0)
+    for _si, real, ghost, daz in v.align_ghosts():
+        moved = ((ghost[0] - real[0]) * fpp, (ghost[1] - real[1]) * fpp)
+        assert moved == pytest.approx((20.0, -8.0), abs=1e-6)
+        assert daz == pytest.approx(0.0, abs=1e-6)
+    assert v.align_dirty()
+
+    svg = v.align_marker_svg()
+    assert "S1&#8242;" in svg and "S2&#8242;" in svg  # ghost labels rendered
+    assert "<line" in svg  # displacement leader from real sensor to ghost
+
+
+@needs_us95
+def test_rotate_preview_swings_the_overlay_before_commit(viewer):
+    """The Align 2-click rotate previews live (2026-07-11 fix): while aiming,
+    align_render_alignment() applies rotated_about to the placement so markers
+    and ghosts swing with the cursor before the second click commits."""
+    v = viewer
+    base = build_alignment(v.project, v.replay.zones, None)
+    v.align_base = base
+    v.align_placement = base.placement
+    before = v.align_marker_svg()
+
+    v.align_rotate_armed = True
+    v.rotate_pivot = (900.0, 900.0)  # world px, as the click handler stores it
+    v.rotate_angle = 10.0
+    preview = v.align_marker_svg()
+    assert preview != before
+
+    fpp = v.ft_per_px()
+    expected = rotated_about(base.placement, (900.0 * fpp, 900.0 * fpp), 10.0)
+    got = v.align_render_alignment().placement
+    assert (got.a_re, got.a_im, got.t_x, got.t_y) == pytest.approx(
+        (expected.a_re, expected.a_im, expected.t_x, expected.t_y))
+    # the authored placement itself is untouched until the commit click
+    assert v.align_placement == base.placement
+
+
+@needs_us95
 def test_live_source_precedence_and_staleness(viewer):
     """align_source_frame prefers a fresh live slot over the recording, and
     treats a stale live slot as absent (the LIVE_STALE_TIMEOUT rule)."""
@@ -120,3 +176,25 @@ def test_live_source_precedence_and_staleness(viewer):
     # a stale slot -> None (overlay clears rather than freezing)
     v.live_frame = (live_frame, _time.monotonic() - LIVE_STALE_TIMEOUT - 1.0)
     assert v.align_source_frame() is None
+
+
+def test_marker_source_routing():
+    """marker_source() (Item 40, owner fix 2026-07-11): the Overlay sub-modes
+    keep their own painter, Record stays blank, and every non-overlay mode
+    persists a running overlay source — live winning over a loaded recording —
+    instead of clearing. This is the headless check for the relaxed
+    read-only-canvas invariant refresh_marker_layer dispatches on."""
+    from gui.app import marker_source
+
+    # overlay sub-modes: painter follows the mode, sources irrelevant
+    assert marker_source("Replay", False, False) == "replay"
+    assert marker_source("Live", False, False) == "live"
+    assert marker_source("Align", True, True) == "align"
+    assert marker_source("Record", True, True) == ""
+
+    # non-overlay modes: whatever source is running persists
+    for mode in ("Draw", "Edit", "Sensor", "Centerline", "Background"):
+        assert marker_source(mode, False, False) == ""
+        assert marker_source(mode, True, False) == "replay"
+        assert marker_source(mode, False, True) == "live"
+        assert marker_source(mode, True, True) == "live"  # live wins

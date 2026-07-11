@@ -236,6 +236,18 @@ overlay *persists into draw/edit*, driven by the same `replay_layer` +
 
 ## 5. Preview → commit
 
+> **Amendment (owner, 2026-07-11 — supersedes §5b below).** Align is not
+> "seat the overlay": its product is a **proposed sensor move**. The default
+> stream→iprj mapping is applied automatically at open (the `Z;` fit /
+> translation fallback — nothing to author); Align then shows **ghost copies
+> of the mapped sensors** moving together with the tracks, and Commit writes
+> the *composed* per-sensor world delta — calibration **and** the group-
+> placement change relative to that default baseline — into each sensor's
+> azimuth/position (`model.calibration.world_delta` / `commit_alignment`).
+> A pure group drag therefore commits too. §5b's "group placement is not
+> written per-sensor" rule is retired; the baseline re-bases on commit so a
+> second commit cannot double-apply. See DESIGN_HISTORY 2026-07-11.
+
 **Decision: uncommitted alignment is in-memory session state (reversible,
 project untouched); commit writes only the *calibration* into per-sensor
 `azimuth_angle` + `position_x/y`; group placement is not written per-sensor.**

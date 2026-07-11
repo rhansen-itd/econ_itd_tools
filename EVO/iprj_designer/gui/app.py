@@ -204,10 +204,11 @@ from model.multifile import (MAX_SENSORS, BackgroundMismatch,
                              pair_role, split_project)
 from model.calibration import (IDENTITY, AlignmentTransform, Placement,
                                RigidDelta, build_alignment, calibrate,
-                               commit_calibration, nudged_delta, rotated_about,
-                               translated)
+                               commit_alignment, nudged_delta, rotated_about,
+                               translated, world_delta)
 from model.replay import (Frame, LiveAligner, Recording, load_recording,
                           marker_color, realign, short_id)
+from model.fusion import fuse, fused_frame_markers, frame_times_s
 from model.zonefit import ZoneFit
 from model.templates import (DIRECTIONS, PlacementContext, expand_and_place,
                              expand_and_place_on_centerline, load_template,
@@ -276,7 +277,9 @@ def effective_mode(tool_val: str, kind_val: str, overlay_kind_val: str = "Replay
     themselves are unchanged from Items 30/31/35, only their entry point
     moved. Align (ROADMAP Item 40) is a fourth Overlay sub-kind: an
     interactive-alignment mode where the overlay persists over an editable
-    canvas and sensor drag/rotate seats the calibrated group (plan §4)."""
+    canvas and drag/rotate moves ghost copies of the sensors together with
+    their tracks — a proposed sensor move, committable into the iprj (plan
+    §4, reframed 2026-07-11)."""
     if tool_val == "Edit":
         return "Edit"
     if tool_val == "Background":
@@ -288,6 +291,28 @@ def effective_mode(tool_val: str, kind_val: str, overlay_kind_val: str = "Replay
     if kind_val == "Sensor":
         return "Sensor"
     return "Draw"
+
+
+def marker_source(mode_val: str, has_replay: bool, live_running: bool) -> str:
+    """Which painter drives the shared track-marker layer (ROADMAP Item 40,
+    owner fix 2026-07-11). The Overlay sub-modes each own their painter
+    ("replay"/"live"/"align"; Record is blank — it captures, nothing to
+    overlay). Every *other* mode — Draw, Edit, Sensor, Centerline,
+    Background — persists whatever overlay source is running instead of
+    clearing: this is Item 40's relaxed read-only invariant, so the tracks
+    stay on screen (and animating — see _enter_mode) while the user draws or
+    edits under them. A running live feed wins over a loaded recording, the
+    same precedence align_source_frame() uses. Pure, so the routing is
+    testable headless; refresh_marker_layer just dispatches on it."""
+    if mode_val in ("Replay", "Live", "Align"):
+        return mode_val.lower()
+    if mode_val == "Record":
+        return ""
+    if live_running:
+        return "live"
+    if has_replay:
+        return "replay"
+    return ""
 
 
 def general_offered(mode: str, draw_kind: str) -> bool:
@@ -480,6 +505,18 @@ class Viewer:
         self.replay_playing = False
         self.replay_speed = 1.0
         self.replay_labels = True
+        # Fusion overlay (ROADMAP Item 43): a raw↔fused toggle over the Replay
+        # markers. Fused view runs the Item 42 batch stitcher over the loaded
+        # recording and renders one marker/id per real vehicle (cross-sensor
+        # dedup + within-sensor stitch), instead of the raw per-sensor points.
+        # The result is expensive to compute over a whole recording, so it is
+        # cached, keyed by (recording identity, calibrated?) — recomputed only
+        # when the recording or its calibration state changes. Fusion is
+        # batch-only (FUSION_PLAN §5), so Live always shows raw.
+        self.fused_view = False
+        self._fusion = None            # cached FusionResult
+        self._fusion_frames: tuple = ()  # per-frame {fused_id: (x_ft, y_ft)}
+        self._fusion_key = None        # (id(recording), calibrated) of the cache
         # Record (ROADMAP Item 31, plan §5): live capture sessions keyed by
         # host, so the Record dialog can be reopened to check on / stop a
         # capture started earlier without losing it. Single-host minimum
@@ -520,8 +557,18 @@ class Viewer:
         self.align_labels = True
         self.align_rotate_armed = False  # group-rotate 2-click, like Edit rotate
         self.align_drag: dict | None = None  # in-flight group / per-sensor drag
-        # Pre-commit snapshot {si: (azimuth, x_px, y_px)} for the commit undo
-        # (plan §5d): None until a commit, restored by the align Undo button.
+        # The *baseline* mapping (owner reframing, 2026-07-11): the automatic,
+        # uncalibrated fit consistent with the sensors' stored iprj placement.
+        # Ghost sensors render at world_delta(align_base, current, slot) applied
+        # to each mapped sensor — "where the sensor would be if it were moved so
+        # its stream lands where the overlay now shows it" — and Commit writes
+        # exactly that. Seeded once per authoring session; re-based to the
+        # committed transform on Commit so ghosts collapse onto the moved
+        # sensors instead of double-counting.
+        self.align_base: AlignmentTransform | None = None
+        # Pre-commit snapshot {"sensors": {si: (azimuth, x_px, y_px)},
+        # "base": AlignmentTransform} for the commit undo (plan §5d): None
+        # until a commit, restored by the align Undo button.
         self.align_commit_snapshot: dict | None = None
         # Generic (non-chain) Lineals: a project-wide pool the Lineal draw
         # kind targets, round-tripped via model/centerline.py's
@@ -1149,6 +1196,15 @@ class Viewer:
                          f'width="{x1 - x0:.1f}" height="{y1 - y0:.1f}" '
                          f'fill="#00e5ff" fill-opacity="0.08" stroke="#00e5ff" '
                          f'stroke-width="{lw}" stroke-dasharray="{3 * lw} {2 * lw}"/>')
+        # Align group-rotate (Item 40 fix, 2026-07-11): the pivot cross was
+        # only ever drawn for Edit rotate, so Align rotate gave no visual
+        # anchor at all. The rotation *preview* lives on the marker layer
+        # (markers + ghosts through align_render_alignment); only the pivot
+        # belongs on the static overlay.
+        if self.mode == "Align" and self.align_rotate_armed \
+                and self.rotate_pivot is not None:
+            px, py = w2i(self.rotate_pivot)
+            parts.append(_cross(px, py, 6 * lw, "#ff4081", lw))
         # rotate (§6.4): pivot cross (seeded at the selection centroid before
         # click 1 places it explicitly) plus a live rotated-outline preview
         # of every selected element once the user is aiming past the pivot.
@@ -1268,26 +1324,79 @@ class Viewer:
             else:
                 fx, fy = pt.x_ft, pt.y_ft
             cx, cy = self.replay_point_to_canvas(fx, fy)
-            color = marker_color(pt.sensor)
-            parts.append(f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{r:.1f}" '
-                         f'fill="{color}" fill-opacity="0.9" stroke="black" '
-                         f'stroke-width="{lw / 2:.2f}"/>')
-            if labels:
-                label = escape(short_id(pt.oid))
-                parts.append(
-                    f'<text x="{cx:.1f}" y="{cy - r - lw:.1f}" fill="white" '
-                    f'font-size="{font:.1f}" text-anchor="middle" '
-                    f'paint-order="stroke" stroke="black" '
-                    f'stroke-width="{font / 8:.2f}">{label}</text>')
+            parts.append(self._marker_glyph(
+                cx, cy, marker_color(pt.sensor),
+                escape(short_id(pt.oid)) if labels else "", lw, r, font))
         return "".join(parts)
+
+    def _marker_glyph(self, cx, cy, color, label, lw, r, font) -> str:
+        """One marker's SVG — the circle plus (when *label* is non-empty) its
+        id text. The single glyph both the raw (`_marker_svg`) and fused
+        (`_fused_marker_svg`, Item 43) paths emit, so a marker reads identically
+        whichever produced it."""
+        glyph = (f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{r:.1f}" '
+                 f'fill="{color}" fill-opacity="0.9" stroke="black" '
+                 f'stroke-width="{lw / 2:.2f}"/>')
+        if label:
+            glyph += (
+                f'<text x="{cx:.1f}" y="{cy - r - lw:.1f}" fill="white" '
+                f'font-size="{font:.1f}" text-anchor="middle" '
+                f'paint-order="stroke" stroke="black" '
+                f'stroke-width="{font / 8:.2f}">{label}</text>')
+        return glyph
+
+    def _fused_marker_svg(self, markers, labels: bool) -> str:
+        """Marker SVG for one frame's *markers* — a ``{fused_id: (x_ft, y_ft)}``
+        dict from the Item 42 stitcher (ROADMAP Item 43): one marker per real
+        vehicle, coloured/labelled by fused id so the same vehicle keeps one
+        colour+id across sensors and stitched gaps. Colour cycles the evo_replay
+        sensor palette by ``fused_id % 10`` — a stable per-vehicle hue reusing
+        the same look as the raw markers."""
+        lw = self.overlay_px / max(self.viewport.scale, 0.05)
+        r = 4 * lw
+        font = 7 * lw
+        parts = []
+        for fid, (fx, fy) in markers.items():
+            cx, cy = self.replay_point_to_canvas(fx, fy)
+            parts.append(self._marker_glyph(
+                cx, cy, marker_color(fid % 10),
+                escape(short_id(fid)) if labels else "", lw, r, font))
+        return "".join(parts)
+
+    def ensure_fusion(self):
+        """Compute (or return the cached) fused view of the loaded recording
+        (ROADMAP Item 43). Keyed by (recording identity, calibrated?) so it is
+        run once and reused across every frame/tick, and re-run only when the
+        recording or its calibration changes. Returns the ``FusionResult`` (or
+        None when no recording is loaded). ``calibrated`` follows whether the
+        recording's frames came through a calibrated overlay (Items 38–40): an
+        uncalibrated stream widens the cross-sensor gate and flags the result
+        (FUSION_PLAN §4b)."""
+        rec = self.replay
+        if rec is None or not rec.frames:
+            return None
+        calibrated = bool(rec.alignment is not None and rec.alignment.calib)
+        key = (id(rec), calibrated)
+        if self._fusion_key != key:
+            self._fusion = fuse(rec.frames, calibrated=calibrated)
+            self._fusion_frames = fused_frame_markers(
+                self._fusion, frame_times_s(rec.frames))
+            self._fusion_key = key
+        return self._fusion
 
     def replay_marker_svg(self) -> str:
         """Markers for the current replay frame (ROADMAP Item 30). Returns ""
-        when no recording is loaded, so the layer is empty off-Replay."""
+        when no recording is loaded, so the layer is empty off-Replay. With the
+        fused toggle on (Item 43) the frame's fused markers (one per real
+        vehicle) render instead of the raw per-sensor points."""
         rec = self.replay
         if rec is None or not rec.frames:
             return ""
         i = max(0, min(self.replay_frame, len(rec.frames) - 1))
+        if self.fused_view:
+            self.ensure_fusion()
+            markers = self._fusion_frames[i] if i < len(self._fusion_frames) else {}
+            return self._fused_marker_svg(markers, self.replay_labels)
         return self._marker_svg(rec.frames[i].points, self.replay_labels)
 
     def live_marker_svg(self) -> str:
@@ -1329,16 +1438,131 @@ class Viewer:
                                   placement=self.align_placement,
                                   calibration=self.align_calibration)
 
+    def align_render_alignment(self):
+        """current_alignment() with the in-flight 2-click rotate preview
+        applied, so markers *and ghost sensors* swing live while the user is
+        aiming — commit_align_rotate then makes the previewed value real."""
+        tr = self.current_alignment()
+        if (tr is None or not self.align_rotate_armed
+                or self.rotate_pivot is None or not self.rotate_angle):
+            return tr
+        fpp = self.ft_per_px()
+        if fpp is None:
+            return tr
+        pivot_ft = (self.rotate_pivot[0] * fpp, self.rotate_pivot[1] * fpp)
+        return AlignmentTransform(
+            calib=tr.calib,
+            placement=rotated_about(tr.placement, pivot_ft, self.rotate_angle),
+            calibration=tr.calibration)
+
+    def align_slot_map(self) -> dict[int, int]:
+        """Stream slot → project sensor index, from the overlay source's Z;
+        fit. Kept off the *source* (recording / live aligner) rather than the
+        current placement because a manual group drag turns the placement into
+        a plain ``Placement`` that no longer carries the match (plan §3). With
+        no Z; the slot is assumed to be the sensor index itself — the vendor's
+        ``oid % 10`` convention on a site authored slot-for-sensor."""
+        zf = None
+        if self.live_session is not None and self.live_aligner is not None:
+            zf = self.live_aligner.zone_fit
+        elif self.replay is not None:
+            zf = self.replay.zone_fit
+        if zf is not None:
+            return dict(zf.slot_to_sensor)
+        return {si: si for si in range(len(self.project.sensors))}
+
+    def align_ghosts(self) -> list[tuple[int, tuple, tuple, float]]:
+        """Ghost-sensor placements for the Align overlay (owner reframing,
+        2026-07-11): ``[(sensor_index, real_pos_px, ghost_pos_px,
+        d_azimuth_deg)]`` for every mapped sensor with a stored position.
+
+        The ghost is where the sensor *would have to move* for its stream to
+        land where the authored transform now renders it — the whole point of
+        the workflow. Computed live against the baseline mapping, so a group
+        drag/rotate (including the rotate preview) moves ghosts and markers
+        together while the background and the real sensors stay put."""
+        base, cur = self.align_base, self.align_render_alignment()
+        fpp = self.ft_per_px()
+        if base is None or cur is None or fpp is None:
+            return []
+        out = []
+        for slot, si in sorted(self.align_slot_map().items()):
+            if not 0 <= si < len(self.project.sensors):
+                continue
+            s = self.project.sensors[si]
+            if s.position_x is None or s.position_y is None:
+                continue
+            try:
+                wd = world_delta(base, cur, slot)
+            except ValueError:  # degenerate placement — no ghost to show
+                continue
+            g_ft = wd.apply_ft(s.position_x * fpp, s.position_y * fpp)
+            out.append((si, (s.position_x, s.position_y),
+                        (g_ft[0] / fpp, g_ft[1] / fpp), wd.rotation_deg))
+        return out
+
+    def align_dirty(self) -> bool:
+        """Whether the authored alignment proposes any real sensor move —
+        gates the Commit button and the status-line Δ readout."""
+        fpp = self.ft_per_px()
+        if fpp is None:
+            return False
+        return any(
+            math.hypot(g[0] - r[0], g[1] - r[1]) * fpp >= 0.05
+            or abs(daz) >= 0.01
+            for _, r, g, daz in self.align_ghosts())
+
     def align_marker_svg(self) -> str:
-        """Markers for the Align overlay (Item 40): the source frame re-aligned
-        live through current_alignment(), so a group drag/rotate re-seats the
-        tracks over the zones in real time. Empty when there's no source frame
-        or no placement yet."""
-        frame = self.align_source_frame()
-        align = self.current_alignment()
-        if frame is None or align is None:
+        """The Align overlay (Item 40, reframed 2026-07-11): the source frame
+        re-aligned live through the authored transform, plus ghost copies of
+        the mapped sensors moving with it — so a group drag/rotate visibly
+        moves the *sensors* and their tracks together against the fixed
+        background. Empty when no placement is seeded yet."""
+        align = self.align_render_alignment()
+        if align is None:
             return ""
-        return self._marker_svg(frame.points, self.align_labels, align=align)
+        parts = ""
+        frame = self.align_source_frame()
+        if frame is not None:
+            parts = self._marker_svg(frame.points, self.align_labels,
+                                     align=align)
+        return parts + self._align_ghost_svg()
+
+    def _align_ghost_svg(self) -> str:
+        """Dashed ghost-sensor glyphs + displacement leaders, rendered on the
+        marker layer so drag ticks stay marker-layer-only (plan §6). The ghost
+        triangle is rotated by the proposed azimuth change, and a leader line
+        ties it back to the real (unmoved) sensor so the size of the proposed
+        move reads at a glance."""
+        ghosts = self.align_ghosts()
+        if not ghosts:
+            return ""
+        lw = self.overlay_px / max(self.viewport.scale, 0.05)
+        font = 7 * lw
+        s = 6 * lw
+        parts = []
+        for si, real_px, ghost_px, d_az in ghosts:
+            ox, oy = self.world_to_canvas(real_px)
+            gx, gy = self.world_to_canvas(ghost_px)
+            if math.hypot(gx - ox, gy - oy) > 0.5:
+                parts.append(
+                    f'<line x1="{ox:.1f}" y1="{oy:.1f}" x2="{gx:.1f}" '
+                    f'y2="{gy:.1f}" stroke="#ff9800" stroke-width="{lw / 2:.2f}" '
+                    f'stroke-dasharray="{2 * lw} {2 * lw}"/>')
+            tri = (f'{gx:.1f},{gy - s:.1f} {gx - s:.1f},{gy + s:.1f} '
+                   f'{gx + s:.1f},{gy + s:.1f}')
+            rot = (f' transform="rotate({d_az:.2f} {gx:.1f} {gy:.1f})"'
+                   if abs(d_az) > 0.01 else '')
+            parts.append(f'<polygon points="{tri}" fill="#ff9800" '
+                         f'fill-opacity="0.35" stroke="#ff9800" '
+                         f'stroke-width="{lw:.2f}" '
+                         f'stroke-dasharray="{3 * lw} {2 * lw}"{rot}/>')
+            parts.append(f'<text x="{gx:.1f}" y="{gy + s + font:.1f}" '
+                         f'fill="#ff9800" font-size="{font:.1f}" '
+                         f'text-anchor="middle" paint-order="stroke" '
+                         f'stroke="black" stroke-width="{font / 6:.2f}">'
+                         f'S{si + 1}&#8242;</text>')
+        return "".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -2526,9 +2750,20 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             else:
                 n = len(v.replay.frames)
                 f = v.replay.frames[v.replay_frame]
+                if v.fused_view:
+                    res = v.ensure_fusion()
+                    markers = (v._fusion_frames[v.replay_frame]
+                               if v.replay_frame < len(v._fusion_frames) else {})
+                    nt = len(markers)
+                    view = (f"{nt} fused track{'s' if nt != 1 else ''}"
+                            + (" (low-confidence)"
+                               if res is not None and res.low_confidence else ""))
+                else:
+                    nt = len(f.points)
+                    view = f"{nt} track{'s' if nt != 1 else ''}"
                 status_label.set_text(
                     f"mode: replay | frame {v.replay_frame + 1}/{n} | {f.t} | "
-                    f"{len(f.points)} track{'s' if len(f.points) != 1 else ''} | "
+                    f"{view} | "
                     f"{'playing' if v.replay_playing else 'paused'}")
         elif v.mode == "Live":
             s = v.live_session
@@ -2568,9 +2803,11 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             v.mode == "Edit" and v.draw_kind_name == "Event Zone"
             and len(v.ctrl.selection) == 1 and 0 <= v.ctrl.selected < len(zones)
             and attached_centerline_for(zones[v.ctrl.selected]) is not None)
-        # Align (Item 40): Commit only once there's a calibration to write and
-        # no pending commit; Undo only while a commit snapshot is held.
-        align_commit_btn.set_enabled(bool(v.align_calib)
+        # Align (Item 40, reframed 2026-07-11): Commit whenever the authored
+        # alignment proposes a real sensor move (calibration *or* a group
+        # drag/rotate) and no commit is pending; Undo only while a commit
+        # snapshot is held.
+        align_commit_btn.set_enabled(v.align_dirty()
                                      and v.align_commit_snapshot is None)
         align_undo_btn.set_enabled(v.align_commit_snapshot is not None)
         refresh_zone_table()
@@ -2888,6 +3125,11 @@ def build_ui(viewer: Viewer, state: dict) -> None:
                 else:
                     v.rotate_angle = geometry.rotation_angle_deg(
                         v.rotate_pivot, v.rotate_ray, pw)
+                # live preview (2026-07-11 fix): markers + ghost sensors swing
+                # with the aim through align_render_alignment(), so the rotate
+                # is judged visually instead of committed blind
+                refresh_marker_layer()
+                refresh_status()
             refresh_overlay()
         elif v.ruler_active:
             if v.ruler_pending:
@@ -3105,17 +3347,18 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             cancel_rotate()
         v.marquee_anchor = None
         v.marquee_cursor = None
-        # Leaving Replay stops the animation; leaving Live tears down the
-        # connection + overlay timer (plan §4). Leaving Record just stops its
-        # status poll — an in-progress capture keeps running (close ≠ stop,
-        # same as the old dialog-only Record). The marker layer itself is
-        # refreshed by the caller (change_tool/change_overlay_kind), which
-        # clears it off both Replay/Live modes.
-        if new_mode != "Replay":
+        # Item 40, owner fix 2026-07-11: the overlay persists — still playing —
+        # across every non-overlay mode, so Draw/Edit keep the animated tracks
+        # (marker_source() renders them there; the caller's
+        # refresh_marker_layer picks that up). Only choosing a *different*
+        # Overlay source stops the current one: entering Record/Live/Align
+        # pauses the replay transport, and entering Record/Replay tears down
+        # the live session (Live↔Align keeps it running, as before). Leaving
+        # Record just stops its status poll — an in-progress capture keeps
+        # running (close ≠ stop, same as the old dialog-only Record).
+        if new_mode in ("Record", "Live", "Align"):
             _pause_replay()
-        # Align works *on* a live overlay, so keep the live session running
-        # across Live↔Align; only tear it down when leaving overlay entirely.
-        if new_mode not in ("Live", "Align"):
+        if new_mode in ("Record", "Replay"):
             _stop_live()
         if new_mode == "Align":
             enter_align()  # seed the group placement + route the live feed
@@ -3126,7 +3369,7 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         _enter_mode(effective_mode(e.value, kind, overlay_kind_toggle.value))
         update_context_bar()
         refresh_overlay()
-        refresh_marker_layer()  # show markers entering Replay/Live, clear leaving
+        refresh_marker_layer()  # re-route the marker painter (marker_source)
         refresh_status()
 
     def change_draw_kind(e):
@@ -3255,16 +3498,22 @@ def build_ui(viewer: Viewer, state: dict) -> None:
     _replay_scrub_lock = [False]
 
     def refresh_marker_layer():
-        """Rewrite the shared track-marker layer (plan §4): Replay markers in
-        Replay mode, live markers in Live mode, empty otherwise — so the overlay
-        above the static svg() layer clears the moment either mode is left.
-        Called on every zoom/pan (via apply_transform) so marker sizes track the
-        zoom, and on each replay/live timer tick / scrub."""
-        if v.mode == "Replay":
+        """Rewrite the shared track-marker layer (plan §4) from whichever
+        painter marker_source() picks: the Overlay sub-modes render their own,
+        and every non-overlay mode keeps a running live feed or loaded
+        recording visible — Item 40's relaxed read-only invariant (owner fix
+        2026-07-11), so the overlay persists over Draw/Edit instead of
+        clearing the moment those modes are entered. Called on every zoom/pan
+        (via apply_transform) so marker sizes track the zoom, and on each
+        replay/live timer tick / scrub."""
+        src = marker_source(
+            v.mode, v.replay is not None,
+            v.live_session is not None and v.live_session.running)
+        if src == "replay":
             replay_layer.content = v.replay_marker_svg()
-        elif v.mode == "Live":
+        elif src == "live":
             replay_layer.content = v.live_marker_svg()
-        elif v.mode == "Align":
+        elif src == "align":
             replay_layer.content = v.align_marker_svg()
         else:
             replay_layer.content = ""
@@ -3345,6 +3594,25 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         v.replay_labels = bool(e.value)
         refresh_marker_layer()
 
+    def toggle_fused_view(e):
+        """Raw↔fused toggle (ROADMAP Item 43): flip the Replay markers between
+        the raw per-sensor points and the Item 42 fused tracks (one marker/id
+        per real vehicle). Fusion over a whole recording is the expensive step,
+        so compute + cache it here on the switch-on (with a note), not on the
+        render tick; a stitched/low-confidence summary lands in the status."""
+        v.fused_view = bool(e.value)
+        if v.fused_view and v.replay is not None:
+            res = v.ensure_fusion()
+            if res is not None:
+                n_fused = sum(1 for t in res.tracks if t.kind != "single")
+                note = (f"fused {len(res.id_of)} raw tracks → "
+                        f"{len(res.tracks)} ({n_fused} stitched/merged)")
+                if res.low_confidence:
+                    note += " — low-confidence (uncalibrated)"
+                ui.notify(note)
+        refresh_marker_layer()
+        refresh_status()
+
     def recording_files() -> dict:
         """EVO recordings discoverable near the loaded project — the site
         folder and its `recordings/` subfolder (Item 28's file convention).
@@ -3389,6 +3657,13 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         v.align_calib = {}
         v.align_calibration = None
         v.align_commit_snapshot = None
+        v.align_base = None
+        # ...and any cached fused view (Item 43): recomputed for this recording
+        # on the next fused-view render (id() can be reused after GC, so don't
+        # lean on the key alone).
+        v._fusion = None
+        v._fusion_frames = ()
+        v._fusion_key = None
         replay_timer.active = False
         n = len(rec.frames)
         _replay_scrub_lock[0] = True
@@ -3752,8 +4027,17 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         """(Re)seed the group placement G from the current calibration: G is the
         zonefit refit over calibrated centroids when Z; exists, else the
         translation seed from the sensor anchor (plan §§1/3). Resets any manual
-        drag/rotate override to the automatic fit."""
+        drag/rotate override to the automatic fit.
+
+        Also seeds the *baseline* mapping (once per authoring session): the
+        uncalibrated automatic fit, i.e. the default stream→iprj mapping the
+        sensors' stored placement implies. Ghosts and Commit measure against
+        it; a commit re-bases it (see align_commit), so it is only filled in
+        here when absent."""
         zones, anchor, ref = _align_zones_anchor_ref()
+        if v.align_base is None:
+            v.align_base = build_alignment(v.project, list(zones), None,
+                                           anchor_ft=anchor, ref_m=ref)
         tr = build_alignment(v.project, list(zones), v.align_calibration,
                              anchor_ft=anchor, ref_m=ref)
         if tr is None:
@@ -3782,25 +4066,10 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             v.replay = realign(v.replay, tr)
         _push_live_alignment()
 
-    def _align_slot_map() -> dict:
-        """Stream slot → project sensor index, from the overlay source's Z; fit.
-        Kept off the *source* (recording / live aligner) rather than the current
-        placement because a manual group drag turns the placement into a plain
-        ``Placement`` that no longer carries the match (plan §3). With no Z; the
-        slot is the sensor index itself."""
-        zf = None
-        if v.live_session is not None and v.live_aligner is not None:
-            zf = v.live_aligner.zone_fit
-        elif v.replay is not None:
-            zf = v.replay.zone_fit
-        if zf is not None:
-            return dict(zf.slot_to_sensor)
-        return {s: s for s in v.align_calib}
-
     def _active_slot() -> int:
         """The stream slot (oid % 10) of the active project sensor — the target
         of an unlocked per-sensor nudge."""
-        for slot, si in _align_slot_map().items():
+        for slot, si in v.align_slot_map().items():
             if si == v.active_si:
                 return slot
         return v.active_si
@@ -3830,7 +4099,14 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             ui.notify("no frames yet — load a recording or let the live overlay "
                       "run a moment first", type="warning")
             return
-        cal = calibrate(frames)
+        # Solve only over stream slots that map to project sensors (2026-07-11
+        # fix): oid % 10 is just an id convention, so a stream can carry stray
+        # slots (fused/transient ids) that are not sensors — previously those
+        # were solved and reported as impossible sensors ("S5/S6 too few
+        # pairs" on a 4-sensor site). reference=None lets the solver anchor on
+        # the best-observed real sensor instead of a hard-wired slot 0.
+        smap = v.align_slot_map()
+        cal = calibrate(frames, reference=None, slots=set(smap) or None)
         if not cal.sensors:
             ui.notify("no sensors seen in the frames", type="warning")
             return
@@ -3840,12 +4116,18 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         _push_live_alignment()
         refresh_marker_layer()
         refresh_status()
+
+        def slot_name(slot: int) -> str:
+            si = smap.get(slot)
+            return f"S{si + 1}" if si is not None else f"slot {slot}"
+
         ok = [s for s in cal.sensors if s.status in ("ok", "translation_only")]
         flagged = cal.flagged
-        parts = [f"calibrated {len(ok)} sensor{'s' if len(ok) != 1 else ''}"]
+        parts = [f"calibrated {len(ok)} sensor{'s' if len(ok) != 1 else ''} "
+                 f"(ref {slot_name(cal.reference)})"]
         if flagged:
             parts.append(", ".join(
-                f"S{s.sensor + 1}:{s.status}" for s in flagged))
+                f"{slot_name(s.sensor)}:{s.status}" for s in flagged))
         ui.notify(" — ".join(parts),
                   type="positive" if v.align_calib else "warning")
 
@@ -3913,32 +4195,37 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         refresh_status()
 
     async def align_commit():
-        """Fold the per-sensor calibration into the iprj sensors' azimuth +
-        position (plan §5b/§5c — only calibration commits; G is reproducible
-        from Z; or stays a designer-side layer). Confirmed, snapshotted for
-        undo, and left applied to the current (uncorrected) recording so the
-        overlay doesn't jump — the write persists the mounting correction for
-        future captures / the field device, matching the commit→re-solve
-        ≈identity contract the model layer proves."""
+        """Write the proposed sensor moves — the ghost positions — into the
+        iprj sensors' azimuth + position (owner reframing, 2026-07-11: the
+        whole authored alignment, calibration *and* group placement, reads as
+        a sensor move; a pure group drag commits too). Confirmed, snapshotted
+        for undo, and the baseline re-bases to the committed transform so the
+        ghosts collapse onto the moved sensors and the overlay doesn't jump."""
         tr = v.current_alignment()
-        if tr is None or not tr.calib:
-            ui.notify("nothing to commit — run Auto-calibrate first (only the "
-                      "per-sensor calibration commits, plan §5b)", type="warning")
+        base = v.align_base
+        if tr is None or base is None:
+            ui.notify("nothing to commit — load an overlay and move the group "
+                      "or run Auto-calibrate first", type="warning")
             return
-        updates = commit_calibration(v.project, tr, slot_to_sensor=_align_slot_map())
+        updates = commit_alignment(v.project, tr, base,
+                                   slot_to_sensor=v.align_slot_map())
         if not updates:
-            ui.notify("no committable sensors — need a Z; sensor match and a "
-                      "stored sensor position", type="warning")
+            ui.notify("nothing to commit — the sensors already sit where the "
+                      "alignment puts them", type="warning")
             return
+        fpp = v.ft_per_px()
         with ui.dialog() as dlg, ui.card():
-            ui.label("Commit calibration to sensors").classes("text-lg")
-            ui.label("Writes each sensor's mounting correction into the "
-                     "project (reversible with the undo button):") \
-                .classes("text-sm text-gray-400")
-            for si, (az, _px) in sorted(updates.items()):
+            ui.label("Commit sensor moves").classes("text-lg")
+            ui.label("Moves each sensor to its ghost position (reversible "
+                     "with the undo button):").classes("text-sm text-gray-400")
+            for si, (az, px) in sorted(updates.items()):
                 old = v.project.sensors[si]
+                moved_ft = (math.hypot(px[0] - old.position_x,
+                                       px[1] - old.position_y) * fpp
+                            if fpp is not None else 0.0)
                 ui.label(f"S{si + 1}:  azimuth {old.azimuth_angle or 0.0:.2f}° "
-                         f"→ {az:.2f}°   ·   position moved").classes("font-mono text-sm")
+                         f"→ {az:.2f}°   ·   moved {moved_ft:.1f} ft") \
+                    .classes("font-mono text-sm")
             with ui.row():
                 ui.button("Commit", on_click=lambda: dlg.submit("commit"))
                 ui.button("Cancel", on_click=lambda: dlg.submit("cancel"))
@@ -3948,40 +4235,46 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         for si in updates:
             s = v.project.sensors[si]
             snap[si] = (s.azimuth_angle, s.position_x, s.position_y)
-        v.align_commit_snapshot = snap
+        v.align_commit_snapshot = {"sensors": snap, "base": base}
         for si, (az, px) in updates.items():
             s = v.project.sensors[si]
             s.azimuth_angle = az
             s.position_x, s.position_y = px
-        refresh_overlay()  # the sensor icons moved to their corrected mounting
+        # Re-base: the committed transform is now the mapping consistent with
+        # the (just-moved) sensors, so ghosts sit on the sensors again and a
+        # later commit can't double-apply the same move.
+        v.align_base = tr
+        refresh_overlay()  # the sensor icons moved to their committed placement
         refresh_marker_layer()
         refresh_status()
         ui.notify(
-            f"committed calibration to {len(updates)} sensor"
-            f"{'s' if len(updates) != 1 else ''} — Save to keep it; undo button "
-            "to revert", type="positive")
+            f"moved {len(updates)} sensor{'s' if len(updates) != 1 else ''} — "
+            "Save to keep it; undo button to revert", type="positive")
 
     def align_undo_commit():
         snap = v.align_commit_snapshot
         if not snap:
             return
-        for si, (az, x, y) in snap.items():
+        for si, (az, x, y) in snap["sensors"].items():
             s = v.project.sensors[si]
             s.azimuth_angle = az
             s.position_x = x
             s.position_y = y
+        v.align_base = snap["base"]  # ghosts measure against the old placement again
         v.align_commit_snapshot = None
         refresh_overlay()
         refresh_marker_layer()
         refresh_status()
-        ui.notify("reverted the calibration commit")
+        ui.notify("reverted the sensor-move commit")
 
     def align_reset():
         """Discard the authored alignment — back to the automatic fit, no
-        calibration (plan §5a reversibility)."""
+        calibration (plan §5a reversibility). Starts a fresh authoring session
+        against the sensors' current placement, so the baseline reseeds too."""
         v.align_calibration = None
         v.align_calib = {}
         v.align_commit_snapshot = None
+        v.align_base = None
         _seed_align_placement()
         _push_live_alignment()
         refresh_marker_layer()
@@ -3996,14 +4289,27 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         p = v.align_placement
         if p is None:
             return ("mode: align | load a recording (Replay) or connect Live, "
-                    "then drag to seat the overlay onto the background")
+                    "then drag — ghost sensors and tracks move together over "
+                    "the background")
         if v.align_rotate_armed:
             if v.rotate_pivot is None:
                 return "mode: align rotate | click to place the pivot  [Esc cancels]"
             return (f"mode: align rotate | {v.rotate_angle:+.1f}° | "
                     "move to aim, click to commit  [Esc cancels]")
-        lock = ("locked — drag moves the group" if v.align_locked
+        lock = ("locked — drag moves the sensor group" if v.align_locked
                 else f"UNLOCKED — drag nudges S{v.active_si + 1}")
+        # the proposed sensor move, so "how much have I changed?" reads off
+        # the status line as well as off the ghost leaders (2026-07-11)
+        ghosts = v.align_ghosts()
+        fpp = v.ft_per_px()
+        if ghosts and fpp is not None:
+            disp = max(math.hypot(g[0] - r[0], g[1] - r[1]) * fpp
+                       for _, r, g, _ in ghosts)
+            daz = max((abs(d) for *_, d in ghosts), default=0.0)
+            move = (f"Δ {disp:.1f} ft, {daz:.1f}°" if disp >= 0.05 or daz >= 0.01
+                    else "sensors unmoved")
+        else:
+            move = "sensors unmoved"
         cal = v.align_calibration
         if cal is None:
             calnote = "no calibration (Auto-calibrate to make sensors agree)"
@@ -4014,8 +4320,7 @@ def build_ui(viewer: Viewer, state: dict) -> None:
                        f"{'s' if len(ok) != 1 else ''}"
                        + (f", ~{max(res):.1f} m residual" if res else "")
                        + (f", {len(cal.flagged)} flagged" if cal.flagged else ""))
-        return (f"mode: align | {lock} | G {p.rotation_deg:+.1f}° ×{p.scale:.3f}"
-                f" | {calnote}")
+        return f"mode: align | {lock} | {move} | {calnote}"
 
     def update_context_bar():
         """Row-2 context controls per tool + Draw sub-kind (ROADMAP Item 24;
@@ -4385,9 +4690,19 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             "ids", value=True, on_change=toggle_replay_labels).props("dense")
         with replay_labels_switch:
             ui.tooltip("show the abbreviated track id over each marker")
+        # Raw↔fused toggle (ROADMAP Item 43): off = raw per-sensor points;
+        # on = the Item 42 fused tracks (one marker/id per real vehicle,
+        # cross-sensor dedup + within-sensor stitch). Replay/batch only — Live
+        # stays raw (fusion is batch-only, FUSION_PLAN §5).
+        fused_switch = ui.switch(
+            "fused", value=False, on_change=toggle_fused_view).props("dense")
+        with fused_switch:
+            ui.tooltip("fuse the tracks: show one marker/id per real vehicle "
+                       "(cross-sensor + stop/drop/resume stitched) instead of "
+                       "raw per-sensor points")
         replay_widgets = [replay_load_btn, replay_step_back_btn,
                           replay_play_btn, replay_step_fwd_btn, replay_speed_sel,
-                          replay_slider, replay_labels_switch]
+                          replay_slider, replay_labels_switch, fused_switch]
 
         # Live overlay controls (ROADMAP Item 35): connect (built from the
         # same _host_auth_form as the Record panel) / stop, plus the id-label

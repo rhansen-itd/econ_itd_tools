@@ -35,6 +35,16 @@ The one convention-sensitive line is the azimuth commit sign (plan §5c):
 ``theta_deg`` uses the same rotation sense as ``sensor_calibration.py``'s
 field-validated "ADD θ°" recommendation (complex-plane angle in the y-down
 EVO frame), and the commit→re-solve round-trip test pins it.
+
+**Sensor-move reading (owner reframing, 2026-07-11).** A stream is rigidly
+attached to its sensor, so an authored alignment — calibration *and* any
+group-placement change away from the automatic fit — is equivalently a
+proposed *move of the sensors themselves*. ``world_delta(base, current,
+slot)`` computes that per-sensor world-feet similarity against the baseline
+mapping (the automatic fit for the sensors' stored placement); ghost sensors
+in the GUI render through it, and ``commit_alignment`` writes it into each
+mapped sensor's iprj azimuth/position — a pure group drag commits too,
+superseding plan §5b's calibration-only rule.
 """
 
 from __future__ import annotations
@@ -229,7 +239,8 @@ def _spread_m(pts: list[tuple[float, float]]) -> float:
 def calibrate(
     frames: Iterable[Frame],
     *,
-    reference: int = 0,
+    reference: int | None = 0,
+    slots: Iterable[int] | None = None,
     isolation_radius_m: float = ISOLATION_RADIUS_M,
     coarse_match_dist_m: float = COARSE_MATCH_DIST_M,
     min_pairs: int = MIN_PAIRS,
@@ -237,15 +248,31 @@ def calibrate(
     max_mean_residual_m: float = MAX_MEAN_RESIDUAL_M,
     frame_stride: int = FRAME_STRIDE,
 ) -> Calibration:
-    """Solve the relational calibration over every sensor seen in *frames*.
+    """Solve the relational calibration over the sensors seen in *frames*.
 
     Reference-anchored (plan §2b): ``C[reference] = identity`` is the gauge
     fix; each other sensor fits the rigid map that carries its detections
     onto the reference's. Never raises on degenerate input — a sensor that
     can't be trusted comes back flagged with an identity delta instead.
+
+    *slots* restricts the solve to the stream slots that actually map to
+    project sensors: ``oid % 10`` is only an id convention, so a stream can
+    carry stray slots (fused/transient ids) that are not sensors at all —
+    without the filter they'd be solved and flagged as if they were.
+    ``reference=None`` picks the gauge automatically: the candidate slot
+    with the most detections (the best-observed sensor pairs best).
     """
     frames = list(frames)
-    seen = sorted({p.sensor for f in frames for p in f.points})
+    counts: dict[int, int] = {}
+    for f in frames:
+        for p in f.points:
+            counts[p.sensor] = counts.get(p.sensor, 0) + 1
+    seen = sorted(counts)
+    if slots is not None:
+        allowed = set(slots)
+        seen = [s for s in seen if s in allowed]
+    if reference is None:
+        reference = max(seen, key=lambda s: counts[s], default=0)
     entries: list[SensorCalibration] = []
     for s in seen:
         if s == reference:
@@ -379,6 +406,79 @@ def invert_placement_m(placement: ZoneFit | Placement,
 
 
 @dataclass(frozen=True)
+class WorldDelta:
+    """A world-feet → world-feet similarity ``w' = a·w + t`` (complex form).
+
+    The *sensor-move* reading of an authored alignment (owner reframing,
+    2026-07-11): a stream is rigidly attached to its sensor, so rendering
+    sensor *i*'s points through ``current`` instead of ``base`` is exactly
+    equivalent to moving the sensor itself by this map. ``world_delta``
+    computes it; ghost sensors render through it and the commit writes it
+    into the sensor's iprj azimuth/position."""
+
+    a_re: float
+    a_im: float
+    t_x: float  # world feet
+    t_y: float
+
+    @property
+    def rotation_deg(self) -> float:
+        return math.degrees(math.atan2(self.a_im, self.a_re))
+
+    @property
+    def scale(self) -> float:
+        return abs(complex(self.a_re, self.a_im))
+
+    def apply_ft(self, x_ft: float, y_ft: float) -> tuple[float, float]:
+        w = (complex(self.a_re, self.a_im) * complex(x_ft, y_ft)
+             + complex(self.t_x, self.t_y))
+        return w.real, w.imag
+
+    def moves(self, pos_ft: tuple[float, float],
+              tol_ft: float = 0.05, tol_deg: float = 0.01) -> bool:
+        """Whether this delta visibly moves/rotates a sensor at *pos_ft* —
+        the commit-worthiness gate (translation is judged at the sensor's own
+        position because a rotation about a far pivot has a near-identity
+        linear part but a large local displacement)."""
+        if abs(self.rotation_deg) >= tol_deg:
+            return True
+        nx, ny = self.apply_ft(*pos_ft)
+        return math.hypot(nx - pos_ft[0], ny - pos_ft[1]) >= tol_ft
+
+
+def invert_alignment_m(alignment: AlignmentTransform, sensor: int,
+                       x_ft: float, y_ft: float) -> tuple[float, float]:
+    """World feet → raw EVO meters through the *composed* transform's inverse
+    for one sensor: undo the group placement, then undo that sensor's
+    calibration delta. Raises ValueError on a zero-scale placement, like
+    ``invert_placement_m``."""
+    e = invert_placement_m(alignment.placement, x_ft, y_ft)
+    delta = alignment.calib.get(sensor)
+    if delta is not None:
+        e = delta.inverse().apply_m(*e)
+    return e
+
+
+def world_delta(base: AlignmentTransform, current: AlignmentTransform,
+                sensor: int) -> WorldDelta:
+    """The world-feet similarity carrying sensor *sensor*'s rendered stream
+    from where *base* puts it to where *current* puts it:
+    ``D = current ∘ base⁻¹`` (both per-sensor composed maps).
+
+    *base* is the mapping consistent with the sensor's stored iprj placement
+    (the automatic fit at load); *current* is the authored transform. Both
+    are complex-affine, so probing the composition at two points recovers it
+    exactly — one copy of the transform math, no re-derivation."""
+    def through(wx: float, wy: float) -> complex:
+        e_m = invert_alignment_m(base, sensor, wx, wy)
+        return complex(*current.apply(sensor, *e_m))
+
+    t = through(0.0, 0.0)
+    a = through(1.0, 0.0) - t
+    return WorldDelta(a.real, a.imag, t.real, t.imag)
+
+
+@dataclass(frozen=True)
 class AlignmentTransform:
     """The one overlay transform both replay and live render through (plan
     §1): per-sensor calibration in EVO meters, then the group placement to
@@ -423,65 +523,76 @@ def build_alignment(
                               calibration=calibration)
 
 
-# --- commit math (plan §5c) -------------------------------------------------------
+# --- commit math (plan §5c, reframed 2026-07-11) -----------------------------------
 
 
 def committed_sensor_config(
     azimuth_deg: float,
     position_px: tuple[float, float],
-    delta: RigidDelta,
-    placement: ZoneFit | Placement,
+    delta: WorldDelta,
     emp: float,
 ) -> tuple[float, tuple[float, float]]:
-    """Fold one sensor's calibration into its iprj config; returns
+    """Fold one sensor's world-feet move into its iprj config; returns
     ``(new_azimuth_deg, (new_x_px, new_y_px))``.
 
     The unique "rotate about the sensor, then move the sensor" decomposition
-    of ``Cᵢ``: the azimuth gains ``theta_deg`` (the "ADD θ°" sign of
+    of the similarity *delta*: the azimuth gains ``rotation_deg`` (for a
+    calibration-only delta this is exactly ``Cᵢ``'s θ — the "ADD θ°" sign of
     ``sensor_calibration.py``, pinned by the commit→re-solve round-trip
-    test), and the new position is ``Cᵢ`` applied to the sensor's own
-    location. The stored position lives in world px, ``Cᵢ`` acts in EVO
-    meters, so the position round-trips px → ft → (G⁻¹) → meters → Cᵢ →
-    (G) → ft → px; conjugating a rigid map by the similarity ``G`` keeps it
-    rigid with the same rotation angle, which is why the azimuth needs no
-    placement term. Positions are in the post-``normalize_origin`` world-px
-    frame every loaded Project already uses."""
+    test), and the new position is *delta* applied to the sensor's own
+    location, converted world feet → world px. Positions are in the
+    post-``normalize_origin`` world-px frame every loaded Project uses."""
     pos_ft = (px_to_ft(position_px[0], emp), px_to_ft(position_px[1], emp))
-    e_m = invert_placement_m(placement, *pos_ft)
-    w_ft = placement.apply_m(*delta.apply_m(*e_m))
+    w_ft = delta.apply_ft(*pos_ft)
     new_px = (ft_to_px(w_ft[0], emp), ft_to_px(w_ft[1], emp))
-    return azimuth_deg + delta.theta_deg, new_px
+    return azimuth_deg + delta.rotation_deg, new_px
 
 
-def commit_calibration(
+def commit_alignment(
     project: Project,
-    alignment: AlignmentTransform,
+    current: AlignmentTransform,
+    base: AlignmentTransform,
     slot_to_sensor: Mapping[int, int] | None = None,
 ) -> dict[int, tuple[float, tuple[float, float]]]:
     """The whole-project commit as a pure function (Item 40 just applies it):
     ``{project sensor index: (new_azimuth_deg, (new_x_px, new_y_px))}`` for
-    every sensor carrying a calibration delta. Nothing is mutated.
+    every mapped sensor whose stream *current* renders somewhere other than
+    *base* does. Nothing is mutated.
 
-    Only calibration commits — group placement is either reproducible from
-    ``Z;`` every load or belongs to the deferred sidecar, never smeared into
-    per-sensor azimuth (plan §5b). *slot_to_sensor* maps stream sensor ids to
-    project sensor indices; it defaults from the placement's ``ZoneFit``
-    match, so it only needs passing on a no-``Z;`` site. Sensors without a
-    mapping or without a stored position are skipped, not guessed."""
+    The owner's 2026-07-11 reframing: the whole authored alignment — the
+    per-sensor calibration ``Cᵢ`` *and* the group-placement change relative
+    to the automatic fit — reads as a proposed **sensor move**, so a pure
+    group drag commits too (superseding plan §5b's calibration-only rule).
+    *base* is the mapping consistent with the sensors' stored placement (the
+    automatic uncalibrated fit, or the last committed transform); each
+    sensor's write-back is ``world_delta(base, current, slot)`` applied to
+    its own config. *slot_to_sensor* maps stream slots to project sensor
+    indices; it defaults from *current*'s (else *base*'s) placement
+    ``ZoneFit`` match — a manual group edit turns the current placement into
+    a plain ``Placement`` that no longer carries the match, but the baseline
+    keeps it — so it only needs passing on a no-``Z;`` site. Sensors without
+    a mapping / stored position, and sensors the composed delta doesn't
+    visibly move, are skipped, not guessed."""
     if slot_to_sensor is None:
         slot_to_sensor = dict(
-            getattr(alignment.placement, "slot_to_sensor", ()) or ())
+            getattr(current.placement, "slot_to_sensor", None)
+            or getattr(base.placement, "slot_to_sensor", ()) or ())
     emp = effective_meter_per_pixel(project.background)
     out: dict[int, tuple[float, tuple[float, float]]] = {}
-    for slot, delta in alignment.calib.items():
-        si = slot_to_sensor.get(slot)
-        if si is None or not 0 <= si < len(project.sensors):
+    for slot, si in sorted(slot_to_sensor.items()):
+        if not 0 <= si < len(project.sensors):
             continue
         sensor = project.sensors[si]
         if sensor.position_x is None or sensor.position_y is None:
             continue
+        try:
+            wd = world_delta(base, current, slot)
+        except ValueError:  # degenerate (zero-scale) placement — refuse
+            continue
+        pos_px = (sensor.position_x, sensor.position_y)
+        pos_ft = (px_to_ft(pos_px[0], emp), px_to_ft(pos_px[1], emp))
+        if not wd.moves(pos_ft):
+            continue
         out[si] = committed_sensor_config(
-            sensor.azimuth_angle or 0.0,
-            (sensor.position_x, sensor.position_y),
-            delta, alignment.placement, emp)
+            sensor.azimuth_angle or 0.0, pos_px, wd, emp)
     return out

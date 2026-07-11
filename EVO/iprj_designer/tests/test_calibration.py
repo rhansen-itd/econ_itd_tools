@@ -27,15 +27,18 @@ from model.calibration import (
     AlignmentTransform,
     Placement,
     RigidDelta,
+    WorldDelta,
     build_alignment,
     calibrate,
-    commit_calibration,
+    commit_alignment,
     committed_sensor_config,
     find_pairs,
+    invert_alignment_m,
     invert_placement_m,
     rotated_about,
     translated,
     translation_placement,
+    world_delta,
 )
 from model.iprj_io import load_iprj
 from model.replay import Frame, LiveAligner, TrackPoint, load_recording, realign
@@ -285,39 +288,153 @@ def test_zonefit_calibrated_refit_absorbs_a_sensor_delta():
     assert refit.mean_residual_ft == pytest.approx(0.0, abs=1e-9)
 
 
-# --- commit math (sign/units, plan §5c) -------------------------------------------
+# --- the sensor-move delta + commit math (plan §5c, reframed 2026-07-11) ----------
+
+
+def test_world_delta_identity_when_nothing_authored():
+    """current == base → every sensor's delta is exactly identity, so ghosts
+    sit on the sensors and commit_alignment proposes nothing."""
+    proj, zones = _make_site()
+    zf = zonefit.fit(proj, zones)
+    tr = AlignmentTransform(calib={}, placement=zf)
+    for slot in (0, 1, 2):
+        wd = world_delta(tr, tr, slot)
+        assert wd.rotation_deg == pytest.approx(0.0, abs=1e-9)
+        assert wd.scale == pytest.approx(1.0, abs=1e-12)
+        assert wd.apply_ft(123.4, -56.7) == pytest.approx((123.4, -56.7), abs=1e-6)
+        assert not wd.moves((123.4, -56.7))
+    assert commit_alignment(proj, tr, tr) == {}
+
+
+def test_world_delta_group_move_is_the_same_rigid_map_for_every_sensor():
+    """A pure group drag+rotate (no calibration) reads as one world-feet rigid
+    move applied to every sensor — the block gesture the owner described:
+    ghost sensors and markers translate/rotate together."""
+    proj, zones = _make_site()
+    zf = zonefit.fit(proj, zones)
+    base = AlignmentTransform(calib={}, placement=zf)
+    pivot, ang, dxy = (350.0, 250.0), 6.0, (30.0, -12.0)
+    cur = AlignmentTransform(
+        calib={}, placement=translated(rotated_about(zf, pivot, ang), *dxy))
+    q = complex(math.cos(math.radians(ang)), math.sin(math.radians(ang)))
+    for slot in (0, 1, 2):
+        wd = world_delta(base, cur, slot)
+        assert wd.rotation_deg == pytest.approx(ang)
+        assert wd.scale == pytest.approx(1.0, abs=1e-9)
+        for w in ((0.0, 0.0), (500.0, 300.0), (-40.0, 90.0)):
+            expect = q * (complex(*w) - complex(*pivot)) + complex(*pivot) \
+                + complex(*dxy)
+            assert wd.apply_ft(*w) == pytest.approx(
+                (expect.real, expect.imag), abs=1e-6)
+
+
+def test_world_delta_calibration_only_matches_the_conjugated_rigid_map():
+    """With the same placement on both sides, a sensor's delta is exactly the
+    similarity-conjugated Cᵢ: rotation θ (the "ADD θ°" sign) and position
+    G(C(G⁻¹(pos))) — the old commit math as a special case."""
+    proj, zones = _make_site()
+    zf = zonefit.fit(proj, zones)
+    delta = RigidDelta.make(-4.0, (3.0, 6.0))
+    base = AlignmentTransform(calib={}, placement=zf)
+    cur = AlignmentTransform(calib={1: delta}, placement=zf)
+    wd = world_delta(base, cur, 1)
+    assert wd.rotation_deg == pytest.approx(delta.theta_deg)
+    assert wd.scale == pytest.approx(1.0, abs=1e-9)
+    pos_ft = (712.6, 388.1)
+    expect = zf.apply_m(*delta.apply_m(*invert_placement_m(zf, *pos_ft)))
+    assert wd.apply_ft(*pos_ft) == pytest.approx(expect, abs=1e-6)
+    # conjugation preserves rigidity: the sensor moves the same distance C
+    # moves its EVO-frame image (in feet)
+    e_m = invert_placement_m(zf, *pos_ft)
+    moved_ft = math.dist(pos_ft, wd.apply_ft(*pos_ft))
+    assert moved_ft == pytest.approx(
+        units.m_to_ft(math.dist(e_m, delta.apply_m(*e_m))) * zf.scale, rel=1e-9)
+    # an uncalibrated sensor passes through identity
+    assert world_delta(base, cur, 0).apply_ft(*pos_ft) == pytest.approx(
+        pos_ft, abs=1e-6)
+
+
+def test_invert_alignment_roundtrips_the_composed_transform():
+    proj, zones = _make_site()
+    zf = zonefit.fit(proj, zones)
+    tr = AlignmentTransform(calib={2: RigidDelta.make(3.0, (1.0, -2.0))},
+                            placement=zf)
+    for slot in (0, 2):
+        for e_m in ((7.0, -3.0), (0.0, 0.0), (-41.2, 18.9)):
+            w = tr.apply(slot, *e_m)
+            assert invert_alignment_m(tr, slot, *w) == pytest.approx(
+                e_m, abs=1e-9)
 
 
 def test_commit_identity_delta_changes_nothing():
     proj, zones = _make_site()
-    zf = zonefit.fit(proj, zones)
     emp = units.effective_meter_per_pixel(proj.background)
-    az, pos = committed_sensor_config(-170.56, (855.95, 313.82), IDENTITY, zf, emp)
+    wd = WorldDelta(1.0, 0.0, 0.0, 0.0)
+    az, pos = committed_sensor_config(-170.56, (855.95, 313.82), wd, emp)
     assert az == pytest.approx(-170.56)
     assert pos == pytest.approx((855.95, 313.82), abs=1e-9)
 
 
-def test_commit_math_is_the_conjugated_rigid_map():
-    """new_azimuth adds θ (the sensor_calibration.py "ADD θ°" sign) and the
-    new position is G(C(G⁻¹(pos))) — checked against a hand computation."""
+def test_commit_alignment_writes_a_pure_group_move():
+    """The 2026-07-11 reframing's new case: no calibration at all, just a
+    group drag — every mapped sensor commits the same rigid move."""
     proj, zones = _make_site()
     zf = zonefit.fit(proj, zones)
     emp = units.effective_meter_per_pixel(proj.background)
-    delta = RigidDelta.make(-4.0, (3.0, 6.0))
-    old_az, old_px = 31.84, (918.54, 564.83)
-    az, px = committed_sensor_config(old_az, old_px, delta, zf, emp)
-    assert az == pytest.approx(old_az + delta.theta_deg)
-    pos_ft = (units.px_to_ft(old_px[0], emp), units.px_to_ft(old_px[1], emp))
-    w_ft = zf.apply_m(*delta.apply_m(*invert_placement_m(zf, *pos_ft)))
-    assert px == pytest.approx((units.ft_to_px(w_ft[0], emp),
-                                units.ft_to_px(w_ft[1], emp)))
-    # conjugation by the similarity preserves rigidity: committing moves the
-    # sensor by the same distance C moves its EVO-frame image (in feet)
-    e_m = invert_placement_m(zf, *pos_ft)
-    e2_m = delta.apply_m(*e_m)
-    moved_ft = math.dist(pos_ft, w_ft)
-    assert moved_ft == pytest.approx(
-        units.m_to_ft(math.dist(e_m, e2_m)) * zf.scale, rel=1e-9)
+    base = AlignmentTransform(calib={}, placement=zf)
+    cur = AlignmentTransform(calib={}, placement=translated(zf, 20.0, -8.0))
+    updates = commit_alignment(proj, cur, base)
+    assert set(updates) == {si for _, si in zf.slot_to_sensor}
+    for si, (az, px) in updates.items():
+        s = proj.sensors[si]
+        assert az == pytest.approx(s.azimuth_angle or 0.0)  # translation only
+        moved = (units.px_to_ft(px[0] - s.position_x, emp),
+                 units.px_to_ft(px[1] - s.position_y, emp))
+        assert moved == pytest.approx((20.0, -8.0), abs=1e-6)
+    # nothing was mutated by the pure commit
+    assert proj.sensors[next(iter(updates))].position_x is not None
+
+
+# --- slot restriction + auto reference (the "S5/S6" fix, 2026-07-11) --------------
+
+
+def test_calibrate_slots_filter_ignores_stray_stream_ids():
+    """Stray oid%10 slots (fused/transient ids) are not sensors: with the
+    mapped-slots filter they are neither solved nor reported, so a 4-sensor
+    site can never report an impossible "S5/S6"."""
+    mis = RigidDelta.make(1.0, (1.0, 1.0))
+    frames = []
+    for i, f in enumerate(_misaligned_frames(mis, n=60)):
+        pts = list(f.points)
+        pts.append(_pt(14, 500.0 + i, 500.0))  # stray slot 4, sparse
+        if i < 10:
+            pts.append(_pt(15, 300.0, 300.0 + i))  # stray slot 5
+        frames.append(Frame(t=f.t, points=tuple(pts)))
+    unrestricted = calibrate(frames, frame_stride=1)
+    assert {e.sensor for e in unrestricted.sensors} == {0, 1, 4, 5}
+    cal = calibrate(frames, frame_stride=1, slots={0, 1})
+    assert {e.sensor for e in cal.sensors} == {0, 1}
+    assert not cal.flagged
+    assert cal.for_sensor(1).status == "ok"
+
+
+def test_calibrate_auto_reference_picks_the_best_observed_slot():
+    """reference=None anchors the gauge on the slot with the most detections
+    — a site whose stream has no slot 0 still solves instead of returning
+    all-no_pairs against a nonexistent reference."""
+    mis = RigidDelta.make(2.0, (1.5, -1.0))
+    # renumber the synthetic frames' sensors 0/1 -> 1/2 (no slot 0 at all)
+    frames = [
+        Frame(t=f.t, points=tuple(
+            replace(p, oid=p.oid + 1, sensor=p.sensor + 1) for p in f.points))
+        for f in _misaligned_frames(mis)]
+    all_no_pairs = calibrate(frames, frame_stride=1)  # legacy slot-0 gauge
+    assert all(e.status == "no_pairs" for e in all_no_pairs.sensors)
+    cal = calibrate(frames, frame_stride=1, reference=None)
+    assert cal.reference in (1, 2)
+    other = 2 if cal.reference == 1 else 1
+    assert cal.for_sensor(cal.reference).status == "reference"
+    assert cal.for_sensor(other).status == "ok"
 
 
 # --- real multi-sensor site: the three plan-§8 correctness gates ------------------
@@ -393,8 +510,13 @@ def test_commit_then_resolve_is_identity(us95, us95_cal):
     proj, rec = us95
     transform = build_alignment(proj, rec.zones, us95_cal)
     assert transform is not None
-    updates = commit_calibration(proj, transform)
-    assert set(updates) == {1}  # slot 1 -> project sensor 1 via the Z; match
+    # base shares the placement so the committed delta is exactly the
+    # conjugated C₁ — the sign-pinning isolation; the composed group-move
+    # case is covered by test_commit_alignment_writes_a_pure_group_move
+    base = AlignmentTransform(calib={}, placement=transform.placement)
+    updates = commit_alignment(proj, transform, base)
+    assert set(updates) == {1}  # slot 1 -> project sensor 1 via the Z; match;
+    #                             sensor 0 is unmoved and therefore skipped
     new_az, new_px = updates[1]
     delta = us95_cal.deltas[1]
     # the azimuth sign: ADD θ°, as sensor_calibration.py recommends

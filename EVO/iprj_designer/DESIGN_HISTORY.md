@@ -2919,7 +2919,209 @@ Suggested prompt:
     auto-index client, and the page builds headless. Full suite **589 pass**.
     Checked off Item 40 in ROADMAP.md.
 
-## Appendix — example template (acceptance case, revised for Items 15/17/18)
+- 2026-07-10 — **Item 41 done → [[FUSION_PLAN.md]] (decision doc, no code).**
+  Architecture for track stitching / fusion, gating Items 42–43. Reviewed the
+  prior art (`../fusion_visualizer.py`, ~2.6k lines; the `../*.html` files are
+  just its rendered plotly output) and the raw recordings.
+  - **Post-mortem → clean-room.** The prior script conflated four jobs
+    (inter-sensor RBF bias correction, within-sensor stitching, cross-sensor
+    fusion, learned path-template classification) with no tests, no acceptance
+    gate, and a forbidden dep stack (pandas/scipy/shapely/cv2/plotly). Verdict:
+    **clean-room rebuild in a pure `model/fusion.py`**, lifting only the tuned
+    constants (velocity-aware stitch windows, ±60° cone, class-compatibility,
+    fine-match distance).
+  - **Two mechanisms retired.** (1) The RBF spatial warp that forced sensors to
+    agree was trained on the *same* noisy pairs it then fused — circular and
+    non-deterministic; **Items 38–40 calibration replaces it**, so fusion
+    *depends on* a calibrated overlay and drops the RBF. (2) The hand-drawn
+    `gates.json` classification dependency is dropped — fusion works off
+    geometry + time directly.
+  - **Seam.** A pure transform *after* alignment, in world-feet, over the Item
+    29 aligned `Frame` stream → `FusionResult` (deduped fused tracks) + `id_of`
+    (raw `(sensor,oid)` → fused id, so Item 43 recolours existing markers with
+    no render-loop change). Parse `Frame.t`→seconds and match in tolerant time
+    *windows* (the prior art's exact-equality time match was a root cause).
+  - **Policy.** Within-sensor bridging (velocity-selected time/space windows +
+    forward cone; the stop/drop/resume case) needs no calibration; cross-sensor
+    fusion (overlap dedup + handoff-id continuity) assumes calibration and
+    degrades *flagged*, not silently, without it. Refuse-don't-guess on
+    ambiguous merges, matching zonefit/calibration character.
+  - **Batch-first.** Item 42 builds the batch engine only; live stays raw (a
+    streaming stitcher is a documented future upgrade). Item 43 wires the
+    raw↔fused toggle on replay.
+  - **Correctness gate (the thing prior attempts lacked).** Real recordings
+    now exist as fixtures (`86_US95&SH8` 3485 frames / 2 sensors, Banks) — the
+    Item 29/33 "no recording survives" caveat is **stale**. Item 42 must pass a
+    labeled real-fixture acceptance set (N trajectories → M fused tracks) plus
+    deterministic synthetic don't-merge cases. Label format seeded in the plan.
+  - No feature code this session. Checked off Item 41 in ROADMAP.md.
+
+- 2026-07-10 — **ROADMAP Item 42: Fusion engine in `model/fusion.py` (Fable)**
+  — the [[FUSION_PLAN.md]] batch engine: fold aligned `Frame`s into
+  `(sensor,oid)` raw tracks, bridge within-sensor stop/drop/resume gaps (§3),
+  greedily associate cross-sensor tracks that coincide in time+space (§4),
+  emit `FusionResult` (`tracks` + `id_of` raw-key→fused-id) for Item 43. Pure,
+  frozen dataclasses, no new deps; every gate lives in `FusionParams`.
+  - **Plan's open items resolved.** (1) *Overlap point policy:* blend by
+    overlap fraction — in the shared window the earlier track's samples are
+    the spine, each lerped toward the later track's nearest-in-time sample by
+    window fraction, so the fused polyline hands off smoothly; later-track
+    samples in an earlier-track dropout survive as-is. (2) *Chain ordering:*
+    stitching accepts only pairs that are the **unique best for both
+    endpoints** (score `gap/T_max + dist/D_max`, margin 0.25), which makes
+    accepted pairs disjoint and multi-pass merging order-independent; chains
+    (A→B→C) can even land in one pass, walked head-first. (3) *Parameter
+    re-tune:* prior-art constants held up on the calibrated fixture except
+    `d_fine` — opened 16→20 ft because the sensors' secondary cls-0 slots
+    (4/5) ride ~17 ft off their same-vehicle primaries: their sparse pair
+    sets are rightly *refused* by Item 39 calibration, so that offset is
+    irreducible and real same-vehicle groups sit just past 16 ft.
+  - **Two decisions the data forced.** (1) The stream's per-point `heading`
+    spans only −0.2..0.7 over 82k points of all-direction traffic — unusable
+    as a bearing — so the §3 forward cone uses displacement-derived end
+    velocity instead. (2) A position-only cone happily bridged onto an
+    *oncoming* vehicle whose start point sat ahead of the ended track
+    (real-fixture case `(0,715230)+(0,715280)`), so the successor's own
+    initial motion must also lie in the cone (direction-consistency gate) —
+    that case now correctly resolves as a cross-sensor dedup with
+    `(1,420221)`.
+  - **The §6 acceptance gate is in.** Hand-labeled ground truth on the real
+    `86_US95&SH8` recording lives in
+    `tests/fixtures/fusion_labels_86_us95_sh8.json`: 4 fused groups (incl. a
+    ~60 s stop-at-light + S1→S0 handoff and a three-source group), 1
+    stop/drop/resume stitch, and 3 must-stay-single controls (a stationary
+    object; two distinct vehicles queued nose-to-tail). Every group was
+    verified by junction kinematics + a no-confusable-track-nearby check and
+    is stable across calibrated/uncalibrated runs. `tests/test_fusion.py`
+    (28 tests): labeled acceptance on the calibrated overlay, graceful
+    degradation + `low_confidence` flag without it, calibration measurably
+    tightening labeled S0↔S1 overlaps, whole-recording class-divide sweep,
+    plus deterministic synthetic don't-merge adversarial cases (same point
+    at different times, opposing headings, ped-beside-car, adjacent-lane
+    parallels, ambiguous successors).
+  - Engine output on the fixture: 740 raw tracks → ~500 fused (163 fused /
+    34 stitched / 304 single, calibrated). Batch only per §5 — live stays
+    raw until a streaming variant reuses this scoring. Checked off Item 42
+    in ROADMAP.md.
+
+- 2026-07-10 — **ROADMAP Item 43: Fusion overlay wiring (Opus)** — wired the
+  Item 42 engine into the Replay overlay: a **raw↔fused toggle** flips the
+  marker layer between the raw per-sensor points and the fused tracks (one
+  marker + id per real vehicle), reusing Item 30's marker-layer-only rewrite
+  (no static-SVG re-render).
+  - **Render seam is two pure `model/fusion.py` helpers** (pytested, headless),
+    so the GUI reads the engine and never re-derives coordinates. (1)
+    `frame_times_s(frames)` — per-frame numeric seconds, 1:1 with the frames
+    (`nan` on a bad stamp), midnight-unwrapped; extracted from `fold_tracks`,
+    which now calls it, so the batch fold and the render index share one clock.
+    (2) `fused_frame_markers(result, frame_times)` → a tuple of
+    `{fused_id: (x_ft, y_ft)}` aligned 1:1 with the frames: each fused-track
+    point is assigned to its nearest-in-time frame, keeping the time-nearest
+    when two land on one frame — so the cross-sensor **dedup the engine did in
+    the overlap window is preserved on screen** (a two-sensor overlap collapses
+    to one marker) rather than re-splitting into two.
+  - **Viewer wiring.** `ensure_fusion()` runs `fuse()` once and caches the
+    result + the per-frame index, keyed by `(id(recording), calibrated?)` —
+    recomputed only when the recording or its calibration state changes, so the
+    10 fps tick just reads the cache. `calibrated` follows
+    `recording.alignment.calib` (Items 38–40): an uncalibrated overlay widens
+    the cross-sensor gate and surfaces `low_confidence` in the toggle-on notify
+    and the status line (§4b, never silent). `replay_marker_svg` branches on
+    `fused_view`; a shared `_marker_glyph` helper backs both the raw and fused
+    paths so a marker reads identically either way. Fused colour cycles the
+    evo_replay sensor palette by `fused_id % 10` — a stable per-vehicle hue.
+  - **Live stays raw** — fusion is batch-only (FUSION_PLAN §5, no streaming
+    variant built), so the toggle lives only in the Replay transport;
+    `live_marker_svg` is untouched. The heavy `fuse()` runs on the switch-on
+    (with a summary notify: raw→fused counts, low-confidence flag), not on the
+    render tick, so a large recording doesn't stall the timer.
+  - **Tests.** `tests/test_fusion.py` +5 (`frame_times_s` alignment/nan/
+    midnight; `fused_frame_markers` one-marker-per-vehicle-per-frame, positions
+    on the fused polyline, two-vehicles-two-markers). New
+    `tests/test_fusion_gui.py` (4): `ensure_fusion` cache keying by recording +
+    calibration, on-screen dedup (fused ≤ raw circle count), the label toggle
+    driving fused markers, empty-when-no-recording. Full suite 626 pass; page
+    builds headless. Checked off Item 43 in ROADMAP.md.
+
+- 2026-07-11 — **Align reframed as "move the sensors" (owner fixes to the
+  38–40 batch, Fable session).** The owner's correction: the Z; auto-fit is
+  just the *default mapping* applied automatically at open (it already was —
+  `parse_recording` / `LiveAligner`, unchanged); **Align's job is to propose
+  new sensor placements**, not to seat an overlay. Pressing Align now shows
+  **ghost copies of the mapped iprj sensors** that move *together with* the
+  stream markers as the group is dragged/rotated against the fixed background
+  — "what the streams would look like if the sensors were moved" — and Commit
+  writes the ghost positions into the sensors. Supersedes plan §5b's
+  calibration-only-commits rule (amendment noted in
+  [[CALIBRATION_ALIGNMENT_PLAN.md]]).
+  - **The sensor-move math (`model/calibration.py`).** New `WorldDelta` (a
+    world-feet similarity) + `world_delta(base, current, slot)` =
+    `current ∘ base⁻¹` per sensor, probed exactly from the existing
+    apply/invert primitives (no second copy of the transform math), with
+    `invert_alignment_m` as the composed inverse. *base* is the **baseline**
+    mapping consistent with the sensors' stored placement (`Viewer.align_base`,
+    the uncalibrated auto fit seeded on first Align entry). Ghosts render at
+    `world_delta(...)` applied to each mapped sensor; a calibration-only delta
+    reduces to the old conjugated-`Cᵢ` commit exactly (kept as a test).
+  - **Commit = the composed move.** `commit_calibration` →
+    `commit_alignment(project, current, base)`: every mapped sensor whose
+    composed delta visibly moves it commits — so a **pure group drag commits
+    too** (the old code refused without a calibration). Azimuth gains the
+    delta's rotation (same "ADD θ°" sign, still pinned by the round-trip
+    test); position becomes the ghost position. On commit the baseline
+    **re-bases** to the committed transform, so ghosts collapse onto the
+    just-moved sensors and a second commit can't double-apply; Undo restores
+    sensors *and* baseline. The commit dialog now shows per-sensor Δazimuth +
+    move distance in feet; the Commit button enables off `align_dirty()`
+    (any ghost displaced), not off calibration presence.
+  - **Rotate actually usable.** Align's 2-click rotate previously drew no
+    pivot and changed nothing on screen until the second click (the pivot
+    cross + preview were Edit-mode-only). Now the pivot cross renders in
+    Align, and while aiming, `align_render_alignment()` applies the in-flight
+    `rotated_about` so markers **and ghosts swing live** (marker-layer-only
+    rewrite, Item 20/30 lesson); the placement itself stays untouched until
+    the commit click. The status line shows the live max Δ (ft, °) so the
+    size of the proposed move reads at a glance.
+  - **"S5/S6 too few pairs" fixed.** `sensor = oid % 10` is only the vendor id
+    convention, so a stream can carry stray slots (fused/transient ids) that
+    are not sensors: `calibrate()` gained `slots=` (solve only stream slots
+    mapped to project sensors — the GUI passes the Z; `slot_to_sensor` keys)
+    and `reference=None` auto-anchoring on the best-observed candidate slot
+    (a stream with no slot 0 no longer solves to all-`no_pairs`). Flag
+    notifications label through the slot map (`S2`, or `slot 4` if ever
+    unmapped) instead of pretending stray slots are project sensors.
+    `Viewer.align_slot_map()` (hoisted from a closure) falls back to
+    slot-index = sensor-index on a no-Z; site so ghosts/commit work there too.
+  - **Tests.** `test_calibration.py` ported to the new commit API and grew:
+    `world_delta` identity / pure-group-move / conjugated-`Cᵢ`-equivalence,
+    composed-inverse round-trip, group-move commit, the stray-slot filter, and
+    auto-reference on a slot-0-less stream. `test_align_gui.py` grew ghost
+    tracking (ghosts sit on sensors at the auto fit, translate exactly with a
+    group drag, labels + leader lines render) and the live rotate preview.
+    Full suite **634 pass**; page builds headless; the whole flow (open →
+    auto-aligned → Align → slot-restricted auto-calibrate → drag → rotate
+    preview → commit lands sensors exactly on their ghosts → ghosts collapse)
+    smoke-driven headless against the real US95&SH8 fixture.
+
+- 2026-07-11 — **Item 40's persist-into-draw/edit bullet actually delivered
+  (owner escalation, Fable session).** The Opus pass had realized "persist the
+  overlay into draw/edit" as *only* the Align sub-mode, so clicking Draw/Edit
+  still paused playback and cleared the markers on the next zoom/pan — the
+  owner rejected that reading. Fix: a pure module-level `marker_source(mode,
+  has_replay, live_running)` now routes the shared marker layer — the Overlay
+  sub-modes keep their own painter (Record blank), and **every non-overlay
+  mode persists a running live feed or loaded recording** (live wins over
+  replay, the same precedence as `align_source_frame`);
+  `refresh_marker_layer` dispatches on it. `_enter_mode`'s teardown was
+  inverted to match: entering a non-overlay mode no longer pauses the replay
+  transport or stops the live session, so **playback keeps animating over
+  Draw/Edit** (the timers already re-render marker-layer-only); only choosing
+  a *different Overlay source* stops the current one — Record/Live/Align
+  pause replay, Record/Replay tear down live (Live↔Align still keeps the
+  session, unchanged). The layer stays `pointer-events:none`, so drawing
+  under moving tracks is unaffected. `test_align_gui.py` grew the headless
+  `marker_source` routing check; suite 633 pass. ROADMAP Item 40's first
+  scope bullet annotated with the correction. — example template (acceptance case, revised for Items 15/17/18)
 
 45 mph approach, lanes `12' L | 12' T | 12' T | 12' R`, count loops, starting
 input 33, lane-by-lane advance detectors, north approach (SB traffic),
