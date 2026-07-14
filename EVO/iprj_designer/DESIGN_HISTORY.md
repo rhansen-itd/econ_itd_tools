@@ -3160,3 +3160,133 @@ the decisions log for the Item 15/17/18 revision.
   `sensor_boresight_deg` centralises it; `world_to_image` carries no rotation
   so the same angle holds in canvas space. Recorded in IPRJ_FORMAT.md;
   `test_align_gui.py` grew glyph/convention checks; suite 637 pass.
+- 2026-07-13 — **Ground-truth stitching round (Item 44, Fable).** The owner
+  hand-labeled handoff/persistence/stray groups across five captures; they
+  now live as `tests/fixtures/stitch_observations_2026-07-13.json` (every
+  abbreviated id resolved to a raw oid; the stray small-integer tokens
+  turned out to be fused-view ids and were resolved by reproduction) and are
+  scored by `scripts/fusion_eval.py`. Engine work in `model/fusion.py`, all
+  label-driven: (1) **vendor-combined seams** — slot `oid%10>=4` is the
+  sensor's own fusion (both raw ids retired, fresh id+4 continues next
+  frame, zero overlap, cls 0); seam-joining these also hands us don't-merge
+  constraints and exposed two mislabeled groups in the 2026-07-10 us95
+  fixture (421505/420685 were attributed to the wrong platooning vehicle —
+  corrected on seam evidence). (2) **Parked resume** — red-light drops
+  bridge to 90 s within 20 ft, guarded by velocity agreement, a
+  lateral-weighted score, and an occupancy veto (nobody parked on the spot
+  during the gap), which stands in for phase-bit decoding site-agnostically.
+  All seven of the owner's "unsure" 2_86_xx735 queue pairs resolve to single
+  merges; the one refusal (420511→421111, 42.7 ft apart with opposing end
+  velocities) looks genuinely suspect. (3) **Re-label bridges** (≤1 s
+  double-tracked handover), **same-sensor duplicate absorption** (twin/
+  ped-fragment blending via the §4 overlap machinery; `non_motor` is sticky
+  through absorption so blended jitter can't turn a pedestrian into a car),
+  and cross-sensor bridge candidacy. (4) **Majority-class fold + behavioral
+  pedestrian override** (`FusedTrack.category`; a 43 s walking-pace "cls 30"
+  track is a pedestrian) and **stray flagging** (`kind="stray"`: flickers
+  and same-way shadows — flagged, never deleted). GUI: peds draw as
+  diamonds, strays dimmed/dashed, raw + fused paths. Eval moved from
+  17/26 handoff, 4/17 persistence, 2/2 stray at baseline to 21/26, 14/17,
+  3/3 (anchors 3/4). Known misses, each understood: the xx107 truck/shadow
+  cluster (uncalibrated shadow-vs-partner ambiguity), one FIFO queue resume
+  the endpoint gates can't order (415751), one §4 greedy second-pass miss
+  (415531 triple), two out-of-reach 2_84 handoffs, the 2_85 ped pair whose
+  two slot-0 tracks run 120 ft apart (possibly two pedestrians), and the
+  422141 anchor's wide-gate contamination. Follow-ups named in the module
+  doc: FIFO queue-order matching, stuck-ghost tail trimming (owner: objects
+  "stick" on multipath and the real vehicle leaves under a new oid; doppler
+  beyond ~200 ft explains why drops cluster at queue tails), and streaming
+  reuse. test_fusion.py grew 11 mechanism/acceptance tests (44 pass).
+- 2026-07-14 — **Overlay review round (Item 45, Fable): in-GUI labeling,
+  fused-view underlay, handoff smoothing, ghost-tail trimming.** Four owner
+  requests in one session:
+  1. **Review labeling mode** — the Item 44 hand-transcription workflow moved
+     into the GUI. A `review` switch in the Replay transport arms marker
+     clicking on the (otherwise read-only) canvas: each click toggles the raw
+     track under the cursor into a selection (cyan halo ring; committed
+     members show a dashed green ring), a kind picker + `ped`/`unsure`/note
+     commit it as a labeled group (handoff / persistence / anchor / stray —
+     the fixture's exact semantics; `same_sensor` derived, never asked), and
+     Save writes `<capture>.observations.json` beside the recording in the
+     **same schema** as `stitch_observations_2026-07-13.json`. Loading a
+     recording resumes its sidecar automatically, and
+     `fusion_eval.py --obs <file>` scores a review file directly — every
+     future review session grows the acceptance set with zero transcription.
+     Pure state in new `model/review.py` (ReviewSession/ReviewGroup: toggle
+     order preserved, pair kinds refuse <2 members); only hit-testing (canvas
+     space, 1.5 marker radii over the *raw* points in both views) and rings
+     live in `gui/app.py`.
+  2. **Fused-view underlay** — the fused display now renders the raw
+     per-sensor markers underneath at 20 % opacity (`<g opacity="0.2">`,
+     still marker-layer-only), so what the engine merged stays visible during
+     fused playback; the underlay shows raw oid labels only while review is
+     armed (that's when raw ids — what the labels record — matter over fused
+     ids).
+  3. **Handoff smoothing** — pure `smooth_seams()` in `model/fusion.py`: a
+     centered ±0.5 s average applied *only* to points within 1 s of a
+     cross-source seam (overlap blends, bridge joints) of multi-member
+     tracks. `ensure_fusion` feeds `fused_frame_markers` from the smoothed
+     copy, so the on-screen handoff glides while the cached `FusionResult`
+     (and every eval/test) keeps the engine's exact geometry.
+  4. **Stuck-ghost tail trimming** (the Item 44 follow-up) —
+     `_split_stuck_tails` runs before any matching: a track whose speed still
+     reads ≥ 15 ft/s across the freeze boundary *and* over the trailing
+     window, then holds one 4-ft spot ≥ 3 s to its death, froze in a way no
+     braking car can (≈0.9 g rejection bound at the hold radius; a parked
+     car's one-sample position hop fails the window gate — verified against
+     the real captures' frozen-tail population, where queued red-light cars
+     like 422921's 66 s hold all reject). The tail becomes a dimmed
+     `kind="ghost"` track (never deleted; `id_of` stays with the live head)
+     and can no longer poison bridging or the occupancy veto — the pytest
+     control case shows the untrimmed failure mode is worse than a veto: the
+     stick *absorbs the real vehicle's trajectory*. Fires 2× across the five
+     labeled captures (conservative by design, refuse-don't-guess); eval
+     unchanged at handoff 21/26, persistence 14/17, anchor 3/4, stray 3/3.
+  Suite 656 → **677 pass** (test_review.py, ghost/smoothing engine tests,
+  underlay/ring GUI seams); review file scored through the harness
+  end-to-end as the smoke test.
+- 2026-07-14 — **Self-calibrating fusion (Item 46, Fable): align the sensors
+  before tracking.** Owner observation: the fused view codes one object as
+  several. Diagnosis: the pipeline seated sensors by zonefit *placement*
+  only — the Items 38–40 relational calibration never ran unless hand-
+  authored in Align, so every cross-sensor association worked through the
+  widened (2×) low-confidence gate over a real ~20 ft inter-sensor
+  disagreement (xx107 solves at +0.66°/24.2 ft, xx735 at +0.72°/23.5 ft —
+  the known ~0.7°/7 m signature of this site class). New
+  `model.replay.autocalibrate(project, recording)` runs the Align
+  Auto-calibrate gesture as a pure batch pre-pass (solve → placement refit
+  over calibrated centroids → realign) with one deliberate difference: **no
+  slots filter** — the GUI restricts the solve to Z;-mapped slots because
+  its output is a proposed sensor move, but this pre-pass corrects *stream
+  geometry*, so an unmapped-but-real sensor calibrates too (64_32's slot 2,
+  which the zonefit missed and which carried the failing 3-sensor handoff)
+  while junk slots are refused by the pair-count/residual guardrails, not a
+  list. (First cut hit exactly this: `set(zone_fit.slot_to_sensor)` is a
+  set of *pairs*, silently emptying the solve — replaced by no filter at
+  all.) On refusal the frames come back unchanged with the solve report
+  attached (`alignment.calibration`), so `bool(alignment.calib)` still
+  means "calibration happened". Consumers: `ensure_fusion` (fused view
+  only; raw overlay and Align authoring untouched) and `fusion_eval.py`
+  (`--no-autocal` reproduces the old runs; per-sensor solve line printed).
+  Calibration then *exposed two engine defects* the sloppy gate had masked,
+  both on xx107: (1) a single-sample blip on a queue spot "reads stopped"
+  and bridged onto the vehicle acquired there 14 s later, poisoning its
+  sensor set against the true cross-sensor partner — a track with the
+  stray module's own non-object shape (`_Track.flicker`) is now refused as
+  either bridge endpoint; (2) a red-light gap seen by both sensors is
+  unbridgeable raw — each endpoint has two comparably-close successor
+  views (own sensor's + the other's, all within ~7 ft once calibrated), so
+  the ambiguity margin rightly refuses — yet trivially unique once
+  association merges each side into one composite, so `fuse` now
+  alternates `_stitch_to_fixpoint` with the association passes to a joint
+  fixpoint (merges strictly shrink the track list, so it terminates). Eval:
+  41/50 → **44/50** (handoff 21→23/26, anchor 3→4/4, persistence 14/17,
+  stray 3/3), engine fixes alone are worth 41→43 uncalibrated; **no
+  regressions in either mode**; xx107 and xx735 are now clean. Remaining
+  misses are all understood: 2_84/2_85 refuse calibration honestly (24/30
+  cross-sensor pairs — the sensors barely co-see vehicles) and keep the old
+  behavior, plus the two pre-existing same-sensor 64_32 splits and the
+  2_85 chain. Suite 677 → **682 pass** (autocalibrate synthetic
+  recover/refuse + real-site, flicker veto, queue-resume fixpoint;
+  test_fusion_gui updated: the fused view of the us95 fixture is now
+  `calibrated`, not low-confidence).

@@ -41,7 +41,9 @@ from model.calibration import (
     world_delta,
 )
 from model.iprj_io import load_iprj
-from model.replay import Frame, LiveAligner, TrackPoint, load_recording, realign
+from model.replay import (Frame, LiveAligner, Recording, TrackPoint,
+                          anchor_world_ft, autocalibrate, load_recording,
+                          realign)
 from test_zonefit import _make_site, _zline
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -632,3 +634,69 @@ def test_find_pairs_reads_only_raw_meters(us95):
     b = find_pairs(scrambled.frames[:400], 1)
     assert a == b
     assert len(a) > 20
+
+
+# --- autocalibrate: the self-calibrating pre-pass (2026-07-14 round) -------------
+
+
+def _synthetic_recording(proj, frames) -> Recording:
+    """A minimal Recording over synthetic frames: no Z; fit, translation
+    anchor — the shape autocalibrate must handle without a zone match."""
+    return Recording(sensor_index=0, ref_m=(0.0, 0.0), ref_seen=False,
+                     anchor_ft=anchor_world_ft(proj, 0), frames=frames)
+
+
+def test_autocalibrate_recovers_and_realigns_synthetic():
+    """The whole pre-pass on a known misalignment: solve C₁ = mis⁻¹, build
+    the composed transform, realign — the two sensors' views of the same
+    vehicle coincide afterwards, and the solve report rides along."""
+    proj, _ = _make_site()
+    mis = RigidDelta.make(2.0, (1.5, -1.0))
+    frames = _misaligned_frames(mis, n=250)  # stride-5 solve sees MIN_PAIRS
+    rec = _synthetic_recording(proj, frames)
+    rec2 = autocalibrate(proj, rec)
+    assert rec2 is not rec
+    assert set(rec2.alignment.calib) == {1}
+    assert rec2.alignment.calibration.for_sensor(1).status == "ok"
+    rt = rec2.alignment.calib[1].compose(mis)
+    assert rt.theta_deg == pytest.approx(0.0, abs=1e-6)
+    assert math.hypot(rt.d_x, rt.d_y) == pytest.approx(0.0, abs=1e-6)
+    for f in rec2.frames[::25]:
+        p0, p1 = f.points
+        assert math.hypot(p0.x_ft - p1.x_ft,
+                          p0.y_ft - p1.y_ft) == pytest.approx(0.0, abs=1e-6)
+    # the input recording is untouched (realign copies)
+    assert rec.frames[0].points[1].x_ft == 0.0
+
+
+def test_autocalibrate_refusal_keeps_frames_but_reports():
+    """Guardrails carry through: too few pairs -> the frames come back
+    unchanged and calib stays empty (calibrated remains False downstream),
+    but the refused solve is attached so callers can say why."""
+    proj, _ = _make_site()
+    frames = _misaligned_frames(RigidDelta.make(2.0, (1.5, -1.0)), n=10)
+    rec = _synthetic_recording(proj, frames)
+    rec2 = autocalibrate(proj, rec)
+    assert rec2.frames is rec.frames
+    assert not rec2.alignment.calib
+    assert rec2.alignment.calibration.for_sensor(1).status == "too_few_pairs"
+
+
+@needs_us95
+def test_autocalibrate_real_recording(us95):
+    """On the real two-sensor site: the non-reference sensor solves and the
+    frames re-align through the composed transform (raw meters untouched);
+    the sparse vendor-combined slots 4/5 are refused, never moved."""
+    proj, rec = us95
+    rec2 = autocalibrate(proj, rec)
+    assert rec2 is not rec
+    cal = rec2.alignment.calibration
+    trusted = set(rec2.alignment.calib)
+    assert trusted and cal.reference not in trusted
+    for s in (4, 5):
+        entry = cal.for_sensor(s)
+        assert entry is not None and entry.flagged
+    for p, p2 in zip(rec.frames[10].points, rec2.frames[10].points):
+        assert (p2.x_raw_m, p2.y_raw_m) == (p.x_raw_m, p.y_raw_m)
+        assert (p2.x_ft, p2.y_ft) == rec2.alignment.apply(
+            p.sensor, p.x_raw_m, p.y_raw_m)

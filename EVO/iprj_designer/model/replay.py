@@ -50,7 +50,7 @@ from dataclasses import dataclass, replace as _dc_replace
 from pathlib import Path
 
 from . import zonefit
-from .calibration import AlignmentTransform
+from .calibration import AlignmentTransform, build_alignment, calibrate
 from .iprj_io import Project
 from .units import effective_meter_per_pixel, m_to_ft, px_to_ft
 from .zonefit import RawZone, ZoneFit
@@ -276,6 +276,45 @@ def realign(recording: Recording, alignment: AlignmentTransform | None) -> Recor
         for f in recording.frames
     ]
     return _dc_replace(recording, frames=frames, alignment=alignment)
+
+
+def autocalibrate(project: Project, recording: Recording) -> Recording:
+    """Self-calibrate a recording from its own frames and realign it — the
+    Items 38–40 composed transform run automatically (2026-07-14 round), so
+    batch consumers (the fusion engine, its eval harness) get agreeing
+    sensors without the GUI's manual Align › Auto-calibrate pass.
+
+    The same three steps that gesture performs — solve the relational
+    calibration (``reference=None`` anchors on the best-observed slot),
+    refit the group placement over the *calibrated* zone centroids, and
+    ``realign`` — with one deliberate difference: **no slots filter**. The
+    GUI's Align solve restricts to ``Z;``-mapped slots because its output is
+    a proposed *sensor move* (a non-sensor slot must never be reported or
+    committed as one). This pre-pass corrects *stream geometry* instead:
+    every id-space that carries enough clean pairs should agree with the
+    reference — including a real sensor the zone fit failed to map (the
+    32_US12&21st capture's slot 2) — and slots that shouldn't be corrected
+    (vendor-combined 4/5, transients) are refused by the pair-count/residual
+    guardrails, not by a list. Nothing here writes back to the project.
+
+    The solver's refuse-don't-guess guardrails carry through:
+    when no sensor solves to a trusted delta the frames come back
+    **unchanged** — ``alignment.calib`` stays empty, so
+    ``bool(alignment.calib)`` keeps meaning "calibration actually happened",
+    exactly the flag the fused view keys its cross-sensor gate on — but the
+    refused solve is still attached as ``alignment.calibration`` so callers
+    can report *why* (statuses, pair counts, residuals) instead of silence."""
+    cal = calibrate(recording.frames, reference=None)
+    alignment = build_alignment(
+        project, recording.zones, cal,
+        anchor_ft=recording.anchor_ft, ref_m=recording.ref_m)
+    if alignment is None:
+        return recording
+    if not cal.deltas:
+        # identical transform (empty calib reduces to the plain fit): keep
+        # the frames, attach the solve report
+        return _dc_replace(recording, alignment=alignment)
+    return realign(recording, alignment)
 
 
 # --- streaming alignment (ROADMAP Item 33, LIVE_OVERLAY_PLAN.md §2) ----------

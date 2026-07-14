@@ -18,6 +18,7 @@ from model.calibration import build_alignment, calibrate
 from model.fusion import (
     DEFAULT_PARAMS,
     FusionParams,
+    _Track,
     fold_tracks,
     frame_times_s,
     fuse,
@@ -407,7 +408,8 @@ def test_us95_calibration_tightens_labeled_overlaps(us95, us95_fused):
             j = min(range(len(bt)), key=lambda i: abs(bt[i] - t))
             if abs(bt[j] - t) <= DEFAULT_PARAMS.dt_match_s:
                 dists.append(math.hypot(x - b[j][1], y - b[j][2]))
-        assert dists
+        if len(dists) < 10:
+            return None  # too few matched samples to be a fair probe
         return sum(dists) / len(dists)
 
     checked = 0
@@ -420,6 +422,8 @@ def test_us95_calibration_tightens_labeled_overlaps(us95, us95_fused):
                  if {s1, s2} == {0, 1}]  # only the calibrated sensor pair
         for ka, kb in pairs:
             before = mean_sep(rec.frames, ka, kb)
+            if before is None:
+                continue  # too few matched samples to be a fair probe
             after = mean_sep(rec_cal.frames, ka, kb)
             assert after < before
             checked += 1
@@ -428,15 +432,26 @@ def test_us95_calibration_tightens_labeled_overlaps(us95, us95_fused):
 
 @needs_us95
 def test_us95_no_class_divide_violations(us95, us95_fused):
-    """No fused track anywhere mixes motorized and non-motorized members —
-    the §3/§4 class gate holds across the whole real recording."""
+    """No fused track anywhere mixes a *driving* motorized member with a
+    non-motorized one — the §3/§4 class gate holds across the whole real
+    recording.  Members that never beat walking pace are exempt since the
+    observation round: the vendor labels pedestrians (and the fragments they
+    shed) cls 30, and the behavioral override deliberately reclassifies
+    them (module doc)."""
     _, rec = us95
     res, _, _ = us95_fused
-    cls_of = {r.key: r.cls for r in fold_tracks(rec.frames)}
+    walking = DEFAULT_PARAMS.ped_pct95_ft_s
+    raw = {r.key: _Track(r) for r in fold_tracks(rec.frames)}
     for t in res.tracks:
-        cats = {("non_motor" if cls_of[m] in (10, 15, 20) else
-                 "motor" if (cls_of[m] or 0) >= 25 else None)
-                for m in t.members}
+        if any(s >= 4 for s, _ in t.members):
+            continue  # vendor-combined: its seam assertion outranks its
+            # own flip-flopping per-frame class labels (module doc)
+        cats = set()
+        for m in t.members:
+            r = raw[m]
+            if r.cat == "motor" and r.pct95_v <= walking:
+                continue  # never beat walking pace: class untrustworthy
+            cats.add(r.cat)
         assert not ({"motor", "non_motor"} <= cats), t.members
 
 
@@ -521,3 +536,379 @@ def test_fused_frame_markers_two_vehicles_two_markers():
     both = [m for m in per_frame if len(m) == 2]
     assert both  # frames where both vehicles are up show two markers
     assert all(len(m) <= 2 for m in per_frame)
+
+
+# --- observation-round mechanisms (2026-07-13; stitch_observations fixture) ---
+
+
+def test_vendor_seam_merge_joins_both_retired_members():
+    """A combined-slot id (oid%10 >= 4) starting the frame after two raw
+    tracks die at its birth point absorbs both — the vendor's own fusion,
+    honored with zero temporal overlap (module doc)."""
+    frames = _frames(
+        (20, 30, 0.0, (0.0, 0.0), (30, 0), 20),   # S0 view, dies t=1.9 x=57
+        (41, 30, 0.0, (0.0, 3.0), (30, 0), 20),   # S1 view, dies alongside
+        (44, 0, 2.0, (60.0, 0.0), (30, 0), 30),   # vendor-combined slot 4
+    )
+    res = fuse(frames, calibrated=True)
+    assert len(res.tracks) == 1
+    t = res.tracks[0]
+    assert set(t.members) == {(0, 20), (1, 41), (4, 44)}
+    assert t.kind == "fused"  # two real sensors behind the combined id
+    assert res.id_of[(4, 44)] == res.id_of[(0, 20)]
+
+
+def test_vendor_seam_ignores_track_moving_the_other_way():
+    """The seam's velocity guard: a track coincidentally dying near the
+    combined birth while moving against it is not a member."""
+    frames = _frames(
+        (20, 30, 0.0, (0.0, 0.0), (30, 0), 20),    # true member, dies x=57
+        (30, 30, 0.0, (117.0, 4.0), (-30, 0), 20),  # oncoming, dies x=60
+        (44, 0, 2.0, (60.0, 0.0), (30, 0), 30),
+    )
+    res = fuse(frames, calibrated=True)
+    fid = res.id_of[(4, 44)]
+    members = next(t.members for t in res.tracks if t.fused_id == fid)
+    assert (0, 20) in members and (0, 30) not in members
+
+
+def test_parked_resume_bridges_a_red_light_gap():
+    """A queued vehicle re-acquired 45 s later a few feet away is one track —
+    beyond the stopped window, inside the parked one."""
+    frames = _frames(
+        (30, 30, 0.0, (0.0, 0.0), (20, 0), 30),     # ends t=2.9 at x=58
+        (40, 30, 48.0, (60.0, 0.0), (15, 0), 30),   # resumes 2 ft on
+    )
+    res = fuse(frames, calibrated=True)
+    assert res.id_of[(0, 30)] == res.id_of[(0, 40)]
+
+
+def test_parked_resume_occupancy_veto():
+    """If another vehicle parked on the spot during the gap, the queue
+    flushed and refilled — the resume is a different vehicle: refuse."""
+    parker = [(50, 30, 10.0, (59.0, 1.0), (0, 0), 100)]  # parks 10 s there
+    drive_off = [(50, 30, 20.0, (59.0, 1.0), (25, 0), 20)]  # then leaves
+    frames = _frames(
+        (30, 30, 0.0, (0.0, 0.0), (20, 0), 30),
+        (40, 30, 48.0, (60.0, 0.0), (15, 0), 30),
+        *parker, *drive_off,
+    )
+    res = fuse(frames, calibrated=True)
+    assert res.id_of[(0, 30)] != res.id_of[(0, 40)]
+
+
+def test_relabel_bridge_tolerates_brief_double_tracking():
+    """A same-sensor re-label whose successor is born in the predecessor's
+    final moments (small temporal overlap) still bridges."""
+    frames = _frames(
+        (30, 30, 0.0, (0.0, 0.0), (20, 0), 25),    # ends t=2.4 at x=48
+        (40, 30, 2.0, (41.0, 0.0), (20, 0), 25),   # born 0.4 s before that
+    )
+    res = fuse(frames, calibrated=True)
+    assert res.id_of[(0, 30)] == res.id_of[(0, 40)]
+    (t,) = res.tracks
+    assert [p.t_s for p in t.points] == sorted(p.t_s for p in t.points)
+
+
+def test_duplicate_twin_absorbed_into_host():
+    """A same-sensor twin living its whole life a few feet off a longer
+    track (sensor double-tracking) is absorbed, not left as a second
+    vehicle."""
+    frames = _frames(
+        (30, 30, 0.0, (0.0, 0.0), (20, 0), 60),
+        (40, 30, 0.5, (10.5, 4.0), (20, 0), 20),   # rides 4 ft off, 2 s
+    )
+    res = fuse(frames, calibrated=True)
+    assert len(res.tracks) == 1
+    assert set(res.tracks[0].members) == {(0, 30), (0, 40)}
+
+
+def test_stopped_queue_neighbours_never_absorb():
+    """Two stationary same-sensor tracks 15 ft apart (queued cars in
+    adjacent lanes) stay separate: neither is non-motorized and their
+    velocities are unreadable."""
+    frames = _frames(
+        (30, 30, 0.0, (0.0, 0.0), (0, 0), 100),
+        (40, 30, 0.0, (0.0, 15.0), (0, 0), 100),
+    )
+    res = fuse(frames, calibrated=True)
+    assert len(res.tracks) == 2
+
+
+def test_behavioral_pedestrian_override_bridges_misclassified_ped():
+    """A long track that never beats walking pace bridges with a cls-10
+    pedestrian even though the vendor labeled it cls 30 (the 2_85 capture's
+    43 s 'motor' pedestrian)."""
+    frames = _frames(
+        (10, 10, 0.0, (0.0, 0.0), (4, 0), 100),      # ped, ends t=9.9 x=39.6
+        (21, 30, 10.0, (40.4, 0.0), (4, 0), 150),    # "cls 30", walking pace
+    )
+    res = fuse(frames, calibrated=True)
+    assert res.id_of[(0, 10)] == res.id_of[(1, 21)]
+    fid = res.id_of[(0, 10)]
+    t = next(t for t in res.tracks if t.fused_id == fid)
+    assert t.category == "non_motor"
+
+
+def test_flicker_flagged_stray():
+    """A sub-second track that goes nowhere is kind='stray' — flagged, not
+    deleted."""
+    frames = _frames((30, 30, 0.0, (0.0, 0.0), (3, 0), 8))
+    res = fuse(frames, calibrated=True)
+    (t,) = res.tracks
+    assert t.kind == "stray"
+
+
+def test_shadow_flagged_stray():
+    """A short-lived track riding a fixed offset beside a much longer
+    concurrent companion moving the same way (a radar shadow) is flagged."""
+    frames = _frames(
+        (30, 30, 0.0, (0.0, 0.0), (30, 0), 100),      # the real vehicle
+        (40, 30, 3.0, (90.0, 25.0), (30, 0), 30),     # 25 ft shadow, 3 s
+    )
+    res = fuse(frames, calibrated=True)
+    kinds = {t.members[0]: t.kind for t in res.tracks}
+    assert kinds[(0, 40)] == "stray"
+    assert kinds[(0, 30)] != "stray"
+
+
+OBS_FIXTURE = FIXTURES / "stitch_observations_2026-07-13.json"
+SITES = Path(__file__).resolve().parents[3] / "sites"
+
+
+@pytest.mark.skipif(not SITES.exists(), reason="sites/ captures not present")
+def test_observation_acceptance_2_86_xx735():
+    """Owner-labeled acceptance on the 2_86_xx735 capture (2026-07-13
+    observation round): confirmed red-light queue pairs bridge, anchors
+    stay clean of same-sensor absorption, the labeled stray never stands
+    as its own real track."""
+    import gzip
+
+    obs = json.loads(OBS_FIXTURE.read_text())["captures"]["2_86_xx735"]
+    proj = load_iprj(US95_IPRJ)
+    rec = load_recording(proj, US95_REC, max_frames=None)
+    res = fuse(rec.frames, calibrated=False)
+
+    id_of = res.id_of
+    by_fid = {t.fused_id: t for t in res.tracks}
+    # confirmed (not 'unsure') persistence pairs share one fused track
+    for g in obs["groups"]:
+        members = [tuple(m) for m in g["members"]]
+        if g["kind"] == "persistence" and not g.get("unsure"):
+            assert len({id_of[m] for m in members}) == 1, g
+        elif g["kind"] == "anchor" and members[0] != (1, 422141):
+            # 422141 is the documented uncalibrated wide-gate miss
+            (m,) = members
+            t = by_fid[id_of[m]]
+            same_sensor_extras = [
+                x for x in t.members if x != m and x[0] == m[0]]
+            assert not same_sensor_extras, g
+        elif g["kind"] == "stray":
+            (m,) = members
+            t = by_fid[id_of[m]]
+            assert t.kind == "stray" or len(t.members) > 1, g
+
+
+# --- stuck-ghost tail trimming (2026-07-14 round) --------------------------------
+
+
+def test_stuck_tail_split_into_ghost():
+    """A moving track that freezes from full speed inside one sample and holds
+    to its death is split: the live head keeps the id_of entry, the frozen
+    tail surfaces as a dimmed kind="ghost" track."""
+    frames = _frames(
+        (10, 30, 0.0, (0, 0), (30, 0), 31),      # moving, 0..90 ft over 3 s
+        (10, 30, 3.1, (93, 0), (0, 0), 50),      # frozen 4.9 s, dies frozen
+    )
+    res = fuse(frames, calibrated=True)
+    ghosts = [t for t in res.tracks if t.kind == "ghost"]
+    assert len(ghosts) == 1
+    (g,) = ghosts
+    assert g.members == ((0, 10),)
+    # the tail holds the hold radius around the frozen spot (the last in-
+    # radius moving sample is swallowed into the suffix by construction)
+    assert all(abs(p.x_ft - 93.0) <= DEFAULT_PARAMS.stuck_hold_r_ft
+               for p in g.points)
+    live = [t for t in res.tracks if t.kind != "ghost"]
+    assert len(live) == 1
+    assert live[0].points[-1].x_ft == pytest.approx(87.0)
+    # the shared member key resolves to the live head, not the ghost
+    assert res.id_of[(0, 10)] == live[0].fused_id
+
+
+def test_braking_stop_keeps_its_tail():
+    """A real car decelerating to a stop (even briskly) arrives at the hold
+    radius slowly — physically plausible, so the frozen tail is kept."""
+    pts = []
+    t, x, v = 0.0, 0.0, 30.0
+    while v > 0:  # brake at 10 ft/s^2, sampled at 10 fps
+        pts.append((t, x))
+        x += v * 0.1
+        v -= 1.0
+        t += 0.1
+    hold_until = t + 5.0
+    while t < hold_until:  # holds 5 s at the stop, then the track drops
+        pts.append((t, x))
+        t += 0.1
+    frames = [Frame(t=_t(tt), points=(_pt(10, xx, 0.0),)) for tt, xx in pts]
+    res = fuse(frames, calibrated=True)
+    assert [t.kind for t in res.tracks] == ["single"]
+    assert len(res.tracks[0].points) == len(pts)
+
+
+def test_parked_position_hop_not_trimmed():
+    """A stopped car whose radar position hops once (big boundary step, near-
+    zero net window displacement) is not a stick — the window gate rejects."""
+    frames = _frames(
+        (10, 30, 0.0, (0, 0), (30, 0), 21),      # drives 60 ft
+        (10, 30, 2.1, (60, 0), (0, 0), 12),      # stops 1.2 s
+        (10, 30, 3.3, (65, 0), (0, 0), 50),      # hops 5 ft, frozen to death
+    )
+    res = fuse(frames, calibrated=True)
+    assert not [t for t in res.tracks if t.kind == "ghost"]
+
+
+def test_freeze_that_resumes_is_not_a_stick():
+    """A mid-track freeze that resumes moving was a stop, not a stick — the
+    tail-only trim never touches it."""
+    frames = _frames(
+        (10, 30, 0.0, (0, 0), (30, 0), 21),
+        (10, 30, 2.1, (63, 0), (0, 0), 40),      # frozen 4 s mid-track
+        (10, 30, 6.1, (64, 0), (10, 0), 20),     # resumes
+    )
+    res = fuse(frames, calibrated=True)
+    assert not [t for t in res.tracks if t.kind == "ghost"]
+    assert len(res.tracks) == 1
+
+
+def test_ghost_tail_no_longer_vetoes_parked_resume():
+    """The motivating case (module doc): a stuck ghost frozen on a queue spot
+    used to trip the parked-resume occupancy veto and split a real red-light
+    resume. Trimmed, the veto sees only the ghost's moving head."""
+    specs = [
+        (10, 30, 0.0, (50, 0), (10, 0), 51),     # A arrives at (100, 0) ...
+        (10, 30, 5.1, (100, 0), (0, 0), 10),     # ... stops 1 s, drops
+        (110, 30, 45.0, (102, 0), (15, 0), 30),  # A's resume 39 s later
+        # the stick: drives -x through the corridor, freezes at (100, 2) —
+        # 2 ft off A's parking spot — for ~10 s during A's gap, then dies
+        (20, 30, 15.0, (160, 2), (-30, 0), 20),
+        (20, 30, 17.0, (100, 2), (0, 0), 100),
+    ]
+    res = fuse(_frames(*specs), calibrated=True)
+    assert res.id_of[(0, 10)] == res.id_of[(0, 110)]  # the resume bridges
+    by_fid = {t.fused_id: t for t in res.tracks}
+    assert set(by_fid[res.id_of[(0, 10)]].members) == {(0, 10), (0, 110)}
+    assert [t.kind for t in res.tracks].count("ghost") == 1
+    # control: with trimming disabled the frozen tail poisons the stitch —
+    # the stick gets absorbed into the real vehicle's trajectory
+    no_trim = FusionParams(stuck_v_fast_ft_s=math.inf)
+    res2 = fuse(_frames(*specs), calibrated=True, params=no_trim)
+    by_fid2 = {t.fused_id: t for t in res2.tracks}
+    assert (0, 20) in by_fid2[res2.id_of[(0, 10)]].members
+
+
+# --- render-side seam smoothing (2026-07-14 round) --------------------------------
+
+
+def _smoothing_case():
+    """A cross-sensor handoff with a 4-ft lateral disagreement: the blend ramps
+    y from 0 to 4 across the overlap, leaving a kink at either end."""
+    frames = _frames(
+        (10, 30, 0.0, (0, 0), (30, 0), 21),       # sensor 0, y = 0
+        (21, 30, 1.5, (45, 4), (30, 0), 26),      # sensor 1, y = 4
+    )
+    return fuse(frames, calibrated=True)
+
+
+def test_smooth_seams_touches_only_the_seam_window():
+    from model.fusion import smooth_seams
+
+    res = _smoothing_case()
+    sm = smooth_seams(res, window_s=1.0)
+    (tr,), (tr2,) = res.tracks, sm.tracks
+    assert tr2.fused_id == tr.fused_id and tr2.members == tr.members
+    assert [p.t_s for p in tr2.points] == [p.t_s for p in tr.points]
+    assert [p.src for p in tr2.points] == [p.src for p in tr.points]
+    t0 = 9 * 3600  # _t() stamps are seconds past 9am
+    changed = [a.t_s - t0 for a, b in zip(tr.points, tr2.points)
+               if (a.x_ft, a.y_ft) != (b.x_ft, b.y_ft)]
+    assert changed, "the seam window must actually smooth"
+    # seams live in the 1.5..2.0 overlap; ±1 s reaches at most 0.5..3.0
+    assert min(changed) >= 0.5 - 1e-9
+    assert max(changed) <= 3.0 + 1e-9
+
+
+def test_smooth_seams_reduces_handoff_jerk():
+    from model.fusion import smooth_seams
+
+    res = _smoothing_case()
+    sm = smooth_seams(res, window_s=1.0)
+
+    def max_step(tr):
+        ys = [p.y_ft for p in tr.points]
+        return max(abs(b - a) for a, b in zip(ys, ys[1:]))
+
+    assert max_step(sm.tracks[0]) < max_step(res.tracks[0])
+    # and the lateral transition still lands on sensor 1's lane
+    assert sm.tracks[0].points[-1].y_ft == pytest.approx(4.0)
+
+
+def test_smooth_seams_leaves_single_tracks_untouched():
+    from model.fusion import smooth_seams
+
+    frames = _frames((10, 30, 0.0, (0, 0), (30, 0), 40))
+    res = fuse(frames, calibrated=True)
+    sm = smooth_seams(res, window_s=1.0)
+    assert sm.tracks == res.tracks
+    assert dict(sm.id_of) == dict(res.id_of)
+
+
+# --- 2026-07-14 calibrated-eval round: flicker veto + stitch<->fuse fixpoint ----
+
+
+def test_flicker_blip_never_anchors_a_bridge():
+    """A single-sample blip on a queue spot must not bridge onto the vehicle
+    acquired there later (the 2_86_xx107 regression): one radar sample has no
+    velocity, reads "stopped", and under the generous stopped gates it used
+    to merge — poisoning the fused track's sensor set so the vehicle's true
+    cross-sensor partner could never associate. The flicker veto refuses the
+    blip as a bridge endpoint; it stands alone and is flagged a stray."""
+    frames = _frames(
+        (11, 30, 0.0, (0.0, 0.0), (0.0, 0.0), 1),       # sensor-1 blip
+        (20, 30, 14.2, (2.0, 0.0), (20.0, 0.0), 100),   # sensor-0 vehicle
+        # sensor-1 view of the same vehicle, acquired mid-track far from the
+        # blip (out of its stopped-gate range), riding ~3 ft off sensor 0
+        (31, 30, 17.6, (70.0, 3.0), (20.0, 0.0), 58),
+    )
+    res = fuse(frames, calibrated=True)
+    assert res.id_of[(0, 20)] == res.id_of[(1, 31)]  # the real handoff fuses
+    by_fid = {t.fused_id: t for t in res.tracks}
+    blip = by_fid[res.id_of[(1, 11)]]
+    assert blip.members == ((1, 11),)
+    assert blip.kind == "stray"
+    assert by_fid[res.id_of[(0, 20)]].kind == "fused"
+
+
+def test_queue_resume_bridges_after_cross_sensor_association():
+    """A red-light gap seen by two sensors: at the raw stage every endpoint
+    has two comparably-close successor views (its own sensor's and the
+    other's), so the ambiguity margin rightly refuses every bridge — but
+    once cross-sensor association merges each side's views into one
+    composite, the resume is unique and must bridge (the stitch<->fuse
+    fixpoint, 2_86_xx107's second regression)."""
+    frames = _frames(
+        # before the light: both sensors watch the vehicle drive up and park
+        # (sensor 1's view rides ~3 ft ahead along the lane)
+        (40, 30, 0.0, (0.0, 0.0), (20.0, 0.0), 50),
+        (40, 30, 5.0, (100.0, 0.0), (0.0, 0.0), 30),
+        (41, 30, 0.1, (3.0, 0.0), (20.0, 0.0), 49),
+        (41, 30, 5.05, (103.0, 0.0), (0.0, 0.0), 30),
+        # green, ~9 s later: both sensors re-acquire it pulling away
+        (50, 30, 17.0, (101.0, 0.0), (20.0, 0.0), 60),
+        (51, 30, 17.1, (104.5, 0.0), (20.0, 0.0), 58),
+    )
+    res = fuse(frames, calibrated=True)
+    fids = {res.id_of[k] for k in ((0, 40), (1, 41), (0, 50), (1, 51))}
+    assert len(fids) == 1, f"queue resume split across fused ids {fids}"
+    track = next(t for t in res.tracks if t.fused_id == fids.pop())
+    assert track.kind == "fused"

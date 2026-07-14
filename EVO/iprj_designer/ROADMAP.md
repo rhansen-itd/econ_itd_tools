@@ -886,6 +886,110 @@ Suggested prompt:
 
 ---
 
+## 44 — Ground-Truth Stitching Round (Target: Fable) — DONE 2026-07-13 — needs Items 42/43
+
+The owner hand-watched five captures (64_32, 2_84_xx404, 2_85, 2_86_xx107,
+2_86_xx735) and labeled handoff / persistence / stray groups; this item
+turns those observations into a scored fixture and improves the Item 42
+engine against it.
+
+Scope:
+- [x] Resolve the owner's abbreviated ids to raw oids and encode the labels
+      (with unsure/ped/fused-ref annotations) as
+      `tests/fixtures/stitch_observations_2026-07-13.json`; scoring harness
+      `scripts/fusion_eval.py` runs all five captures the way the GUI does.
+- [x] Decode the vendor-combined id convention (slot `oid%10 >= 4` = the
+      sensor's own fusion: both raw ids retired, fresh id+4 continues, zero
+      overlap) and join those seams in `model/fusion.py`.
+- [x] Red-light "parked resume" bridging (30-90 s drops a few feet apart)
+      with an occupancy veto standing in for phase-status decoding;
+      re-label bridges (brief double-tracked handover); same-sensor
+      duplicate absorption; cross-sensor bridge candidacy.
+- [x] Majority-class fold + behavioral pedestrian override (walking-pace
+      cls-30 tracks are non-motorized); `FusedTrack.category`; stray
+      flagging (`kind="stray"`: flickers + same-way shadows), never deleted.
+- [x] GUI: pedestrians draw as diamonds, strays render dimmed/dashed, on
+      both raw and fused marker paths.
+- [x] Two old us95 labels corrected on seam evidence (421505, 420685 were
+      attributed to the wrong platooning vehicle); labeled acceptance +
+      observation acceptance in pytest.
+- [x] Eval: handoff 21/26, persistence 14/17, anchor 3/4, stray 3/3
+      (baseline 17/26, 4/17, 3/4, 2/2). Known misses + follow-ups (FIFO
+      queue matching, stuck-ghost tails, shadow-vs-partner ambiguity when
+      uncalibrated) recorded in DESIGN_HISTORY and the module doc.
+
+---
+
+## 45 — Overlay Review Round: In-GUI Labeling + Fused Display + Ghost Tails (Target: Fable) — DONE 2026-07-14 — needs Items 43/44
+
+The owner's 2026-07-14 batch, one session: move the Item 44 ground-truth
+labeling workflow into the overlay itself, make the fused display show its
+underlying objects, smooth the on-screen handoff, and deliver the Item 44
+stuck-ghost-tail follow-up.
+
+Scope:
+- [x] **Review labeling mode** (`model/review.py` + Replay transport): a
+      `review` switch arms marker clicking — select raw tracks by click
+      (halo rings; dashed once labeled), commit groups as handoff /
+      persistence / anchor / stray with `ped`/`unsure`/note (`same_sensor`
+      derived), save/resume `<capture>.observations.json` beside the
+      recording in the Item 44 observation schema;
+      `fusion_eval.py --obs <file>` scores review output directly.
+- [x] **Fused-view underlay**: raw per-sensor markers at 20 % opacity under
+      the fused markers (marker-layer-only), raw oid labels while reviewing.
+- [x] **Handoff smoothing**: pure `smooth_seams()` — display copy eased near
+      cross-source seams only; engine geometry, eval, and tests untouched.
+- [x] **Stuck-ghost tail trimming** (Item 44 follow-up): freeze-onset
+      kinematics (boundary + trailing-window speed ≥ 15 ft/s into a ≥ 3 s
+      hold-to-death within 4 ft) split the frozen tail into a dimmed
+      `kind="ghost"` track before matching, so sticks can't poison bridges
+      or the occupancy veto; braking cars / parked position-hops rejected.
+- [x] Eval unchanged (21/26, 14/17, 3/4, 3/3); suite 656 → 677;
+      DESIGN_HISTORY entry.
+
+---
+
+## 46 — Self-Calibrating Fusion (Target: Fable) — DONE 2026-07-14 — needs Items 39/42
+
+Owner observation: the fused view codes one object as several; root cause
+analysis showed the pipeline seats sensors by zonefit placement only — the
+Items 38–40 relational calibration never ran unless authored by hand in
+Align, so cross-sensor association worked through the widened low-confidence
+gate on ~20 ft inter-sensor disagreement.
+
+Scope:
+- [x] **`model.replay.autocalibrate(project, recording)`**: the Align
+      Auto-calibrate gesture as a pure batch pre-pass — relational solve
+      over the stream's own vehicle pairs (`reference=None`, **no slots
+      filter**: the solve corrects stream geometry, not sensor configs, so
+      an unmapped-but-real sensor like 32_US12&21st's slot 2 calibrates and
+      junk slots are refused by the guardrails, not a list), placement refit
+      over calibrated centroids, `realign`. On refusal the frames come back
+      unchanged with the solve report attached.
+- [x] **Consumers**: `Viewer.ensure_fusion` self-calibrates an uncalibrated
+      recording before fusing (fused view only — the raw overlay and the
+      Align authoring/commit workflow are untouched); `fusion_eval.py` does
+      the same (`--no-autocal` reproduces the old runs) and prints the
+      per-sensor solve line.
+- [x] **Flicker veto**: a track with the stray shape (sub-`stray_dur_s`,
+      sub-`stray_net_ft`) is refused as a bridge endpoint — one radar blip
+      no longer anchors a stopped/parked bridge and poisons the fused
+      sensor set (the calibrated 2_86_xx107 regression).
+- [x] **Stitch↔fuse fixpoint**: `fuse` alternates gap-bridging with
+      cross-sensor association until no track merges — a two-sensor
+      red-light gap that is ambiguous raw (two views per endpoint) bridges
+      uniquely once each side's views are one composite.
+- [x] Eval: 41/50 → **44/50** self-calibrated (handoff 21→23/26,
+      persistence 14/17, anchor 3→4/4, stray 3/3), 43/50 with
+      `--no-autocal`; **no regressions in either mode**. Remaining misses
+      are all refused-calibration captures (2_84/2_85: too few pairs) or
+      same-sensor splits.
+- [x] pytest: autocalibrate (synthetic recover/refuse + real-site),
+      flicker veto, queue-resume fixpoint; suite 677 → 682. DESIGN_HISTORY
+      entry.
+
+---
+
 ## 10 — Webserver Deployment (Target: Opus)
 
 Carried over unchanged from the earlier "Phase 5" round (not started, not

@@ -24,13 +24,18 @@
     },
     {
       "expect": "fused",
-      "members": [[0, 716460], [1, 421491], [5, 421505]],
-      "note": "three-source NE-through: both sensors plus S1's secondary slot"
+      "members": [[0, 716460], [1, 421491], [1, 421531]],
+      "note": "NE-through truck; 421531 is S1's double-track twin dying 11 ft from 421491's endpoint at the same moment. Corrected 2026-07-13: 421505 was mislabeled into this group - the seam evidence (2-point 421501 born+dying at 716510's death spot as 421505 starts) pins it to the platooning partner below, which the 2026-07-10 inspection could not see"
     },
     {
       "expect": "fused",
-      "members": [[0, 715090], [5, 420685]],
-      "note": "SW-bound; short secondary-slot echo wholly inside the S0 track"
+      "members": [[0, 715470], [0, 716510], [1, 421501], [5, 421505]],
+      "note": "the NE-through platooner: first tracked as 715470, stops ~72 s at the light (drops at (403,516), resumes 12.8 ft away as 716510 on the same heading), then hands to the vendor-combined slot-5 id via the instant 2-point S1 acquisition 421501 (2026-07-13 observation round)"
+    },
+    {
+      "expect": "fused",
+      "members": [[0, 715380], [1, 420681], [5, 420685]],
+      "note": "SW-bound into the stop bar. Corrected 2026-07-13: 420685 was labeled onto 715090 (queued ~15 ft alongside), but the seam is unambiguous - 715380 dies 6.4 ft and the 1-point 420681 2.0 ft from 420685's birth, 0.1 s before"
     },
     {
       "expect": "stitched",

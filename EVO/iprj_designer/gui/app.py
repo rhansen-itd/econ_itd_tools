@@ -206,9 +206,11 @@ from model.calibration import (IDENTITY, AlignmentTransform, Placement,
                                RigidDelta, build_alignment, calibrate,
                                commit_alignment, nudged_delta, rotated_about,
                                translated, world_delta)
-from model.replay import (Frame, LiveAligner, Recording, load_recording,
-                          marker_color, realign, short_id)
-from model.fusion import fuse, fused_frame_markers, frame_times_s
+from model.replay import (Frame, LiveAligner, Recording, autocalibrate,
+                          load_recording, marker_color, realign, short_id)
+from model.fusion import fuse, fused_frame_markers, frame_times_s, smooth_seams
+from model.review import KINDS as REVIEW_KINDS
+from model.review import ReviewSession, observations_path
 from model.zonefit import ZoneFit
 from model.templates import (DIRECTIONS, PlacementContext, expand_and_place,
                              expand_and_place_on_centerline, load_template,
@@ -556,12 +558,25 @@ class Viewer:
         # dedup + within-sensor stitch), instead of the raw per-sensor points.
         # The result is expensive to compute over a whole recording, so it is
         # cached, keyed by (recording identity, calibrated?) — recomputed only
-        # when the recording or its calibration state changes. Fusion is
-        # batch-only (FUSION_PLAN §5), so Live always shows raw.
+        # when the recording or its calibration state changes. An uncalibrated
+        # recording self-calibrates on the way in (ensure_fusion ->
+        # model.replay.autocalibrate, 2026-07-14 round). Fusion is batch-only
+        # (FUSION_PLAN §5), so Live always shows raw.
         self.fused_view = False
         self._fusion = None            # cached FusionResult
         self._fusion_frames: tuple = ()  # per-frame {fused_id: (x_ft, y_ft)}
+        self._fusion_meta: dict = {}   # fused_id -> (kind, category)
         self._fusion_key = None        # (id(recording), calibrated) of the cache
+        # Review labeling (2026-07-14 round): with the `review` switch armed
+        # in Replay, clicking a marker toggles its raw track into the current
+        # selection; a selection commits into a labeled ReviewGroup (handoff/
+        # persistence/anchor/stray + ped/unsure/note) and saves as an
+        # observations JSON beside the recording — the same schema
+        # scripts/fusion_eval.py scores, so labels feed straight back into
+        # engine tuning. Selection state lives in model/review.py (pure);
+        # only the click hit-test and the rings live here.
+        self.review_active = False
+        self.review = ReviewSession()
         # Record (ROADMAP Item 31, plan §5): live capture sessions keyed by
         # host, so the Record dialog can be reopened to check on / stop a
         # capture started earlier without losing it. Single-host minimum
@@ -1372,23 +1387,38 @@ class Viewer:
             cx, cy = self.replay_point_to_canvas(fx, fy)
             parts.append(self._marker_glyph(
                 cx, cy, marker_color(pt.sensor),
-                escape(short_id(pt.oid)) if labels else "", lw, r, font))
+                escape(short_id(pt.oid)) if labels else "", lw, r, font,
+                ped=pt.cls in (10, 15, 20)))
         return "".join(parts)
 
-    def _marker_glyph(self, cx, cy, color, label, lw, r, font) -> str:
-        """One marker's SVG — the circle plus (when *label* is non-empty) its
+    def _marker_glyph(self, cx, cy, color, label, lw, r, font,
+                      ped: bool = False, dim: bool = False) -> str:
+        """One marker's SVG — the glyph plus (when *label* is non-empty) its
         id text. The single glyph both the raw (`_marker_svg`) and fused
         (`_fused_marker_svg`, Item 43) paths emit, so a marker reads identically
-        whichever produced it."""
-        glyph = (f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{r:.1f}" '
-                 f'fill="{color}" fill-opacity="0.9" stroke="black" '
-                 f'stroke-width="{lw / 2:.2f}"/>')
+        whichever produced it. Non-motorized objects (*ped*) draw as a diamond
+        instead of a circle; flagged strays (*dim*) render faded with a dashed
+        outline so they read as non-objects without disappearing."""
+        opacity = 0.35 if dim else 0.9
+        dash = f' stroke-dasharray="{lw:.1f},{lw:.1f}"' if dim else ""
+        if ped:
+            pr = r * 1.2
+            pts = (f"{cx:.1f},{cy - pr:.1f} {cx + pr:.1f},{cy:.1f} "
+                   f"{cx:.1f},{cy + pr:.1f} {cx - pr:.1f},{cy:.1f}")
+            glyph = (f'<polygon points="{pts}" fill="{color}" '
+                     f'fill-opacity="{opacity}" stroke="black" '
+                     f'stroke-width="{lw / 2:.2f}"{dash}/>')
+        else:
+            glyph = (f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{r:.1f}" '
+                     f'fill="{color}" fill-opacity="{opacity}" stroke="black" '
+                     f'stroke-width="{lw / 2:.2f}"{dash}/>')
         if label:
             glyph += (
                 f'<text x="{cx:.1f}" y="{cy - r - lw:.1f}" fill="white" '
                 f'font-size="{font:.1f}" text-anchor="middle" '
                 f'paint-order="stroke" stroke="black" '
-                f'stroke-width="{font / 8:.2f}">{label}</text>')
+                f'stroke-width="{font / 8:.2f}"'
+                f'{" fill-opacity=\"0.5\"" if dim else ""}>{label}</text>')
         return glyph
 
     def _fused_marker_svg(self, markers, labels: bool) -> str:
@@ -1402,11 +1432,14 @@ class Viewer:
         r = 4 * lw
         font = 7 * lw
         parts = []
+        meta = self._fusion_meta or {}
         for fid, (fx, fy) in markers.items():
             cx, cy = self.replay_point_to_canvas(fx, fy)
+            kind, category = meta.get(fid, ("single", None))
             parts.append(self._marker_glyph(
                 cx, cy, marker_color(fid % 10),
-                escape(short_id(fid)) if labels else "", lw, r, font))
+                escape(short_id(fid)) if labels else "", lw, r, font,
+                ped=category == "non_motor", dim=kind in ("stray", "ghost")))
         return "".join(parts)
 
     def ensure_fusion(self):
@@ -1415,18 +1448,37 @@ class Viewer:
         run once and reused across every frame/tick, and re-run only when the
         recording or its calibration changes. Returns the ``FusionResult`` (or
         None when no recording is loaded). ``calibrated`` follows whether the
-        recording's frames came through a calibrated overlay (Items 38–40): an
-        uncalibrated stream widens the cross-sensor gate and flags the result
-        (FUSION_PLAN §4b)."""
+        recording's frames came through a calibrated overlay (Items 38–40).
+
+        An *uncalibrated* recording self-calibrates first (2026-07-14 round,
+        ``model.replay.autocalibrate``): the relational solve runs over the
+        stream's own vehicle pairs, so when it trusts a sensor the engine
+        fuses agreeing sensors through the tight cross-sensor gate — no
+        manual Align › Auto-calibrate needed. When the solve refuses
+        (guardrails), fusion falls back to the widened gate and flags the
+        result low-confidence (FUSION_PLAN §4b), exactly as before. Only the
+        fused view consumes the self-calibrated copy; the raw overlay keeps
+        rendering the loaded recording untouched — authoring/committing a
+        calibration stays the Align workflow's explicit act."""
         rec = self.replay
         if rec is None or not rec.frames:
             return None
         calibrated = bool(rec.alignment is not None and rec.alignment.calib)
         key = (id(rec), calibrated)
         if self._fusion_key != key:
-            self._fusion = fuse(rec.frames, calibrated=calibrated)
+            fuse_rec = rec
+            if not calibrated:
+                fuse_rec = autocalibrate(self.project, rec)
+                calibrated = bool(fuse_rec.alignment is not None
+                                  and fuse_rec.alignment.calib)
+            self._fusion = fuse(fuse_rec.frames, calibrated=calibrated)
+            # render index from the seam-smoothed copy (2026-07-14 round):
+            # the on-screen handoff eases across sensor seams while the
+            # cached FusionResult itself stays the engine's exact geometry
             self._fusion_frames = fused_frame_markers(
-                self._fusion, frame_times_s(rec.frames))
+                smooth_seams(self._fusion), frame_times_s(fuse_rec.frames))
+            self._fusion_meta = {
+                t.fused_id: (t.kind, t.category) for t in self._fusion.tracks}
             self._fusion_key = key
         return self._fusion
 
@@ -1434,16 +1486,71 @@ class Viewer:
         """Markers for the current replay frame (ROADMAP Item 30). Returns ""
         when no recording is loaded, so the layer is empty off-Replay. With the
         fused toggle on (Item 43) the frame's fused markers (one per real
-        vehicle) render instead of the raw per-sensor points."""
+        vehicle) render instead of the raw per-sensor points — with the raw
+        points ghosted underneath at 20 % opacity (2026-07-14 round) so the
+        fused display still shows what the underlying objects were. Review
+        rings (selection cyan, already-labeled green) draw on top at full
+        opacity in either view."""
         rec = self.replay
         if rec is None or not rec.frames:
             return ""
         i = max(0, min(self.replay_frame, len(rec.frames) - 1))
+        points = rec.frames[i].points
         if self.fused_view:
             self.ensure_fusion()
             markers = self._fusion_frames[i] if i < len(self._fusion_frames) else {}
-            return self._fused_marker_svg(markers, self.replay_labels)
-        return self._marker_svg(rec.frames[i].points, self.replay_labels)
+            # raw ids on the underlay only while reviewing: that is when the
+            # raw oid (what the labels record) matters over the fused id
+            under = self._marker_svg(
+                points, self.replay_labels and self.review_active)
+            return (f'<g opacity="0.2">{under}</g>'
+                    + self._review_ring_svg(points)
+                    + self._fused_marker_svg(markers, self.replay_labels))
+        return (self._marker_svg(points, self.replay_labels)
+                + self._review_ring_svg(points))
+
+    def _review_ring_svg(self, points) -> str:
+        """Full-opacity halo rings over the current frame's raw markers while
+        the review switch is armed (2026-07-14 round): cyan = in the current
+        selection, dashed green = already committed to a labeled group."""
+        if not self.review_active:
+            return ""
+        labeled = self.review.labeled_members()
+        lw = self.overlay_px / max(self.viewport.scale, 0.05)
+        r = 4 * lw * 1.9
+        parts = []
+        for pt in points:
+            key = (pt.sensor, pt.oid)
+            sel = self.review.is_selected(key)
+            if not sel and key not in labeled:
+                continue
+            cx, cy = self.replay_point_to_canvas(pt.x_ft, pt.y_ft)
+            color = "#00e5ff" if sel else "#4caf50"
+            dash = "" if sel else f' stroke-dasharray="{2 * lw:.1f},{2 * lw:.1f}"'
+            parts.append(
+                f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{r:.1f}" fill="none" '
+                f'stroke="{color}" stroke-width="{lw:.1f}"{dash}/>')
+        return "".join(parts)
+
+    def review_hit(self, canvas_pt) -> tuple[int, int] | None:
+        """The raw track under a review click: nearest current-frame marker
+        within 1.5 marker radii of *canvas_pt*, as its (sensor, oid) key.
+        Hit-testing is against the raw points in both views — in the fused
+        view they are the 20 %-opacity underlay, which is exactly what the
+        labels record (raw oids, not fused ids)."""
+        rec = self.replay
+        if rec is None or not rec.frames:
+            return None
+        i = max(0, min(self.replay_frame, len(rec.frames) - 1))
+        lw = self.overlay_px / max(self.viewport.scale, 0.05)
+        r_hit = 4 * lw * 1.5
+        best: tuple[float, tuple[int, int]] | None = None
+        for pt in rec.frames[i].points:
+            cx, cy = self.replay_point_to_canvas(pt.x_ft, pt.y_ft)
+            d = math.hypot(cx - canvas_pt[0], cy - canvas_pt[1])
+            if d <= r_hit and (best is None or d < best[0]):
+                best = (d, (pt.sensor, pt.oid))
+        return best[1] if best else None
 
     def live_marker_svg(self) -> str:
         """Markers for the latest live frame in the drop-to-latest slot (ROADMAP
@@ -2805,10 +2912,14 @@ def build_ui(viewer: Viewer, state: dict) -> None:
                 else:
                     nt = len(f.points)
                     view = f"{nt} track{'s' if nt != 1 else ''}"
+                review = ""
+                if v.review_active:
+                    review = (f" | review: {len(v.review.selection)} selected"
+                              f" · {len(v.review.groups)} groups")
                 status_label.set_text(
                     f"mode: replay | frame {v.replay_frame + 1}/{n} | {f.t} | "
                     f"{view} | "
-                    f"{'playing' if v.replay_playing else 'paused'}")
+                    f"{'playing' if v.replay_playing else 'paused'}{review}")
         elif v.mode == "Live":
             s = v.live_session
             if s is None:
@@ -3092,6 +3203,16 @@ def build_ui(viewer: Viewer, state: dict) -> None:
                 v.align_drag = {"anchor": pw, "placement0": v.align_placement,
                                 "calib0": dict(v.align_calib),
                                 "slot": _active_slot(), "moved": False}
+        elif button == 0 and v.mode == "Replay" and v.review_active:
+            # Review labeling (2026-07-14 round): with the review switch armed
+            # the read-only Replay canvas accepts marker clicks — toggle the
+            # raw track under the cursor in/out of the label selection. The
+            # marker layer is pointer-events:none, so the click arrives here.
+            hit = v.review_hit(p)
+            if hit is not None:
+                v.review.toggle(hit)
+                refresh_marker_layer()
+                refresh_status()
         elif button == 0 and v.template_placement_active():
             # Item 27: a template picked in Draw › Event Zone turns the click
             # into a template drop (was the standalone Template tool). With a
@@ -3657,6 +3778,129 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         refresh_marker_layer()
         refresh_status()
 
+    # -- review labeling (2026-07-14 round) -----------------------------------
+    # The observation-fixture workflow (Item 44) moved into the GUI: arm the
+    # `review` switch in Replay, click markers to select the raw tracks of one
+    # real-world object, commit them as a labeled group, save the observations
+    # JSON beside the recording. scripts/fusion_eval.py --obs <file> scores it.
+
+    def _repo_rel(path: Path) -> str:
+        try:
+            return str(path.resolve().relative_to(REPO))
+        except ValueError:
+            return str(path)
+
+    def _seed_review(path: Path):
+        """Fresh review session for a newly loaded recording — resumed from
+        its observations sidecar when one exists, so labeling can continue
+        across app runs."""
+        side = observations_path(path)
+        if side.exists():
+            try:
+                v.review = ReviewSession.load(side)
+                if v.review.groups:
+                    ui.notify(f"resumed {len(v.review.groups)} labeled "
+                              f"group{'s' if len(v.review.groups) != 1 else ''} "
+                              f"from {side.name}")
+                _refresh_review_groups_label()
+                return
+            except (OSError, ValueError, KeyError):
+                ui.notify(f"could not read {side.name} — starting fresh "
+                          "labels", type="warning")
+        name = path.name
+        for sfx in (".txt.gz", ".txt"):
+            if name.endswith(sfx):
+                name = name[: -len(sfx)]
+                break
+        cands = list(v.pair) if v.pair else ([v.source] if v.source else [])
+        v.review = ReviewSession(
+            capture=name,
+            recording=_repo_rel(path),
+            iprj_candidates=[_repo_rel(c) for c in cands])
+        _refresh_review_groups_label()
+
+    def toggle_review(e):
+        v.review_active = bool(e.value)
+        update_context_bar()
+        refresh_marker_layer()
+        refresh_status()
+
+    def _refresh_review_groups_label():
+        review_groups_btn.set_text(f"groups ({len(v.review.groups)})")
+
+    def add_review_group():
+        try:
+            g = v.review.commit(
+                review_kind_sel.value or "handoff",
+                ped=bool(review_ped_switch.value),
+                unsure=bool(review_unsure_switch.value),
+                note=review_note_in.value or "")
+        except ValueError as err:
+            ui.notify(str(err), type="warning")
+            return
+        review_note_in.value = ""
+        _refresh_review_groups_label()
+        mem = " ".join(f"{s}/{o}" for s, o in g.members)
+        ui.notify(f"labeled {g.kind}: [{mem}]")
+        refresh_marker_layer()
+        refresh_status()
+
+    def clear_review_selection():
+        v.review.clear_selection()
+        refresh_marker_layer()
+        refresh_status()
+
+    def save_review():
+        if v.replay_path is None:
+            ui.notify("load a recording first", type="warning")
+            return
+        if not v.review.groups:
+            ui.notify("no labeled groups to save", type="warning")
+            return
+        side = observations_path(v.replay_path)
+        try:
+            v.review.save(side)
+        except OSError as err:
+            ui.notify(f"could not save: {err}", type="negative")
+            return
+        ui.notify(f"saved {len(v.review.groups)} "
+                  f"group{'s' if len(v.review.groups) != 1 else ''} → {side.name}")
+
+    def open_review_groups():
+        """List the committed groups with per-group delete — the review
+        counterpart of the zone table, small enough to be a dialog."""
+        with ui.dialog() as dlg, ui.card().classes("min-w-[28rem]"):
+            ui.label(f"labeled groups — {v.review.capture or 'no recording'}") \
+                .classes("text-lg")
+            if not v.review.groups:
+                ui.label("none yet — arm review, click markers, add group") \
+                    .classes("text-sm text-gray-500")
+            for i, g in enumerate(v.review.groups):
+                with ui.row().classes("items-center gap-2 no-wrap"):
+                    mem = " ".join(f"{s}/{o}" for s, o in g.members)
+                    flags = "".join(
+                        f" · {name}" for name, on in
+                        (("same-sensor", g.same_sensor), ("ped", g.ped),
+                         ("unsure", g.unsure)) if on)
+                    ui.label(f"{g.kind} [{mem}]{flags}"
+                             + (f" — {g.note}" if g.note else "")) \
+                        .classes("font-mono text-sm")
+                    ui.button(icon="delete",
+                              on_click=lambda _=None, idx=i, d=dlg:
+                              _delete_review_group(idx, d)).props("flat dense")
+            with ui.row():
+                ui.button("save", on_click=save_review).props("flat dense")
+                ui.button("close", on_click=dlg.close).props("flat dense")
+        dlg.open()
+
+    def _delete_review_group(idx: int, dlg):
+        v.review.remove(idx)
+        _refresh_review_groups_label()
+        dlg.close()
+        open_review_groups()  # rebuild the list without the removed row
+        refresh_marker_layer()
+        refresh_status()
+
     def recording_files() -> dict:
         """EVO recordings discoverable near the loaded project — the site
         folder and its `recordings/` subfolder (Item 28's file convention).
@@ -3702,6 +3946,9 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         v.align_calibration = None
         v.align_commit_snapshot = None
         v.align_base = None
+        # ...and the review labels follow the recording (2026-07-14 round):
+        # resume from its observations sidecar or start a fresh session.
+        _seed_review(path)
         # ...and any cached fused view (Item 43): recomputed for this recording
         # on the next fused-view render (id() can be reused after GC, so don't
         # lean on the key alone).
@@ -4417,6 +4664,9 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         # Replay transport (Item 30): the whole cluster shows only in Replay.
         for _rw in replay_widgets:
             _rw.set_visibility(v.mode == "Replay")
+        # Review labeling controls (2026-07-14): only while the switch is armed.
+        for _vw in review_widgets:
+            _vw.set_visibility(v.mode == "Replay" and v.review_active)
         # Live overlay controls (Item 35): shown only in Live.
         for _lw in live_widgets:
             _lw.set_visibility(v.mode == "Live")
@@ -4744,9 +4994,57 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             ui.tooltip("fuse the tracks: show one marker/id per real vehicle "
                        "(cross-sensor + stop/drop/resume stitched) instead of "
                        "raw per-sensor points")
+        # Review labeling cluster (2026-07-14 round): the switch arms marker
+        # clicking; the rest shows only while armed (update_context_bar).
+        review_switch = ui.switch(
+            "review", value=False, on_change=toggle_review).props("dense")
+        with review_switch:
+            ui.tooltip("label ground truth: click markers to select the raw "
+                       "tracks of one real object, pick a kind, add the group; "
+                       "save writes an observations JSON beside the recording "
+                       "(scored by scripts/fusion_eval.py --obs)")
+        review_kind_sel = ui.select(
+            {k: k for k in REVIEW_KINDS}, value="handoff", label="kind") \
+            .classes("w-32").props("dense")
+        with review_kind_sel:
+            ui.tooltip("handoff: cross-sensor views of one object · "
+                       "persistence: dropped + re-acquired by one sensor · "
+                       "anchor: correctly persisted through a stop (must not "
+                       "absorb neighbours) · stray: not a real object")
+        review_ped_switch = ui.switch("ped").props("dense")
+        with review_ped_switch:
+            ui.tooltip("the object is a pedestrian")
+        review_unsure_switch = ui.switch("unsure").props("dense")
+        with review_unsure_switch:
+            ui.tooltip("could not confirm by eye — scored separately, "
+                       "engine's verdict reported back instead of gated")
+        review_note_in = ui.input("note").classes("w-40").props("dense clearable")
+        with review_note_in:
+            ui.tooltip("optional free-text note saved with the group")
+        review_add_btn = ui.button(
+            icon="playlist_add", on_click=add_review_group).props("flat dense")
+        with review_add_btn:
+            ui.tooltip("commit the selected markers as one labeled group")
+        review_clear_btn = ui.button(
+            icon="deselect", on_click=clear_review_selection).props("flat dense")
+        with review_clear_btn:
+            ui.tooltip("clear the current selection")
+        review_groups_btn = ui.button(
+            "groups (0)", on_click=open_review_groups).props("flat dense")
+        with review_groups_btn:
+            ui.tooltip("list / delete the labeled groups")
+        review_save_btn = ui.button(
+            icon="save_alt", on_click=save_review).props("flat dense")
+        with review_save_btn:
+            ui.tooltip("save the labeled groups as an observations JSON "
+                       "beside the recording")
+        review_widgets = [review_kind_sel, review_ped_switch,
+                          review_unsure_switch, review_note_in, review_add_btn,
+                          review_clear_btn, review_groups_btn, review_save_btn]
         replay_widgets = [replay_load_btn, replay_step_back_btn,
                           replay_play_btn, replay_step_fwd_btn, replay_speed_sel,
-                          replay_slider, replay_labels_switch, fused_switch]
+                          replay_slider, replay_labels_switch, fused_switch,
+                          review_switch]
 
         # Live overlay controls (ROADMAP Item 35): connect (built from the
         # same _host_auth_form as the Record panel) / stop, plus the id-label
