@@ -160,3 +160,57 @@ def test_review_hit_and_selection_rings(viewer):
     assert 'stroke="#4caf50"' in v.replay_marker_svg()
     v.review_active = False
     assert 'stroke="#4caf50"' not in v.replay_marker_svg()
+
+
+# --- Item 47: traceable labels, bad_pair fused-marker click, gap-fill layer ------
+
+
+@needs_us95
+def test_fused_marker_labels_are_traceable_codes(viewer):
+    """The fused label is the members' traceable code (fused_label), not the
+    raw integer fused_id — a multi-member track shows a hyphenated 2-digit
+    label, and it is what renders on the marker."""
+    v = viewer
+    v.fused_view = True
+    v.replay_labels = True
+    v.ensure_fusion()
+    multi = next(t for t in v._fusion.tracks if len(t.members) >= 2)
+    label = v._fusion_labels[multi.fused_id]
+    assert "-" in label  # >= 2 members joined
+    v.replay_frame = next(i for i, m in enumerate(v._fusion_frames)
+                          if multi.fused_id in m)
+    assert f">{label}<" in v.replay_marker_svg()
+
+
+@needs_us95
+def test_fused_hit_returns_the_marker_member_set(viewer):
+    """A click on a fused marker resolves to that FusedTrack's members (the
+    bad_pair authoring seam); a click far from any marker resolves to None."""
+    v = viewer
+    v.fused_view = True
+    v.ensure_fusion()
+    markers = v._fusion_frames[v.replay_frame]
+    fid, (fx, fy) = next(iter(markers.items()))
+    cx, cy = v.replay_point_to_canvas(fx, fy)
+    expected = next(t.members for t in v._fusion.tracks if t.fused_id == fid)
+    assert v.fused_hit((cx + 1, cy + 1)) == expected
+    assert v.fused_hit((cx + 10_000, cy)) is None
+
+
+@needs_us95
+def test_synthetic_gap_fill_layer_is_populated_and_styled(viewer):
+    """ensure_fusion builds a per-frame synthetic layer aligned to the frames;
+    a synthetic marker renders as a hollow dashed ring with no label so it
+    reads as interpolated, not observed."""
+    v = viewer
+    v.fused_view = True
+    v.ensure_fusion()
+    assert len(v._fusion_synth_frames) == len(v.replay.frames)
+    svg = v._synth_marker_svg({7: (0.0, 0.0)})
+    assert 'fill="none"' in svg and "stroke-dasharray" in svg
+    assert "<text" not in svg  # interpolated points carry no id label
+    # if the fixture has a real drop gap, its fill renders in the fused view
+    gap_frames = [i for i, m in enumerate(v._fusion_synth_frames) if m]
+    if gap_frames:
+        v.replay_frame = gap_frames[0]
+        assert 'fill="none"' in v.replay_marker_svg()

@@ -17,11 +17,18 @@ Kinds mirror the fixture's semantics (owner's words, quoted there):
                     must not absorb any same-sensor neighbour.
 * ``stray``       — not a genuine object (interference / shadow); must not
                     merge into any genuine group.
+* ``bad_pair``    — the inverse of handoff/persistence (Item 47): these members
+                    are *distinct* objects the engine over-merged, so they must
+                    **not** all land in one fused id. Authored by clicking an
+                    over-merged fused marker in the fused overlay (its
+                    ``FusedTrack.members`` become the selection); scored pass
+                    when they end up in ≥2 distinct fused ids.
 
 ``ped`` and ``unsure`` are per-group flags, ``note`` free text, and
-``same_sensor`` is derived from the members rather than asked for. Pair
-kinds (handoff/persistence) need at least two members; anchor/stray label a
-single track (more are allowed — the fixture has multi-member strays).
+``same_sensor`` is derived from the members rather than asked for. Multi-track
+kinds (handoff/persistence, and bad_pair) need at least two members; anchor and
+stray label a single track (more are allowed — the fixture has multi-member
+strays).
 
 Pure Python, no GUI imports, pytest-testable headless like the rest of
 ``model/``. The GUI owns click hit-testing (it lives in canvas space); this
@@ -36,8 +43,10 @@ from pathlib import Path
 
 Member = tuple[int, int]  # (sensor, oid) — a raw track key, as in fusion
 
-KINDS = ("handoff", "persistence", "anchor", "stray")
-_PAIR_KINDS = ("handoff", "persistence")
+KINDS = ("handoff", "persistence", "anchor", "stray", "bad_pair")
+# kinds that describe two-or-more tracks and so need at least two members —
+# handoff/persistence (must fuse) and bad_pair (must NOT all fuse), Item 47.
+_MULTI_KINDS = ("handoff", "persistence", "bad_pair")
 
 
 @dataclass(frozen=True)
@@ -117,13 +126,14 @@ class ReviewSession:
     def commit(self, kind: str, *, ped: bool = False, unsure: bool = False,
                note: str = "") -> ReviewGroup:
         """Turn the current selection into a labeled group (and clear it).
-        Raises ValueError on an unknown kind, an empty selection, or a pair
-        kind with a single member — refuse, don't guess, as everywhere."""
+        Raises ValueError on an unknown kind, an empty selection, or a
+        multi-track kind with a single member — refuse, don't guess, as
+        everywhere."""
         if kind not in KINDS:
             raise ValueError(f"unknown kind {kind!r} (one of {KINDS})")
         if not self.selection:
             raise ValueError("nothing selected — click markers first")
-        if kind in _PAIR_KINDS and len(self.selection) < 2:
+        if kind in _MULTI_KINDS and len(self.selection) < 2:
             raise ValueError(
                 f"a {kind} group needs at least two tracks "
                 f"({len(self.selection)} selected)")

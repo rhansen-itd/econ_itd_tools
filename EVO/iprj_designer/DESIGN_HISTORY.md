@@ -3290,3 +3290,50 @@ the decisions log for the Item 15/17/18 revision.
   recover/refuse + real-site, flicker veto, queue-resume fixpoint;
   test_fusion_gui updated: the fused view of the us95 fixture is now
   `calibrated`, not low-confidence).
+
+- 2026-07-14 — **Fused-overlay & review refinements (Item 47, Opus): bad_pair
+  kind, traceable labels, gap interpolation.** Three changes to the Item 43/45
+  fused-display + review-labeling surface, one session. (Item routed to Fable,
+  but Fable is the debugging-escalation reserve under CLAUDE.md's standing rule
+  — this was feature work, so Opus ran it end-to-end.)
+  1. **`bad_pair` review kind** — the inverse of handoff/persistence: members
+     the engine *over-merged* that must **not** all share one fused id. Added to
+     `review.py`'s `KINDS` (and the ≥2-member rule, now `_MULTI_KINDS`) and to
+     `fusion_eval.py` scoring — **pass = the flagged members land in ≥2 distinct
+     fused ids**, fail if still one (`STILL MERGED`); its own totals line, all
+     other buckets untouched. Authored only in the fused view: a click on a
+     fused marker (`Viewer.fused_hit` → the marker's `FusedTrack.members`)
+     replaces the selection with those members and arms `bad_pair`; the kind is
+     added to / removed from the kind dropdown as the fused toggle flips
+     (`sync_review_kinds`), so it is offered only where a fused marker exists.
+  2. **Traceable fused labels** — the fused marker now shows a code built from
+     its members instead of the plain integer `fused_id`. **Open ID-format
+     decision resolved with the owner:** the site's oids encode the sensor as
+     the *trailing* digit (`oid % 10`, the Item 44 slot convention, confirmed
+     against the observation fixtures — the item's leading-digit example did not
+     match the data). Owner's call: take each member's **last three oid digits
+     and drop that trailing sensor digit → two digits** (`881520` → `520` → `52`),
+     join all members in join order (`52-77-54` for a 3-member track; duplicates
+     kept so the label maps 1:1 to `members`). New pure helpers `member_label` /
+     `fused_label` in `fusion.py`; `FusedTrack.fused_id` stays the integer
+     identity (`id_of`, eval, `fused_frame_markers` keys unchanged) — nothing
+     downstream reads the label text.
+  3. **Persistence-gap interpolation** — a drop/re-acquire track is drawn
+     continuous across its gap. `interpolate_gaps(result, frame_times)` is a
+     render-side copy (exactly like `smooth_seams`): for each observed point
+     pair it inserts a linearly-interpolated `FusedPoint` at every frame stamp
+     strictly between them, tagged `synthetic=True` with empty `src` — normal
+     spacing has no interior stamp so only real gaps fill, and strays/ghosts are
+     skipped. The engine geometry, `id_of`, eval, and bridging/occupancy logic
+     never see these points. `synthetic_frame_markers` indexes only the fills
+     into their own overlay layer (`fused_frame_markers` now excludes synthetic
+     points via a shared `_frame_markers` predicate), rendered as hollow dashed
+     reduced-opacity rings, no label — clearly interpolated, not observed. On
+     the us95 fixture the fill fires on 3176 frames.
+  pytest: `bad_pair` commit + round-trip (`test_review`), `member_label` /
+  `fused_label` formatting incl. the >2-member and collision cases, the
+  interpolation helper's point count / linear positions / synthetic flag /
+  disjoint layers, and `bad_pair` eval scoring against the engine's own `id_of`
+  on the us95 fixture; GUI seams (fused-marker → member set, traceable label
+  renders, synthetic layer populated + styled) headless in `test_fusion_gui`.
+  Suite 682 → **696 pass**; eval buckets unchanged (new `bad_pair` line only).

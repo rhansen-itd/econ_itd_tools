@@ -10,6 +10,9 @@ verdicts:
   handoff/persistence  all members must share ONE fused id (recall), and that
                        fused track must not contain members of a *different*
                        labeled group (contamination = precision failure).
+  bad_pair             the inverse (Item 47): these members are distinct objects
+                       the engine over-merged, so they must land in >= 2 fused
+                       ids; pass = split apart, fail = still one fused id.
   unsure               not gated; the engine's verdict is printed so the owner
                        can confirm or reject it.
   anchor               a track that correctly persisted through a stop; it
@@ -157,6 +160,12 @@ def evaluate(params=DEFAULT_PARAMS, verbose: bool = True,
                 if not unsure:
                     totals[f"{bucket}_total"] += 1
                     totals[f"{bucket}_ok"] += ok
+            elif kind == "bad_pair":
+                # Item 47 inverse of handoff/persistence: the over-merged
+                # members must split into >= 2 distinct fused ids.
+                ok = len(fids) >= 2
+                totals["bad_pair_total"] += 1
+                totals["bad_pair_ok"] += ok
             elif kind == "anchor":
                 same_sensor_extras = [
                     m for m in extras if m[0] == members[0][0]]
@@ -187,7 +196,10 @@ def evaluate(params=DEFAULT_PARAMS, verbose: bool = True,
                 line = f"  {status} {kind:<11} [{mem}] -> fused {fids}"
                 if missing:
                     line += f"  MISSING {missing}"
-                if len(fids) > 1:
+                if kind == "bad_pair":
+                    if len(fids) < 2:
+                        line += "  STILL MERGED"
+                elif len(fids) > 1:
                     line += "  SPLIT"
                 if contamination:
                     line += f"  CONTAMINATED by {contamination}"
@@ -213,7 +225,7 @@ def evaluate(params=DEFAULT_PARAMS, verbose: bool = True,
         results[name] = cap_results
     if verbose:
         print("\n== totals")
-        for bucket in ("handoff", "persistence", "anchor", "stray"):
+        for bucket in ("handoff", "persistence", "bad_pair", "anchor", "stray"):
             t = totals[f"{bucket}_total"]
             if t:
                 print(f"  {bucket:<11} {totals[f'{bucket}_ok']}/{t}")

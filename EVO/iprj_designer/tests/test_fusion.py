@@ -17,13 +17,20 @@ import pytest
 from model.calibration import build_alignment, calibrate
 from model.fusion import (
     DEFAULT_PARAMS,
+    FusedPoint,
+    FusedTrack,
     FusionParams,
+    FusionResult,
     _Track,
     fold_tracks,
     frame_times_s,
     fuse,
     fused_frame_markers,
+    fused_label,
+    interpolate_gaps,
+    member_label,
     parse_time_s,
+    synthetic_frame_markers,
 )
 from model.iprj_io import load_iprj
 from model.replay import Frame, TrackPoint, load_recording, realign
@@ -912,3 +919,152 @@ def test_queue_resume_bridges_after_cross_sensor_association():
     assert len(fids) == 1, f"queue resume split across fused ids {fids}"
     track = next(t for t in res.tracks if t.fused_id == fids.pop())
     assert track.kind == "fused"
+
+
+# --- Item 47: traceable fused labels -----------------------------------------
+
+
+def test_member_label_drops_the_sensor_digit():
+    """The 2-digit code is the last three oid digits with the trailing sensor
+    digit (oid % 10) removed: 881520 -> last-three 520 -> drop the 0 -> 52."""
+    assert member_label(881520) == "52"
+    assert member_label(979772) == "77"
+    assert member_label(415541) == "54"
+    assert member_label(9101) == "10"  # short id degrades gracefully
+
+
+def test_fused_label_joins_all_members_in_join_order():
+    """A traceable label from every member's code, join order preserved so the
+    label maps 1:1 to `members` (the >2-member case)."""
+    t = FusedTrack(3, ((0, 881520), (2, 979772), (1, 415541)), (), "fused")
+    assert fused_label(t) == "52-77-54"
+    # a single-member track is just its own code (no separator)
+    assert fused_label(FusedTrack(1, ((5, 9225),), (), "single")) == "22"
+
+
+def test_fused_label_keeps_duplicate_codes_on_collision():
+    """Two different oids can share a 2-digit code; the label keeps both (no
+    dedup) so it still enumerates the members one-for-one."""
+    t = FusedTrack(9, ((0, 881520), (1, 773521)), (), "fused")
+    assert member_label(773521) == "52" == member_label(881520)
+    assert fused_label(t) == "52-52"
+
+
+def test_fused_id_stays_the_integer_identity():
+    """The label is display-only: fused_id and the id_of / marker keys stay
+    integer-keyed (nothing downstream depends on the label text)."""
+    frames = _handoff_frames()
+    res = fuse(frames, calibrated=True)
+    (tr,) = res.tracks
+    assert isinstance(tr.fused_id, int)
+    per_frame = fused_frame_markers(res, frame_times_s(frames))
+    for m in per_frame:
+        for fid in m:
+            assert isinstance(fid, int)
+
+
+# --- Item 47: persistence-gap interpolation ----------------------------------
+
+
+def _gapped_result(pts, kind="stitched", members=((0, 10), (0, 20))):
+    tr = FusedTrack(fused_id=7, members=members, points=tuple(pts), kind=kind)
+    return FusionResult((tr,), {members[0]: 7, members[-1]: 7}, True, False)
+
+
+def test_interpolate_gaps_fills_a_drop_with_synthetic_points():
+    frame_times = [i * 0.1 for i in range(11)]  # 0.0 .. 1.0, dt 0.1
+    pts = (FusedPoint(0.0, 0.0, 0.0, ((0, 10),)),
+           FusedPoint(1.0, 10.0, 20.0, ((0, 20),)))
+    interp = interpolate_gaps(_gapped_result(pts), frame_times)
+    (tr,) = interp.tracks
+    synth = [p for p in tr.points if p.synthetic]
+    # interior frame stamps strictly between 0.0 and 1.0: 0.1 .. 0.9 -> 9
+    assert len(synth) == 9
+    assert all(p.src == () for p in synth)
+    # observed endpoints preserved untouched, points stay time-ordered
+    assert tr.points[0] == pts[0] and tr.points[-1] == pts[1]
+    assert list(tr.points) == sorted(tr.points, key=lambda p: p.t_s)
+    # linear: nearest-to-midpoint synthetic point sits at (5.0, 10.0)
+    mid = min(synth, key=lambda p: abs(p.t_s - 0.5))
+    assert mid.t_s == pytest.approx(0.5)
+    assert (mid.x_ft, mid.y_ft) == pytest.approx((5.0, 10.0))
+
+
+def test_interpolate_gaps_leaves_ungapped_tracks_untouched():
+    frame_times = [i * 0.1 for i in range(11)]
+    pts = tuple(FusedPoint(i * 0.1, i * 1.0, 0.0, ((0, 10),)) for i in range(11))
+    interp = interpolate_gaps(_gapped_result(pts), frame_times)
+    (tr,) = interp.tracks
+    assert tr.points == pts  # no interior stamp anywhere -> nothing added
+    assert all(not p.synthetic for p in tr.points)
+
+
+def test_interpolate_gaps_skips_strays_and_ghosts():
+    frame_times = [i * 0.1 for i in range(11)]
+    pts = (FusedPoint(0.0, 0.0, 0.0, ((0, 11),)),
+           FusedPoint(1.0, 10.0, 0.0, ((0, 11),)))
+    for kind in ("stray", "ghost"):
+        interp = interpolate_gaps(
+            _gapped_result(pts, kind=kind, members=((0, 11),)), frame_times)
+        (tr,) = interp.tracks
+        assert tr.points == pts
+        assert all(not p.synthetic for p in tr.points)
+
+
+def test_synthetic_and_real_marker_layers_are_disjoint():
+    """fused_frame_markers is the real detections (synthetic excluded);
+    synthetic_frame_markers is only the fills — the two never overlap."""
+    frame_times = [i * 0.1 for i in range(11)]
+    pts = (FusedPoint(0.0, 0.0, 0.0, ((0, 10),)),
+           FusedPoint(1.0, 10.0, 0.0, ((0, 20),)))
+    interp = interpolate_gaps(_gapped_result(pts), frame_times)
+    real = fused_frame_markers(interp, frame_times)
+    synth = synthetic_frame_markers(interp, frame_times)
+    assert [i for i, m in enumerate(real) if m] == [0, 10]
+    assert [i for i, m in enumerate(synth) if m] == list(range(1, 10))
+    for r, s in zip(real, synth):
+        assert not (set(r) & set(s))
+
+
+# --- Item 47: bad_pair eval scoring ------------------------------------------
+
+
+@needs_us95
+def test_bad_pair_scoring_splits_pass_merges_fail(tmp_path):
+    """bad_pair passes when its members land in >= 2 fused ids and fails when
+    they stay in one — verified against the engine's own id_of on the US95
+    fixture so the assertion is independent of engine tuning."""
+    import sys as _sys
+    from collections import defaultdict
+    _sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    import fusion_eval
+
+    from model.replay import autocalibrate
+
+    entry = {
+        "recording":
+            "EVO/iprj_designer/tests/fixtures/10_37_2_86_EVO_1770311735.txt",
+        "iprj_candidates":
+            ["EVO/iprj_designer/tests/fixtures/us95&sh8.iprj"],
+    }
+    _iprj, project, rec = fusion_eval.load_capture(entry)
+    rec = autocalibrate(project, rec)
+    calibrated = bool(rec.alignment is not None and rec.alignment.calib)
+    res = fuse(rec.frames, calibrated=calibrated)
+    by_fid: dict[int, list] = defaultdict(list)
+    for key, fid in res.id_of.items():
+        by_fid[fid].append(key)
+    merged = next((ms for ms in by_fid.values() if len(ms) >= 2), None)
+    fids = [f for f, ms in by_fid.items()]
+    assert merged is not None and len(fids) >= 2  # fixture sanity
+
+    split = [by_fid[fids[0]][0], by_fid[fids[1]][0]]
+    obs = {"captures": {"cap": dict(entry, groups=[
+        {"kind": "bad_pair", "members": [list(m) for m in merged[:2]]},  # fail
+        {"kind": "bad_pair", "members": [list(m) for m in split]},       # pass
+    ])}}
+    path = tmp_path / "obs.json"
+    path.write_text(json.dumps(obs))
+    out = fusion_eval.evaluate(obs_path=path, verbose=False)
+    assert out["totals"]["bad_pair_total"] == 2
+    assert out["totals"]["bad_pair_ok"] == 1

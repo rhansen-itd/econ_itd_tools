@@ -355,6 +355,11 @@ class FusedPoint:
     x_ft: float
     y_ft: float
     src: tuple[tuple[int, int], ...]  # contributing (sensor, oid) keys
+    # A synthetic gap-fill point (Item 47): linearly interpolated across a
+    # drop/re-acquire gap by the render-side ``interpolate_gaps`` helper, never
+    # observed and never in the engine's own output. ``src`` is empty for these
+    # — the render layer styles them as filled-in rather than real detections.
+    synthetic: bool = False
 
 
 @dataclass(frozen=True)
@@ -368,6 +373,29 @@ class FusedTrack:
     # majority-class + behavioral category ("motor" | "non_motor" | None):
     # the render layer symbolizes non-motorized tracks differently
     category: str | None = None
+
+
+def member_label(oid: int) -> str:
+    """The 2-digit display code for one raw ``oid`` in a fused label (Item 47):
+    the last three digits of the id with its trailing **sensor** digit dropped
+    (the vendor's ``oid % 10`` slot convention, Item 44) — e.g. ``881520`` →
+    last-three ``520`` → drop the sensor ``0`` → ``52``. The sensor is what the
+    raw view already color-codes, so omitting it leaves the two digits that
+    distinguish this track. Degrades gracefully for ids shorter than three
+    digits (fewer characters, never an error)."""
+    return str(oid)[-3:-1]
+
+
+def fused_label(track: "FusedTrack") -> str:
+    """A traceable display label for a fused marker (Item 47): the constituent
+    members' :func:`member_label` codes joined by ``-`` in join order (the
+    order the object moved through the sensors), e.g. members …520/…772/…541 →
+    ``52-77-54``. Purely for the on-screen label — ``FusedTrack.fused_id`` stays
+    the integer identity everything downstream (eval, ``id_of``,
+    ``fused_frame_markers`` keys) is keyed on, so nothing depends on this text.
+    Duplicate codes are kept (join order over dedup) so the label still maps
+    1:1 to ``members``."""
+    return "-".join(member_label(oid) for _s, oid in track.members)
 
 
 @dataclass(frozen=True)
@@ -1212,6 +1240,40 @@ def smooth_seams(
 # --- render-side per-frame index (Item 43) ------------------------------------
 
 
+def _frame_markers(
+    result: FusionResult,
+    frame_times: Sequence[float],
+    keep,
+) -> tuple[dict[int, tuple[float, float]], ...]:
+    """Shared core of the per-frame ``{fused_id: (x_ft, y_ft)}`` index — assign
+    every fused point matching *keep* to the frame whose time is nearest, one
+    marker per fused id per frame (time-nearest wins a tie)."""
+    n = len(frame_times)
+    valid_t: list[float] = []
+    valid_i: list[int] = []
+    for i, t in enumerate(frame_times):
+        if not math.isnan(t):
+            valid_t.append(t)
+            valid_i.append(i)
+    out: tuple[dict[int, tuple[float, float]], ...] = tuple({} for _ in range(n))
+    best: list[dict[int, float]] = [{} for _ in range(n)]
+    for tr in result.tracks:
+        for pt in tr.points:
+            if not keep(pt):
+                continue
+            j = bisect_left(valid_t, pt.t_s)
+            cand = [k for k in (j - 1, j) if 0 <= k < len(valid_t)]
+            if not cand:
+                continue
+            k = min(cand, key=lambda c: abs(valid_t[c] - pt.t_s))
+            fi = valid_i[k]
+            d = abs(valid_t[k] - pt.t_s)
+            if tr.fused_id not in best[fi] or d < best[fi][tr.fused_id]:
+                best[fi][tr.fused_id] = d
+                out[fi][tr.fused_id] = (pt.x_ft, pt.y_ft)
+    return out
+
+
 def fused_frame_markers(
     result: FusionResult,
     frame_times: Sequence[float],
@@ -1227,26 +1289,72 @@ def fused_frame_markers(
     the overlap window is preserved on screen rather than re-splitting into two
     markers. The result is a tuple aligned 1:1 with *frame_times* (an empty dict
     for a frame with no stamp or no active fused track). Pure and deterministic,
-    like the rest of the engine — the render layer reads it without re-fusing."""
-    n = len(frame_times)
-    valid_t: list[float] = []
-    valid_i: list[int] = []
-    for i, t in enumerate(frame_times):
-        if not math.isnan(t):
-            valid_t.append(t)
-            valid_i.append(i)
-    out: tuple[dict[int, tuple[float, float]], ...] = tuple({} for _ in range(n))
-    best: list[dict[int, float]] = [{} for _ in range(n)]
+    like the rest of the engine — the render layer reads it without re-fusing.
+
+    Synthetic gap-fill points (Item 47) are *excluded* — this is the real
+    detection layer; ``synthetic_frame_markers`` owns the interpolated fills so
+    the two render as distinct layers."""
+    return _frame_markers(result, frame_times, lambda pt: not pt.synthetic)
+
+
+# --- render-side persistence-gap interpolation (Item 47) ----------------------
+
+
+def interpolate_gaps(
+    result: FusionResult,
+    frame_times: Sequence[float],
+) -> FusionResult:
+    """A render-side copy of *result* with **synthetic** points filled into each
+    track's drop/re-acquire gaps (Item 47) — a persistence/anchor track that
+    dropped and came back is drawn continuous instead of blinking out.
+
+    For every consecutive point pair in a fused track, any *frame_times* stamp
+    lying strictly between the two is a frame the track was absent for; a
+    :class:`FusedPoint` is inserted there, linearly interpolated between the
+    bracketing observed points and tagged ``synthetic=True`` (empty ``src``).
+    Normal frame-to-frame spacing has no interior stamp, so only real gaps fill.
+    Strays and ghosts are skipped — they are not objects to bridge across.
+
+    Display-only, exactly like :func:`smooth_seams`: the engine's stored
+    geometry, ``id_of``, eval, and bridging/occupancy logic never see these
+    points. Times, sources, ids, kinds, and membership of the observed points
+    are preserved; pure and deterministic."""
+    stamps = sorted(t for t in frame_times if not math.isnan(t))
+    if not stamps:
+        return result
+    out: list[FusedTrack] = []
     for tr in result.tracks:
-        for pt in tr.points:
-            j = bisect_left(valid_t, pt.t_s)
-            cand = [k for k in (j - 1, j) if 0 <= k < len(valid_t)]
-            if not cand:
+        if tr.kind in ("stray", "ghost") or len(tr.points) < 2:
+            out.append(tr)
+            continue
+        filled: list[FusedPoint] = []
+        added = False
+        for a, b in zip(tr.points, tr.points[1:]):
+            filled.append(a)
+            if b.t_s <= a.t_s:
                 continue
-            k = min(cand, key=lambda c: abs(valid_t[c] - pt.t_s))
-            fi = valid_i[k]
-            d = abs(valid_t[k] - pt.t_s)
-            if tr.fused_id not in best[fi] or d < best[fi][tr.fused_id]:
-                best[fi][tr.fused_id] = d
-                out[fi][tr.fused_id] = (pt.x_ft, pt.y_ft)
-    return out
+            lo = bisect_right(stamps, a.t_s)
+            hi = bisect_left(stamps, b.t_s)
+            span = b.t_s - a.t_s
+            for t in stamps[lo:hi]:
+                f = (t - a.t_s) / span
+                filled.append(FusedPoint(
+                    t, a.x_ft + (b.x_ft - a.x_ft) * f,
+                    a.y_ft + (b.y_ft - a.y_ft) * f, (), synthetic=True))
+                added = True
+        filled.append(tr.points[-1])
+        out.append(tr if not added else FusedTrack(
+            tr.fused_id, tr.members, tuple(filled), tr.kind, tr.category))
+    return FusionResult(tuple(out), result.id_of, result.calibrated,
+                        result.low_confidence)
+
+
+def synthetic_frame_markers(
+    result: FusionResult,
+    frame_times: Sequence[float],
+) -> tuple[dict[int, tuple[float, float]], ...]:
+    """Per-frame ``{fused_id: (x_ft, y_ft)}`` of only the **synthetic** gap-fill
+    points (Item 47) in *result* — feed it an :func:`interpolate_gaps` output to
+    get the "filled-in" marker layer the overlay draws distinct from the real
+    fused markers (:func:`fused_frame_markers`)."""
+    return _frame_markers(result, frame_times, lambda pt: pt.synthetic)

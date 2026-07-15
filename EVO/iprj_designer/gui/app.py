@@ -208,7 +208,9 @@ from model.calibration import (IDENTITY, AlignmentTransform, Placement,
                                translated, world_delta)
 from model.replay import (Frame, LiveAligner, Recording, autocalibrate,
                           load_recording, marker_color, realign, short_id)
-from model.fusion import fuse, fused_frame_markers, frame_times_s, smooth_seams
+from model.fusion import (fuse, fused_frame_markers, fused_label,
+                          frame_times_s, interpolate_gaps, smooth_seams,
+                          synthetic_frame_markers)
 from model.review import KINDS as REVIEW_KINDS
 from model.review import ReviewSession, observations_path
 from model.zonefit import ZoneFit
@@ -565,7 +567,11 @@ class Viewer:
         self.fused_view = False
         self._fusion = None            # cached FusionResult
         self._fusion_frames: tuple = ()  # per-frame {fused_id: (x_ft, y_ft)}
+        # per-frame {fused_id: (x_ft, y_ft)} of synthetic gap-fill points
+        # (Item 47) — the "filled-in" layer, distinct from the real markers
+        self._fusion_synth_frames: tuple = ()
         self._fusion_meta: dict = {}   # fused_id -> (kind, category)
+        self._fusion_labels: dict = {}  # fused_id -> traceable display label
         self._fusion_key = None        # (id(recording), calibrated) of the cache
         # Review labeling (2026-07-14 round): with the `review` switch armed
         # in Replay, clicking a marker toggles its raw track into the current
@@ -1433,13 +1439,33 @@ class Viewer:
         font = 7 * lw
         parts = []
         meta = self._fusion_meta or {}
+        lbls = self._fusion_labels or {}
         for fid, (fx, fy) in markers.items():
             cx, cy = self.replay_point_to_canvas(fx, fy)
             kind, category = meta.get(fid, ("single", None))
+            # Item 47: the fused label is the members' traceable code
+            # (fused_label), not the raw integer fused_id.
             parts.append(self._marker_glyph(
                 cx, cy, marker_color(fid % 10),
-                escape(short_id(fid)) if labels else "", lw, r, font,
+                escape(lbls.get(fid, str(fid))) if labels else "", lw, r, font,
                 ped=category == "non_motor", dim=kind in ("stray", "ghost")))
+        return "".join(parts)
+
+    def _synth_marker_svg(self, markers) -> str:
+        """The Item 47 "filled-in" layer: synthetic gap-fill markers for a
+        drop/re-acquire interval, drawn as small hollow reduced-opacity rings
+        (no fill, no label) so they read clearly as interpolated rather than
+        observed. ``markers`` is one frame of ``_fusion_synth_frames``."""
+        lw = self.overlay_px / max(self.viewport.scale, 0.05)
+        r = 3 * lw
+        parts = []
+        for fid, (fx, fy) in markers.items():
+            cx, cy = self.replay_point_to_canvas(fx, fy)
+            parts.append(
+                f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{r:.1f}" fill="none" '
+                f'stroke="{marker_color(fid % 10)}" stroke-opacity="0.5" '
+                f'stroke-width="{lw:.2f}" '
+                f'stroke-dasharray="{lw:.1f},{lw:.1f}"/>')
         return "".join(parts)
 
     def ensure_fusion(self):
@@ -1475,10 +1501,20 @@ class Viewer:
             # render index from the seam-smoothed copy (2026-07-14 round):
             # the on-screen handoff eases across sensor seams while the
             # cached FusionResult itself stays the engine's exact geometry
-            self._fusion_frames = fused_frame_markers(
-                smooth_seams(self._fusion), frame_times_s(fuse_rec.frames))
+            times = frame_times_s(fuse_rec.frames)
+            smoothed = smooth_seams(self._fusion)
+            self._fusion_frames = fused_frame_markers(smoothed, times)
+            # Item 47: drop/re-acquire gaps get a display-only interpolated
+            # fill, rendered as a distinct "filled-in" layer (synthetic points
+            # never touch the cached engine geometry, eval, or bridging logic).
+            self._fusion_synth_frames = synthetic_frame_markers(
+                interpolate_gaps(smoothed, times), times)
             self._fusion_meta = {
                 t.fused_id: (t.kind, t.category) for t in self._fusion.tracks}
+            # Item 47: traceable display label per fused id (members' last-three
+            # oid digits, sensor omitted) — the integer fused_id stays identity.
+            self._fusion_labels = {
+                t.fused_id: fused_label(t) for t in self._fusion.tracks}
             self._fusion_key = key
         return self._fusion
 
@@ -1499,11 +1535,14 @@ class Viewer:
         if self.fused_view:
             self.ensure_fusion()
             markers = self._fusion_frames[i] if i < len(self._fusion_frames) else {}
+            synth = (self._fusion_synth_frames[i]
+                     if i < len(self._fusion_synth_frames) else {})
             # raw ids on the underlay only while reviewing: that is when the
             # raw oid (what the labels record) matters over the fused id
             under = self._marker_svg(
                 points, self.replay_labels and self.review_active)
             return (f'<g opacity="0.2">{under}</g>'
+                    + self._synth_marker_svg(synth)
                     + self._review_ring_svg(points)
                     + self._fused_marker_svg(markers, self.replay_labels))
         return (self._marker_svg(points, self.replay_labels)
@@ -1551,6 +1590,30 @@ class Viewer:
             if d <= r_hit and (best is None or d < best[0]):
                 best = (d, (pt.sensor, pt.oid))
         return best[1] if best else None
+
+    def fused_hit(self, canvas_pt) -> tuple[tuple[int, int], ...] | None:
+        """The *members* of the fused marker under a review click (Item 47):
+        nearest current-frame fused marker within 1.5 marker radii, returned as
+        its ``FusedTrack.members`` tuple. Used only in the fused view to author
+        a ``bad_pair`` — click an over-merged marker, its constituents become
+        the selection. Returns None if no fused marker is under the cursor."""
+        rec = self.replay
+        if rec is None or not rec.frames or self._fusion is None:
+            return None
+        i = max(0, min(self.replay_frame, len(rec.frames) - 1))
+        markers = self._fusion_frames[i] if i < len(self._fusion_frames) else {}
+        if not markers:
+            return None
+        members_of = {t.fused_id: t.members for t in self._fusion.tracks}
+        lw = self.overlay_px / max(self.viewport.scale, 0.05)
+        r_hit = 4 * lw * 1.5
+        best: tuple[float, int] | None = None
+        for fid, (fx, fy) in markers.items():
+            cx, cy = self.replay_point_to_canvas(fx, fy)
+            d = math.hypot(cx - canvas_pt[0], cy - canvas_pt[1])
+            if d <= r_hit and (best is None or d < best[0]):
+                best = (d, fid)
+        return members_of.get(best[1]) if best else None
 
     def live_marker_svg(self) -> str:
         """Markers for the latest live frame in the drop-to-latest slot (ROADMAP
@@ -3208,11 +3271,26 @@ def build_ui(viewer: Viewer, state: dict) -> None:
             # the read-only Replay canvas accepts marker clicks — toggle the
             # raw track under the cursor in/out of the label selection. The
             # marker layer is pointer-events:none, so the click arrives here.
-            hit = v.review_hit(p)
-            if hit is not None:
-                v.review.toggle(hit)
+            #
+            # Item 47: in the fused view a click that lands on a fused marker
+            # instead selects that marker's whole member set as a bad_pair
+            # candidate (the over-merged group the owner is flagging) and arms
+            # the bad_pair kind; clicks that miss every fused marker fall back
+            # to the raw per-track toggle below.
+            members = v.fused_hit(p) if v.fused_view else None
+            if members is not None:
+                v.review.clear_selection()
+                for m in members:
+                    v.review.toggle(m)
+                review_kind_sel.set_value("bad_pair")
                 refresh_marker_layer()
                 refresh_status()
+            else:
+                hit = v.review_hit(p)
+                if hit is not None:
+                    v.review.toggle(hit)
+                    refresh_marker_layer()
+                    refresh_status()
         elif button == 0 and v.template_placement_active():
             # Item 27: a template picked in Draw › Event Zone turns the click
             # into a template drop (was the standalone Template tool). With a
@@ -3766,6 +3844,7 @@ def build_ui(viewer: Viewer, state: dict) -> None:
         so compute + cache it here on the switch-on (with a note), not on the
         render tick; a stitched/low-confidence summary lands in the status."""
         v.fused_view = bool(e.value)
+        sync_review_kinds()
         if v.fused_view and v.replay is not None:
             res = v.ensure_fusion()
             if res is not None:
@@ -3777,6 +3856,16 @@ def build_ui(viewer: Viewer, state: dict) -> None:
                 ui.notify(note)
         refresh_marker_layer()
         refresh_status()
+
+    def sync_review_kinds():
+        """Offer the ``bad_pair`` review kind only in the fused view (Item 47) —
+        it is authored by clicking a fused marker, which only exists there. When
+        leaving the fused view with bad_pair selected, fall back to handoff."""
+        opts = [k for k in REVIEW_KINDS if k != "bad_pair" or v.fused_view]
+        value = review_kind_sel.value
+        if value not in opts:
+            value = "handoff"
+        review_kind_sel.set_options({k: k for k in opts}, value=value)
 
     # -- review labeling (2026-07-14 round) -----------------------------------
     # The observation-fixture workflow (Item 44) moved into the GUI: arm the
@@ -5003,14 +5092,19 @@ def build_ui(viewer: Viewer, state: dict) -> None:
                        "tracks of one real object, pick a kind, add the group; "
                        "save writes an observations JSON beside the recording "
                        "(scored by scripts/fusion_eval.py --obs)")
+        # bad_pair (Item 47) is offered only in the fused view — sync_review_kinds
+        # adds/removes it as the fused toggle flips.
         review_kind_sel = ui.select(
-            {k: k for k in REVIEW_KINDS}, value="handoff", label="kind") \
+            {k: k for k in REVIEW_KINDS if k != "bad_pair"},
+            value="handoff", label="kind") \
             .classes("w-32").props("dense")
         with review_kind_sel:
             ui.tooltip("handoff: cross-sensor views of one object · "
                        "persistence: dropped + re-acquired by one sensor · "
                        "anchor: correctly persisted through a stop (must not "
-                       "absorb neighbours) · stray: not a real object")
+                       "absorb neighbours) · stray: not a real object · "
+                       "bad_pair (fused view): click an over-merged marker — "
+                       "its members must NOT all share one fused id")
         review_ped_switch = ui.switch("ped").props("dense")
         with review_ped_switch:
             ui.tooltip("the object is a pedestrian")

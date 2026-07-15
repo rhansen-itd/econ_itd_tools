@@ -74,6 +74,35 @@ def test_commit_refuses_bad_input():
     assert [g.kind for g in s.groups] == ["anchor", "stray"]
 
 
+def test_bad_pair_needs_two_members():
+    """bad_pair (Item 47) is the inverse of handoff/persistence — like them it
+    describes two-or-more tracks, so a single member is refused."""
+    assert "bad_pair" in KINDS
+    s = ReviewSession()
+    s.toggle((0, 100))
+    with pytest.raises(ValueError):
+        s.commit("bad_pair")  # only one member
+    s.toggle((0, 200))  # same-sensor over-merge is a valid bad_pair
+    g = s.commit("bad_pair", note="two vehicles fused into one")
+    assert g.kind == "bad_pair"
+    assert g.members == ((0, 100), (0, 200))
+    assert g.note == "two vehicles fused into one"
+    assert s.selection == []
+
+
+def test_bad_pair_survives_json_round_trip(tmp_path: Path):
+    s = ReviewSession(capture="c", recording="r.txt.gz")
+    s.toggle((0, 100))
+    s.toggle((1, 201))
+    s.commit("bad_pair", unsure=True)
+    path = tmp_path / "obs.json"
+    s.save(path)
+    loaded = ReviewSession.load(path)
+    assert loaded.groups[0].kind == "bad_pair"
+    assert loaded.groups[0].unsure is True
+    assert loaded.groups[0].members == ((0, 100), (1, 201))
+
+
 def test_same_sensor_is_derived():
     assert ReviewGroup("persistence", ((2, 10), (2, 20))).same_sensor
     assert not ReviewGroup("handoff", ((0, 10), (1, 20))).same_sensor
